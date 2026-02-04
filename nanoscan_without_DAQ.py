@@ -6,7 +6,7 @@ import time
 import pyvisa
 from tqdm import tqdm
 from scipy.io import savemat
-from scan_initial import get_scan_initial
+from utils.scan_initial import get_scan_initial
 import numpy as np
 from ctypes import WinDLL, create_string_buffer
 import os
