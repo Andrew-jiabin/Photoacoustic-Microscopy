@@ -1,6 +1,5 @@
 from __future__ import division
 import ctypes
-from ctypes import *
 import numpy as np
 import os
 import signal
@@ -10,8 +9,10 @@ import time
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..', 'Library'))
 import atsapi as ats
 
+samplesPerSec = None
+
 # Configures a board for acquisition
-def ConfigureBoard(board, fft_module, recordLength_samples):
+def ConfigureBoard(board):
     # TODO: Select clock parameters as required to generate this
     # sample rate
     #
@@ -22,12 +23,12 @@ def ConfigureBoard(board, fft_module, recordLength_samples):
     #  - or select clock source FAST_EXTERNAL_CLOCK, sample rate
     #    SAMPLE_RATE_USER_DEF, and connect a 100MHz signal to the
     #    EXT CLK BNC connector
-    samplesPerSec = 1000000000.0
+    global samplesPerSec
+    samplesPerSec = 4000000000.0
     board.setCaptureClock(ats.INTERNAL_CLOCK,
-                          ats.SAMPLE_RATE_1000MSPS,
+                          ats.SAMPLE_RATE_4000MSPS,
                           ats.CLOCK_EDGE_RISING,
                           0)
-
     
     # TODO: Select channel A input parameters as required.
     board.inputControlEx(ats.CHANNEL_A,
@@ -78,61 +79,20 @@ def ConfigureBoard(board, fft_module, recordLength_samples):
     # Configure AUX I/O connector as required
     board.configureAuxIO(ats.AUX_OUT_TRIGGER,
                          0)
+    
 
-    # FFT Configuration
+def AcquireData(board):
+    # TODO: Select the total acquisition length in seconds
+    acquisitionLength_sec = 1.
 
-    # TODO: Select the window function type
-    windowType = ats.DSP_WINDOW_HANNING;
-
-    id,major,minor,maxLength = fft_module.dspGetInfo()
-    if id != ats.DSP_MODULE_FFT:
-        print("Error: DSP module is not FFT")
-        return
-
-    fftLength_samples = 1;
-    while fftLength_samples < recordLength_samples:
-        fftLength_samples *= 2;
-
-    # Create and fill the window function
-    window = ats.dspGenerateWindowFunction(windowType,
-                                           recordLength_samples,
-                                           fftLength_samples - recordLength_samples)
-    # Set the window function
-    fft_module.fftSetWindowFunction(fftLength_samples, 
-                                    window.ctypes.data_as(POINTER(c_float)), 
-                                    None)
-
-    # TODO: Select the background subtraction record
-    backgroundSubtractionRecord = np.zeros((recordLength_samples), dtype=np.int16)
-
-    # Background subtraction
-    fft_module.fftBackgroundSubtractionSetRecordS16(
-                    backgroundSubtractionRecord.ctypes.data_as(POINTER(c_int16)),
-                    recordLength_samples)
-
-    fft_module.fftBackgroundSubtractionSetEnabled(True);
-
-def AcquireData(board, fft_module, recordLength_samples):
-    # TODO: Specify the number of records per DMA buffer
-    recordsPerBuffer = 10
-
-    # TODO: Specify the total number of buffers to capture
-    buffersPerAcquisition = 10
-
+    # TODO: Select the number of samples in each DMA buffer
+    samplesPerBuffer = 1024000
+    
     # TODO: Select the active channels.
     channels = ats.CHANNEL_A
     channelCount = 0
     for c in ats.channels:
         channelCount += (c & channels == c)
-
-    # TODO: Select the FFT output format
-    outputFormat = ats.FFT_OUTPUT_FORMAT_U16_LOG
-
-    # TODO: Select the presence of NPT footers
-    footer = ats.FFT_FOOTER_NONE
-
-    # Compute the number of bytes per record and per buffer
-    memorySize_samples, bitsPerSample = board.getChannelInfo()
 
     # TODO: Should data be saved to file?
     saveData = False
@@ -141,49 +101,36 @@ def AcquireData(board, fft_module, recordLength_samples):
         dataFile = open(os.path.join(os.path.dirname(__file__),
                                      "data.bin"), 'wb')
 
-    # Configure the FFT
-    fftLength_samples = 1;
-    while fftLength_samples < recordLength_samples:
-        fftLength_samples *= 2
-
-    bytesPerOutputRecord = fft_module.fftSetup(channels,
-                                               recordLength_samples,
-                                               fftLength_samples,
-                                               outputFormat,
-                                               footer,
-                                               0)
-
-    bytesPerBuffer = bytesPerOutputRecord * recordsPerBuffer
+    # Compute the number of bytes per record and per buffer
+    memorySize_samples, bitsPerSample = board.getChannelInfo()
+    bytesPerSample = (bitsPerSample.value + 7) // 8
+    bytesPerBuffer = bytesPerSample * samplesPerBuffer * channelCount;
+    # Calculate the number of buffers in the acquisition
+    samplesPerAcquisition = int(samplesPerSec * acquisitionLength_sec + 0.5);
+    buffersPerAcquisition = ((samplesPerAcquisition + samplesPerBuffer - 1) //
+                             samplesPerBuffer)
 
     # TODO: Select number of DMA buffers to allocate
     bufferCount = 4
 
     # Allocate DMA buffers
-    if ((outputFormat == ats.FFT_OUTPUT_FORMAT_U8_LOG) or
-       (outputFormat == ats.FFT_OUTPUT_FORMAT_U8_AMP2)):
-        sample_type = ctypes.c_uint8
-    elif ((outputFormat == ats.FFT_OUTPUT_FORMAT_U16_LOG) or
-         (outputFormat == ats.FFT_OUTPUT_FORMAT_U16_AMP2)):
+
+    sample_type = ctypes.c_uint8
+    if bytesPerSample > 1:
         sample_type = ctypes.c_uint16
-    elif (outputFormat == ats.FFT_OUTPUT_FORMAT_U32):
-        sample_type = ctypes.c_uint32
-    elif ((outputFormat == ats.FFT_OUTPUT_FORMAT_REAL_S32) or
-         (outputFormat == ats.FFT_OUTPUT_FORMAT_IMAG_S32)):
-        sample_type = ctypes.c_int32
-    else:
-        sample_type = ctypes.c_float
 
     buffers = []
     for i in range(bufferCount):
         buffers.append(ats.DMABuffer(board.handle, sample_type, bytesPerBuffer))
-
-    # Configure the board to make an NPT AutoDMA acquisition
+    
     board.beforeAsyncRead(channels,
-                          0,
-                          bytesPerOutputRecord,
-                          recordsPerBuffer,
-                          0x7FFFFFFF,
-                          ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT | ats.ADMA_DSP)
+                          0,                 # Must be 0
+                          samplesPerBuffer,
+                          1,                 # Must be 1
+                          0x7FFFFFFF,        # Ignored
+                          ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_TRIGGERED_STREAMING | ats.ADMA_FIFO_ONLY_STREAMING)
+    
+
 
     # Post DMA buffers to board
     for buffer in buffers:
@@ -200,9 +147,8 @@ def AcquireData(board, fft_module, recordLength_samples):
                ats.enter_pressed()):
             # Wait for the buffer at the head of the list of available
             # buffers to be filled by the board.
-            timeout_ms = 5000
             buffer = buffers[buffersCompleted % len(buffers)]
-            board.dspGetBuffer(buffer.addr, timeout_ms)
+            board.waitAsyncBufferComplete(buffer.addr, timeout_ms=5000)
             buffersCompleted += 1
             bytesTransferred += buffer.size_bytes
 
@@ -229,44 +175,28 @@ def AcquireData(board, fft_module, recordLength_samples):
             # - 0x0000 represents a negative full scale input signal.
             # - 0x8000 represents a ~0V signal.
             # - 0xFFFF represents a positive full scale input signal.
-
             # Optionaly save data to file
             if dataFile:
                 buffer.buffer.tofile(dataFile)
 
             # Add the buffer to the end of the list of available buffers.
             board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
-
     finally:
-        board.dspAbortCapture()
-        if dataFile:
-            dataFile.close()
-
+        board.abortAsyncRead()
     # Compute the total transfer time, and display performance information.
     transferTime_sec = time.time() - start
     print("Capture completed in %f sec" % transferTime_sec)
     buffersPerSec = 0
     bytesPerSec = 0
-    recordsPerSec = 0
     if transferTime_sec > 0:
         buffersPerSec = buffersCompleted / transferTime_sec
         bytesPerSec = bytesTransferred / transferTime_sec
-        recordsPerSec = recordsPerBuffer * buffersCompleted / transferTime_sec
     print("Captured %d buffers (%f buffers per sec)" %
           (buffersCompleted, buffersPerSec))
-    print("Captured %d records (%f records per sec)" %
-          (recordsPerBuffer * buffersCompleted, recordsPerSec))
     print("Transferred %d bytes (%f bytes per sec)" %
           (bytesTransferred, bytesPerSec))
 
 if __name__ == "__main__":
     board = ats.Board(systemId = 1, boardId = 1)
-    dsp_modules = board.dspGetModules()
-    num_modules = len(dsp_modules)
-    if num_modules > 0:
-        fft_module = dsp_modules[0]
-        recordLength_samples = 2048
-        ConfigureBoard(board, fft_module, recordLength_samples)
-        AcquireData(board, fft_module, recordLength_samples)
-    else:
-        print("This board does any DSP modules");
+    ConfigureBoard(board)
+    AcquireData(board)

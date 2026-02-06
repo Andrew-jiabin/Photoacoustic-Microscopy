@@ -24,9 +24,9 @@ def ConfigureBoard(board):
     #    SAMPLE_RATE_USER_DEF, and connect a 100MHz signal to the
     #    EXT CLK BNC connector
     global samplesPerSec
-    samplesPerSec = 1000000000.0
+    samplesPerSec = 4000000000.0
     board.setCaptureClock(ats.INTERNAL_CLOCK,
-                          ats.SAMPLE_RATE_1000MSPS,
+                          ats.SAMPLE_RATE_4000MSPS,
                           ats.CLOCK_EDGE_RISING,
                           0)
     
@@ -82,11 +82,17 @@ def ConfigureBoard(board):
 
 def AcquireData(boards):
     
-    # TODO: Select the total acquisition length in seconds
-    acquisitionLength_sec = 1.;
+    # No pre-trigger samples in NPT mode
+    preTriggerSamples = 0
 
-    # TODO: Select the number of samples in each DMA buffer
-    samplesPerBuffer = 204800;
+    # TODO: Select the number of samples per record.
+    postTriggerSamples = 2048
+
+    # TODO: Select the number of records per DMA buffer.
+    recordsPerBuffer = 10
+
+    # TODO: Select the number of buffers per acquisition.
+    buffersPerAcquisition = 10
     
     # TODO: Select the active channels.
     channels = ats.CHANNEL_A
@@ -111,11 +117,9 @@ def AcquireData(boards):
     # Compute the number of bytes per record and per buffer
     memorySize_samples, bitsPerSample = boards[0].getChannelInfo()
     bytesPerSample = (bitsPerSample.value + 7) // 8
-    bytesPerBuffer = bytesPerSample * samplesPerBuffer * channelCount;
-    # Calculate the number of buffers in the acquisition
-    samplesPerAcquisition = int(samplesPerSec * acquisitionLength_sec + 0.5);
-    buffersPerAcquisition = ((samplesPerAcquisition + samplesPerBuffer - 1) //
-                             samplesPerBuffer);
+    samplesPerRecord = preTriggerSamples + postTriggerSamples
+    bytesPerRecord = bytesPerSample * samplesPerRecord
+    bytesPerBuffer = bytesPerRecord * recordsPerBuffer * channelCount
 
     # TODO: Select number of DMA buffers to allocate
     bufferCount = 4
@@ -133,12 +137,18 @@ def AcquireData(boards):
             buffers[b].append(ats.DMABuffer(board.handle, sample_type, bytesPerBuffer))
 
         
+        # Set the record size
+        boards[b].setRecordSize(preTriggerSamples, postTriggerSamples)
+
+        recordsPerAcquisition = recordsPerBuffer * buffersPerAcquisition
+
+        # Configure the board to make an NPT AutoDMA acquisition
         boards[b].beforeAsyncRead(channels,
-                                  0,                 # Must be 0
-                                  samplesPerBuffer,
-                                  1,                 # Must be 1
-                                  0x7FFFFFFF,        # Ignored
-                                  ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_CONTINUOUS_MODE | ats.ADMA_FIFO_ONLY_STREAMING)
+                                  -preTriggerSamples,
+                                  samplesPerRecord,
+                                  recordsPerBuffer,
+                                  recordsPerAcquisition,
+                                  ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT | ats.ADMA_FIFO_ONLY_STREAMING)
         
 
 
@@ -203,11 +213,16 @@ def AcquireData(boards):
     print("Capture completed in %f sec" % transferTime_sec)
     buffersPerSec = 0
     bytesPerSec = 0
+    recordsPerSec = 0
     if transferTime_sec > 0:
         buffersPerSec = buffersCompletedAllBoards / transferTime_sec
         bytesPerSec = bytesTransferredAllBoards / transferTime_sec
+        recordsPerSec = (recordsPerBuffer * buffersCompletedAllBoards /
+                         transferTime_sec)
     print("Captured %d buffers (%f buffers per sec)" %
           (buffersCompletedAllBoards, buffersPerSec))
+    print("Captured %d records (%f records per sec)" %
+          (recordsPerBuffer * buffersCompletedAllBoards, recordsPerSec))
     print("Transferred %d bytes (%f bytes per sec)" %
           (bytesTransferredAllBoards, bytesPerSec))
 

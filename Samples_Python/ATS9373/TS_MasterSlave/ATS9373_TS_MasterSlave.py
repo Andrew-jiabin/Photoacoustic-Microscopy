@@ -24,9 +24,9 @@ def ConfigureBoard(board):
     #    SAMPLE_RATE_USER_DEF, and connect a 100MHz signal to the
     #    EXT CLK BNC connector
     global samplesPerSec
-    samplesPerSec = 1000000000.0
+    samplesPerSec = 4000000000.0
     board.setCaptureClock(ats.INTERNAL_CLOCK,
-                          ats.SAMPLE_RATE_1000MSPS,
+                          ats.SAMPLE_RATE_4000MSPS,
                           ats.CLOCK_EDGE_RISING,
                           0)
     
@@ -79,14 +79,14 @@ def ConfigureBoard(board):
     # Configure AUX I/O connector as required
     board.configureAuxIO(ats.AUX_OUT_TRIGGER,
                          0)
-    
 
-def AcquireData(board):
+def AcquireData(boards):
+    
     # TODO: Select the total acquisition length in seconds
-    acquisitionLength_sec = 1.
+    acquisitionLength_sec = 1.;
 
     # TODO: Select the number of samples in each DMA buffer
-    samplesPerBuffer = 1024000
+    samplesPerBuffer = 1024000;
     
     # TODO: Select the active channels.
     channels = ats.CHANNEL_A
@@ -101,102 +101,122 @@ def AcquireData(board):
         dataFile = open(os.path.join(os.path.dirname(__file__),
                                      "data.bin"), 'wb')
 
+    # Make sure that boards[0] is the system's master
+    if boards[0].boardId != 1:
+        raise ValueError("The first board passed should be the master.")
+    for board in boards:
+        if board.systemId != boards[0].systemId:
+            raise ValueError("All the boards should be of the same system.")
+
     # Compute the number of bytes per record and per buffer
-    memorySize_samples, bitsPerSample = board.getChannelInfo()
+    memorySize_samples, bitsPerSample = boards[0].getChannelInfo()
     bytesPerSample = (bitsPerSample.value + 7) // 8
     bytesPerBuffer = bytesPerSample * samplesPerBuffer * channelCount;
     # Calculate the number of buffers in the acquisition
     samplesPerAcquisition = int(samplesPerSec * acquisitionLength_sec + 0.5);
     buffersPerAcquisition = ((samplesPerAcquisition + samplesPerBuffer - 1) //
-                             samplesPerBuffer)
+                             samplesPerBuffer);
 
     # TODO: Select number of DMA buffers to allocate
     bufferCount = 4
 
-    # Allocate DMA buffers
-
-    sample_type = ctypes.c_uint8
-    if bytesPerSample > 1:
-        sample_type = ctypes.c_uint16
-
     buffers = []
-    for i in range(bufferCount):
-        buffers.append(ats.DMABuffer(board.handle, sample_type, bytesPerBuffer))
-    
-    board.beforeAsyncRead(channels,
-                          0,                 # Must be 0
-                          samplesPerBuffer,
-                          1,                 # Must be 1
-                          0x7FFFFFFF,        # Ignored
-                          ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_TRIGGERED_STREAMING | ats.ADMA_FIFO_ONLY_STREAMING)
-    
+    for b in range(len(boards)):
+        # Allocate DMA buffers
+
+        sample_type = ctypes.c_uint8
+        if bytesPerSample > 1:
+            sample_type = ctypes.c_uint16
+
+        buffers.append([])
+        for i in range(bufferCount):
+            buffers[b].append(ats.DMABuffer(board.handle, sample_type, bytesPerBuffer))
+
+        
+        boards[b].beforeAsyncRead(channels,
+                                  0,                 # Must be 0
+                                  samplesPerBuffer,
+                                  1,                 # Must be 1
+                                  0x7FFFFFFF,        # Ignored
+                                  ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_TRIGGERED_STREAMING | ats.ADMA_FIFO_ONLY_STREAMING)
+        
 
 
-    # Post DMA buffers to board
-    for buffer in buffers:
-        board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+        # Post DMA buffers to board
+        for buffer in buffers[b]:
+            boards[b].postAsyncBuffer(buffer.addr, buffer.size_bytes)
 
     start = time.time() # Keep track of when acquisition started
     try:
-        board.startCapture() # Start the acquisition
-        print("Capturing %d buffers. Press <enter> to abort" %
-              buffersPerAcquisition)
-        buffersCompleted = 0
-        bytesTransferred = 0
-        while (buffersCompleted < buffersPerAcquisition and not
+        boards[0].startCapture() # Start the acquisition
+        buffersPerAcquisitionAllBoards = len(boards) * buffersPerAcquisition
+        print("Capturing {} buffers. Press <enter> to abort".format(
+            buffersPerAcquisitionAllBoards))
+        buffersCompletedPerBoard = 0
+        buffersCompletedAllBoards = 0
+        bytesTransferredAllBoards = 0
+        while (buffersCompletedPerBoard < buffersPerAcquisition and not
                ats.enter_pressed()):
-            # Wait for the buffer at the head of the list of available
-            # buffers to be filled by the board.
-            buffer = buffers[buffersCompleted % len(buffers)]
-            board.waitAsyncBufferComplete(buffer.addr, timeout_ms=5000)
-            buffersCompleted += 1
-            bytesTransferred += buffer.size_bytes
+            for b in range(len(boards)):
+                # Wait for the buffer at the head of the list of available
+                # buffers to be filled by the board.
+                buffer = buffers[b][buffersCompletedPerBoard % len(buffers[b])]
+                boards[b].waitAsyncBufferComplete(buffer.addr, timeout_ms=5000)
+                buffersCompletedAllBoards += 1
+                bytesTransferredAllBoards += buffer.size_bytes
 
-            # TODO: Process sample data in this buffer. Data is available
-            # as a NumPy array at buffer.buffer
+                # TODO: Process sample data in this buffer. Data is available
+                # as a NumPy array at buffer.buffer
 
-            # NOTE:
-            #
-            # While you are processing this buffer, the board is already
-            # filling the next available buffer(s).
-            #
-            # You MUST finish processing this buffer and post it back to the
-            # board before the board fills all of its available DMA buffers
-            # and on-board memory.
-            #
-            # Samples are arranged in the buffer as follows:
-            # S0A, S0B, ..., S1A, S1B, ...
-            # with SXY the sample number X of channel Y.
-            #
-            # A 12-bit sample code is stored in the most significant bits of
-            # each 16-bit sample value.
-            #
-            # Sample codes are unsigned by default. As a result:
-            # - 0x0000 represents a negative full scale input signal.
-            # - 0x8000 represents a ~0V signal.
-            # - 0xFFFF represents a positive full scale input signal.
-            # Optionaly save data to file
-            if dataFile:
-                buffer.buffer.tofile(dataFile)
+                # NOTE:
+                #
+                # While you are processing this buffer, the board is already
+                # filling the next available buffer(s).
+                #
+                # You MUST finish processing this buffer and post it back to the
+                # board before the board fills all of its available DMA buffers
+                # and on-board memory.
+                #
+                # Samples are arranged in the buffer as follows:
+                # S0A, S0B, ..., S1A, S1B, ...
+                # with SXY the sample number X of channel Y.
+                #
+                # A 12-bit sample code is stored in the most significant bits of
+                # each 16-bit sample value.
+                #
+                # Sample codes are unsigned by default. As a result:
+                # - 0x0000 represents a negative full scale signal.
+                # - 0x8000 represents a ~0V signal.
+                # - 0xFFFF represents a positive full scale signal.
+                # Optionaly save data to file
+                if dataFile:
+                    buffer.buffer.tofile(dataFile)
 
-            # Add the buffer to the end of the list of available buffers.
-            board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+                # Add the buffer to the end of the list of available buffers.
+                boards[b].postAsyncBuffer(buffer.addr, buffer.size_bytes)
+            buffersCompletedPerBoard += 1
     finally:
         board.abortAsyncRead()
+
     # Compute the total transfer time, and display performance information.
     transferTime_sec = time.time() - start
     print("Capture completed in %f sec" % transferTime_sec)
     buffersPerSec = 0
     bytesPerSec = 0
     if transferTime_sec > 0:
-        buffersPerSec = buffersCompleted / transferTime_sec
-        bytesPerSec = bytesTransferred / transferTime_sec
+        buffersPerSec = buffersCompletedAllBoards / transferTime_sec
+        bytesPerSec = bytesTransferredAllBoards / transferTime_sec
     print("Captured %d buffers (%f buffers per sec)" %
-          (buffersCompleted, buffersPerSec))
+          (buffersCompletedAllBoards, buffersPerSec))
     print("Transferred %d bytes (%f bytes per sec)" %
-          (bytesTransferred, bytesPerSec))
+          (bytesTransferredAllBoards, bytesPerSec))
+
 
 if __name__ == "__main__":
-    board = ats.Board(systemId = 1, boardId = 1)
-    ConfigureBoard(board)
-    AcquireData(board)
+    boards = []
+    systemId = 1
+    for i in range(ats.boardsInSystemBySystemID(systemId)):
+        boards.append(ats.Board(systemId, i + 1))
+    for board in boards:
+        ConfigureBoard(board)
+    AcquireData(boards)
