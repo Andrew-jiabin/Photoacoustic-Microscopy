@@ -26,6 +26,6 @@ def get_scan_initial(path):
     # disconnect cleanly from controller
     cmd("controller.disconnect")
 
-
+ 
 if __name__ == "__main__":
     get_scan_initial(r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll")
