@@ -1,0 +1,8 @@
+README.txt
+setup.py
+atsapi/__init__.py
+atsapi/atsapi.py
+atsapi.egg-info/PKG-INFO
+atsapi.egg-info/SOURCES.txt
+atsapi.egg-info/dependency_links.txt
+atsapi.egg-info/top_level.txt
