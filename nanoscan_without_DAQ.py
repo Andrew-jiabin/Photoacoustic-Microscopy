@@ -50,7 +50,6 @@ Whole_data=[]               # 存放采样数据的数组
 
 
 # ================ 纳米平移台初始化及其command函数 ==========
-get_scan_initial(PATH)
 if os.path.exists(PATH):
     SDKPrior = WinDLL(PATH)
 else:

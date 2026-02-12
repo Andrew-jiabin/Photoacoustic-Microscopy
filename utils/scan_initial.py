@@ -1,6 +1,8 @@
 
 from ctypes import WinDLL, create_string_buffer
 import os
+import serial
+import time
 
 class Prior_xy_stage:
     def __init__(self, path, COM_port):
@@ -45,9 +47,14 @@ class Prior_xy_stage:
     
     def stage_deinitial(self):
         return self.cmd("controller.disconnect")
-    
+    # def fuction_test(self):
+        
+
 
  
 if __name__ == "__main__":
     stage=Prior_xy_stage(r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll","4")
-    print(stage.get_SDK_vision())
+    print(stage.get_position())
+
+
+
