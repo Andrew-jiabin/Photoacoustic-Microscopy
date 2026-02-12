@@ -19,10 +19,10 @@ class PriorUnifiedStage:
         self.baudrate = baudrate
         
         # 状态标志
-        self.mode = 'OFFLINE'  # 可选: 'SDK', 'SERIAL', 'OFFLINE'
-        self.ser = None        # 用于存储 serial 对象
+        self.mode = 'OFFLINE'  # 'SDK', 'SERIAL', 'OFFLINE'
+        self.ser = None        # 存储 serial 对象
         
-        # --- 1. 加载 DLL ---
+        # --- 1. 加载 SDK DLL ---
         if os.path.exists(dll_path):
             self.SDKPrior = WinDLL(dll_path)
         else:
@@ -37,106 +37,113 @@ class PriorUnifiedStage:
         self.rx = create_string_buffer(5000) # 加大缓冲区防止溢出
         
         # --- 2. 注册安全急停 ---
-        # 无论程序如何退出，都会尝试停止电机
         atexit.register(self.emergency_stop)
         
-        # --- 3. 初始连接 (默认使用 SDK 模式) ---
+        # --- 3. 初始连接 (默认进入 SDK 模式) ---
         self.connect_sdk()
 
     # =====================================================
-    #  核心机制：模式切换 (解决端口独占问题)
+    #  核心机制：模式切换 (自动管理端口独占)
     # =====================================================
     
     def connect_sdk(self):
-        """切换到 SDK 控制模式 (常规移动/查询)"""
+        """切换到 SDK 控制模式"""
+        # 如果当前占着串口，先断开
         if self.mode == 'SERIAL':
             self.disconnect_serial()
             
         if self.mode != 'SDK':
-            print(f"🔌 [切换] 连接 SDK 模式 (Port {self.port_sdk_str})...")
+            # print(f"🔌 [切换] 连接 SDK 模式...")
             ret = self.cmd_sdk_raw(f"controller.connect {self.port_sdk_str}")
             if ret == 0:
                 self.mode = 'SDK'
-                print("✅ SDK 已连接")
             else:
                 print(f"❌ SDK 连接失败, 错误码: {ret}")
 
     def disconnect_sdk(self):
-        """断开 SDK 连接 (释放 COM 口给串口用)"""
+        """断开 SDK 连接 (释放 COM 口)"""
         if self.mode == 'SDK':
             self.cmd_sdk_raw("controller.disconnect")
             self.mode = 'OFFLINE'
-            time.sleep(0.5) # 给系统一点时间释放资源
+            time.sleep(0.1) 
 
     def connect_serial(self):
-        """切换到 原生串口 模式 (用于 AutoScan)"""
+        """切换到 原生串口 模式"""
+        # 如果当前占着 SDK，先断开
         if self.mode == 'SDK':
             self.disconnect_sdk()
             
         if self.mode != 'SERIAL':
-            print(f"🔌 [切换] 连接原生串口模式 ({self.port_serial_str})...")
             try:
-                self.ser = serial.Serial(self.port_serial_str, self.baudrate, timeout=0.1)
+                # print(f"🔌 [切换] 连接原生串口模式...")
+                self.ser = serial.Serial(self.port_serial_str, self.baudrate, timeout=0.05)
                 self.ser.flushInput()
-                self.ser.flushOutput()
-                
-                # 激活标准模式并握手
-                self._serial_send_wait("COMP,0")
-                if not self._serial_send_wait("?"):
-                    if not self._serial_send_wait("VERSION"):
-                        raise Exception("握手无响应")
-                        
+                self._serial_send_wait("COMP,0") # 确保标准模式
                 self.mode = 'SERIAL'
-                print("✅ 串口已连接 (高速模式)")
             except Exception as e:
                 print(f"❌ 串口连接失败: {e}")
-                self.connect_sdk() # 尝试回滚到 SDK
+                self.connect_sdk() # 失败则回滚到 SDK
 
     def disconnect_serial(self):
-        """关闭串口连接"""
         if self.ser and self.ser.is_open:
             self.ser.close()
         self.mode = 'OFFLINE'
 
     # =====================================================
-    #  Part A: SDK 功能封装 (原有的功能)
+    #  Part A: 原有 SDK 功能 (已全部复原)
     # =====================================================
 
     def cmd_sdk_raw(self, msg):
-        """发送 SDK 指令 (内部使用)"""
+        """(内部函数) 直接调用 DLL 发送指令"""
         return self.SDKPrior.PriorScientificSDK_cmd(
             self.sessionID, create_string_buffer(msg.encode()), self.rx
         )
 
     def cmd(self, msg):
-        """发送 SDK 指令并返回结果 (供用户调用)"""
-        if self.mode != 'SDK': self.connect_sdk() # 自动切回 SDK
+        """
+        [原函数复原] 发送指令并返回 (错误码, 响应字符串)
+        会自动检查并切换到 SDK 模式。
+        """
+        if self.mode != 'SDK': self.connect_sdk()
         ret = self.cmd_sdk_raw(msg)
         return ret, self.rx.value.decode()
 
-    def get_position(self): 
-        """获取当前坐标 (SDK)"""
-        # 注意: 如果当前是 SERIAL 模式，这会自动切回 SDK 模式，速度较慢
-        # 如果在扫描中途，千万不要调用这个！
+    def cmd_simple(self, msg):
+        """
+        [原函数复原] 仅发送指令，不返回结果 (但会更新 self.rx)
+        """
         if self.mode != 'SDK': self.connect_sdk()
+        self.cmd_sdk_raw(msg)
         
+    def get_ID(self):
+        """[原函数复原] 获取 Session ID"""
+        return self.sessionID
+    
+    def get_SDK_version(self): # 原名 get_SDK_vision，修正了拼写
+        """[原函数复原] 获取 SDK 版本"""
+        return self.SDKPrior.PriorScientificSDK_Version(self.rx)
+
+    def get_position(self): 
+        """[原函数复原] 获取当前位置 (SDK方式)"""
+        if self.mode != 'SDK': self.connect_sdk()
         self.cmd_sdk_raw("controller.stage.position.get")
         return self.rx.value.decode()
     
     def set_position(self, position: list): 
-        """移动到指定位置 (SDK)"""
+        """[原函数复原] 移动到指定位置 (SDK方式)"""
         if self.mode != 'SDK': self.connect_sdk()
         self.cmd_sdk_raw(f"controller.stage.goto-position {position[0]} {position[1]}")
-
-    def get_sdk_version(self):
-        return self.SDKPrior.PriorScientificSDK_Version(self.rx)
+    
+    def stage_deinitial(self):
+        """[原函数复原] 断开控制器连接"""
+        return self.disconnect_sdk()
 
     # =====================================================
-    #  Part B: 高速扫描功能 (整合 Solution B)
+    #  Part B: 新增的高速扫描功能 (串口直连)
     # =====================================================
 
     def _serial_send_wait(self, cmd_text):
-        """串口底层发送 (私有方法)"""
+        """(内部函数) 串口发送并等待回复"""
         if not self.ser: return ""
         try:
             self.ser.flushInput()
@@ -145,93 +152,90 @@ class PriorUnifiedStage:
         except Exception:
             return ""
 
-    def perform_autoscan(self, width_px, height_px, step_um):
+    def prepare_scan_serial(self, width_px, height_px, step_um, 
+                            exposure_ms, settle_ms, ttl_pin=1):
         """
-        执行高速 AutoScan。
-        注意：此函数会自动接管 COM 口，并在完成后自动归还给 SDK。
+        配置扫描参数 (不启动运动)。
+        会自动切换到串口模式。
         """
-        # 1. 切换环境
-        print("\n=== 准备启动高速扫描任务 ===")
         self.connect_serial()
-        if self.mode != 'SERIAL':
-            print("❌ 无法进入串口模式，扫描中止")
-            return
-
-        total_points = width_px * height_px
-        print(f"⚙️ 配置: {width_px}x{height_px} | 步长: {step_um}μm | 总点数: {total_points}")
-
-        try:
-            # 2. 配置参数
-            self._serial_send_wait(f"N,{width_px-1},{height_px-1}")
-            self._serial_send_wait(f"X,{step_um},{step_um}")
-            # AS配置: 1ms曝光, 0ms稳定, TTL1, 高电平, 蛇形
-            resp = self._serial_send_wait("AS,1,0,1,H,S")
-            if "E" in resp:
-                print(f"⚠️ 配置警告: {resp}")
-
-            # 3. 启动并监控
-            print("🚀 启动 AutoScan (硬件接管中)...")
-            self._serial_send_wait("AS,1")
-            
-            start_time = time.perf_counter()
-            
-            while True:
-                status = self._serial_send_wait("AS")
-                # 使用 P 指令直接从串口读位置
-                pos = self._serial_send_wait("P") 
-                
-                if not status: continue
-
-                if status == "0":
-                    end_time = time.perf_counter()
-                    self._print_stats(start_time, end_time, total_points, pos)
-                    break
-                
-                print(f"\r🔄 扫描中... 坐标: {pos.ljust(15)} | 状态: {status}   ", end="", flush=True)
-                time.sleep(0.05)
-
-        except KeyboardInterrupt:
-            print("\n⚠️ 用户手动中止！")
-            self._serial_send_wait("I") # 串口急停
+        # print(f"⚙️ [Stage] 配置扫描: {width_px}x{height_px}, 步长{step_um}um")
         
-        finally:
-            # 4. 任务结束，切回 SDK 模式以供后续常规操作
-            print("\n=== 扫描结束，恢复 SDK 连接 ===")
-            self.connect_sdk()
+        # 发送网格参数
+        self._serial_send_wait(f"N,{width_px-1},{height_px-1}")
+        self._serial_send_wait(f"X,{step_um},{step_um}")
+        
+        # 发送 AutoScan 参数
+        # AS, 曝光, 稳定, TTL脚, 高电平触发(H), 蛇形扫描(S)
+        cfg_str = f"AS,{exposure_ms},{settle_ms},{ttl_pin},H,S"
+        resp = self._serial_send_wait(cfg_str)
+        if "E" in resp: print(f"⚠️ Stage配置警告: {resp}")
 
-    def _print_stats(self, start_t, end_t, total, final_pos):
-        duration = end_t - start_t
-        avg_step = (duration * 1000) / total if total > 0 else 0
-        freq = 1000 / avg_step if avg_step > 0 else 0
-        print("\n" + "-"*40)
-        print(f"⏱️ 总耗时: {duration:.4f}s | 平均速度: {avg_step:.2f} ms/点 | 频率: {freq:.2f} Hz")
-        print(f"📍 最终坐标: {final_pos}")
-        print("-" * 40)
+    def start_scan_motion(self):
+        """发送启动指令 (AS,1)"""
+        # print("🚀 [Stage] 启动物理运动 (AS,1)")
+        self._serial_send_wait("AS,1")
 
-                
+    def get_pos_fast(self):
+        """
+        高速读取位置 (仅串口模式下可用)。
+        返回字符串 "X,Y,Z"
+        """
+        return self._serial_send_wait("P")
+
+    def is_scan_running(self):
+        """检查 AutoScan 是否还在运行 (返回 True/False)"""
+        status = self._serial_send_wait("AS")
+        return status != "0"
+
+    # =====================================================
+    #  Part C: 安全急停
+    # =====================================================
+
+    def emergency_stop(self):
+        """
+        [安全急停] 无论在什么模式，尝试一切手段停止电机。
+        """
+        # 1. 如果在串口模式，发送 I 和 K
+        try:
+            if self.mode == 'SERIAL' and self.ser:
+                self.ser.write(b"I\r"); time.sleep(0.05)
+                self.ser.write(b"K\r")
+        except:
+            pass
+
+        # 2. 尝试通过 SDK 停止
+        try:
+            if self.SDKPrior:
+                self.cmd_sdk_raw("controller.stop.abruptly")
+        except:
+            pass
 
 # =====================================================
-#  主程序调用示例
+#  测试代码
 # =====================================================
-
 if __name__ == "__main__":
-    dll_loc = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
-    com_port = "4" # 用户只需提供数字，类内部会自动处理
+    DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
+    COM_PORT = "4"
+
+    stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
+
+    print("--- 测试原 SDK 功能 ---")
+    print(f"SDK Version: {stage.get_SDK_version()}")
+    print(f"Session ID: {stage.get_ID()}")
+    print(f"Current Pos: {stage.get_position()}")
     
-    # 1. 初始化 (自动连接 SDK)
-    stage = PriorUnifiedStage(dll_loc, com_port)
+    # 测试 cmd_simple
+    stage.cmd_simple("controller.z.position.get")
+    print(f"Z Pos (via rx): {stage.rx.value.decode()}")
+
+    print("\n--- 测试高速扫描功能 ---")
+    stage.prepare_scan_serial(10, 10, 10, 100, 0)
+    stage.start_scan_motion()
     
-    # 2. 测试 SDK 功能
-    print(f"🔍 [SDK] 当前位置: {stage.get_position()}")
+    while stage.is_scan_running():
+        print(f"\rScanning... {stage.get_pos_fast()}", end="")
+        time.sleep(0.1)
     
-    # 3. 移动到一个起点 (SDK)
-    # stage.set_position([0, 0])
-    
-    # 4. 执行高速扫描 (自动切换到 串口 -> 扫描 -> 切回 SDK)
-    # 参数: 宽50px, 高50px, 步长10um
-    stage.perform_autoscan(50, 50, 1)
-    
-    # 5. 再次测试 SDK 功能 (验证是否切回来了)
-    print(f"🔍 [SDK] 扫描后位置: {stage.get_position()}")
-    
-    # 程序结束时会自动触发 emergency_stop 并断开连接
+    print("\n\n--- 测试切回 SDK ---")
+    print(f"Final Pos: {stage.get_position()}")

@@ -9,12 +9,16 @@ import time
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..', 'Library'))
 import atsapi as ats
 
-samplesPerSec = 4000000000.0
-triggerDelay_sec = 0
+
 class Board_DAQ():
-    def ConfigureBoard(self, board):
+    def __init__(self, board):
     # Configures a board for acquisition
-    def ConfigureBoard(self, board):
+        self.board = board
+        self.samplesPerSec = 4000000000.0
+        self.triggerDelay_sec = 0
+        # TODO: Select number of DMA buffers to allocate
+        self.bufferCount = 4
+    def ConfigureBoard(self):
         # TODO: Select clock parameters as required to generate this
         # sample rate
         #
@@ -25,31 +29,30 @@ class Board_DAQ():
         #  - or select clock source FAST_EXTERNAL_CLOCK, sample rate
         #    SAMPLE_RATE_USER_DEF, and connect a 100MHz signal to the
         #    EXT CLK BNC connector
-        global samplesPerSec, triggerDelay_sec
 
         # 所以 ECLK 属于系统设定的一部分
-        board.setCaptureClock(ats.INTERNAL_CLOCK,
+        self.board.setCaptureClock(ats.INTERNAL_CLOCK,
                             ats.SAMPLE_RATE_4000MSPS,
                             ats.CLOCK_EDGE_RISING,
                             0)
         
         # TODO: Select channel A input parameters as required.
-        board.inputControlEx(ats.CHANNEL_A,
+        self.board.inputControlEx(ats.CHANNEL_A,
                             ats.DC_COUPLING,
                             ats.INPUT_RANGE_PM_400_MV,
                             ats.IMPEDANCE_50_OHM)
         
         
         # TODO: Select channel B input parameters as required.
-        board.inputControlEx(ats.CHANNEL_B,
+        self.board.inputControlEx(ats.CHANNEL_B,
                             ats.DC_COUPLING,
-                            ats.INPUT_RANGE_PM_400_MV,
+                            ats.INPUT_RANGE_PM_5_V,
                             ats.IMPEDANCE_50_OHM)
         
         # TODO: Select trigger inputs and levels as required.
-        board.setTriggerOperation(ats.TRIG_ENGINE_OP_J,
+        self.board.setTriggerOperation(ats.TRIG_ENGINE_OP_J,
                                 ats.TRIG_ENGINE_J,
-                                ats.CHANNEL_A,    # 可以选择从哪里触发 atsappi.py ：line400
+                                ats.TRIG_EXTERNAL,    # 可以选择从哪里触发 atsappi.py ：line400
                                 ats.TRIGGER_SLOPE_POSITIVE,
                                 150,
                                 ats.TRIG_ENGINE_K,
@@ -58,16 +61,16 @@ class Board_DAQ():
                                 128)
 
         # TODO: Select external trigger parameters as required.
-        board.setExternalTrigger(ats.DC_COUPLING,
+        self.board.setExternalTrigger(ats.DC_COUPLING,
                                 ats.ETR_TTL)
 
         # TODO: Set trigger delay as required.
         
-        triggerDelay_samples = int(triggerDelay_sec * samplesPerSec + 0.5)
+        triggerDelay_samples = int(self.triggerDelay_sec * self.samplesPerSec + 0.5)
 
 
         # 让采集卡延迟 triggerDelay_samples 个采样点采样
-        board.setTriggerDelay(triggerDelay_samples)
+        self.board.setTriggerDelay(triggerDelay_samples)
 
         # TODO: Set trigger timeout as required.
         #
@@ -81,13 +84,13 @@ class Board_DAQ():
         # the board may trigger if the timeout interval expires before a
         # hardware trigger event arrives.
         # Gemini 说单位是 us
-        board.setTriggerTimeOut(0)
+        self.board.setTriggerTimeOut(0)
 
         # Configure AUX I/O connector as required
-        board.configureAuxIO(ats.AUX_OUT_TRIGGER,
+        self.board.configureAuxIO(ats.AUX_OUT_TRIGGER,
                             0)
         
-    def AcquireData(self, board):
+    def AcquireData(self):
         # No pre-trigger samples in NPT mode
         preTriggerSamples = 0
 
@@ -117,14 +120,15 @@ class Board_DAQ():
                                         "data.bin"), 'wb')
 
         # Compute the number of bytes per record and per buffer
-        memorySize_samples, bitsPerSample = board.getChannelInfo()
+        memorySize_samples, bitsPerSample = self.board.getChannelInfo()
+        print("memorySize_samples, bitsPerSample is :", bitsPerSample)
         bytesPerSample = (bitsPerSample.value + 7) // 8
+        print("bytesPerSample is :", bytesPerSample)
         samplesPerRecord = preTriggerSamples + postTriggerSamples
         bytesPerRecord = bytesPerSample * samplesPerRecord
         bytesPerBuffer = bytesPerRecord * recordsPerBuffer * channelCount
-
-        # TODO: Select number of DMA buffers to allocate
-        bufferCount = 4
+        print("bytesPerBuffer is :", bytesPerBuffer)
+        
 
         # Allocate DMA buffers
 
@@ -133,16 +137,16 @@ class Board_DAQ():
             sample_type = ctypes.c_uint16
 
         buffers = []
-        for i in range(bufferCount):
-            buffers.append(ats.DMABuffer(board.handle, sample_type, bytesPerBuffer))
+        for i in range(self.bufferCount):
+            buffers.append(ats.DMABuffer(self.board.handle, sample_type, bytesPerBuffer))
         
         # Set the record size
-        board.setRecordSize(preTriggerSamples, postTriggerSamples)
+        self.board.setRecordSize(preTriggerSamples, postTriggerSamples)
 
         recordsPerAcquisition = recordsPerBuffer * buffersPerAcquisition
 
         # Configure the board to make an NPT AutoDMA acquisition
-        board.beforeAsyncRead(channels,
+        self.board.beforeAsyncRead(channels,
                             -preTriggerSamples,
                             samplesPerRecord,
                             recordsPerBuffer,
@@ -153,11 +157,11 @@ class Board_DAQ():
 
         # Post DMA buffers to board
         for buffer in buffers:
-            board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+            self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
 
         start = time.time() # Keep track of when acquisition started
         try:
-            board.startCapture() # Start the acquisition
+            self.board.startCapture() # Start the acquisition
             print("Capturing %d buffers. Press <enter> to abort" %
                 buffersPerAcquisition)
             buffersCompleted = 0
@@ -167,7 +171,7 @@ class Board_DAQ():
                 # Wait for the buffer at the head of the list of available
                 # buffers to be filled by the board.
                 buffer = buffers[buffersCompleted % len(buffers)]
-                board.waitAsyncBufferComplete(buffer.addr, timeout_ms=5000)
+                self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=5000)
                 buffersCompleted += 1
                 bytesTransferred += buffer.size_bytes
                 # --- 新增绘图部分 ---
@@ -187,7 +191,9 @@ class Board_DAQ():
                 plt.xlabel("Samples")
                 plt.ylabel("ADC Code")
                 plt.ylim(0, 65535) # 16-bit 数据的显示范围
+                plt.savefig("live_plot.png") # 每次采集覆盖这张图
                 plt.pause(0.01)    # 必须加 pause，否则窗口会卡死
+                
                 # -------------------
                 # TODO: Process sample data in this buffer. Data is available
                 # as a NumPy array at buffer.buffer
@@ -217,9 +223,9 @@ class Board_DAQ():
                     buffer.buffer.tofile(dataFile)
 
                 # Add the buffer to the end of the list of available buffers.
-                board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+                self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
         finally:
-            board.abortAsyncRead()
+            self.board.abortAsyncRead()
         # Compute the total transfer time, and display performance information.
         transferTime_sec = time.time() - start
         print("Capture completed in %f sec" % transferTime_sec)
@@ -245,5 +251,7 @@ if __name__ == "__main__":
     board = ats.Board(systemId = 1, boardId = 1)
     # 这里记得调用类方法时，如果你已经把函数封装进 Board_DAQ 类，
     # 需要实例化类或者直接调用（当前代码中 ConfigureBoard 带有 self 参数，请注意调用方式）
-    Board_DAQ.ConfigureBoard(board) 
-    Board_DAQ.AcquireData(board)
+    board_daq_process=Board_DAQ(board)
+
+    board_daq_process.ConfigureBoard() 
+    board_daq_process.AcquireData()
