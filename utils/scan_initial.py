@@ -47,7 +47,7 @@ class Prior_xy_stage:
         return self.cmd("controller.disconnect")
     
 
-
+ 
 if __name__ == "__main__":
     stage=Prior_xy_stage(r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll","4")
     print(stage.get_SDK_vision())
