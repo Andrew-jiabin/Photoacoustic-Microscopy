@@ -14,14 +14,14 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数
-    SCAN_W = 100       # 像素宽
-    SCAN_H = 100       # 像素高
-    STEP_UM = 10       # 步长 (um)
-    EXPOSURE_MS = 1    # 每个点曝光/脉冲时间 (位移台参数)
+    SCAN_W = 20       # 像素宽
+    SCAN_H = 20       # 像素高
+    STEP_UM = 1       # 步长 (um)
+    EXPOSURE_MS = 10    # 每个点曝光/脉冲时间 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 4096
-    RECORDS_BUF = 50   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
+    RECORDS_BUF = 1   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
     
     # === 2. 初始化硬件 ===
     try:
@@ -33,7 +33,7 @@ def main():
         daq.configure_board() # 80kHz 外部触发配置
         daq.prepare_acquisition(samples_per_record=SAMPLES_REC, 
                                 records_per_buffer=RECORDS_BUF,
-                                buffer_count=8) # 准备 DMA
+                                buffer_count=4) # 准备 DMA
         
         # === 3. 配置扫描 ===
         # 准备位移台 (此时未动)
@@ -52,15 +52,15 @@ def main():
         daq.start_capture()
         
         # B. 开启 位移台 (开始发出 TTL 触发 & 移动)
-        stage.start_scan_motion()
-        
         start_t = time.time()
-        
-        # === 5. 主循环 (Polling Loop) ===
         print("Starting Main Loop...")
-        
         last_pos_str = ""
         total_buffers_captured = 0
+        stage.start_scan_motion()
+        
+        # === 5. 主循环 (Polling Loop) ===
+        
+
         
         while True:
             # --- A. 获取 DAQ 数据 ---

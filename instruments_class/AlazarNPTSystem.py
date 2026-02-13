@@ -14,14 +14,10 @@ class AlazarNPTSystem:
         self.board = ats.Board(systemId=systemId, boardId=boardId)
         self.buffers = []
         self.buffer_list_handle = [] # 保持对Buffer对象的引用防止被GC
-        self.samplesPerSec = 4000000000.0
+        self.samplesPerSec = 2000000000.0
         self.is_capturing = False
         
-    def configure_board(self, internal_freq=80000):
-        """
-        配置板卡。
-        :param internal_freq: 内部触发频率 (Hz), 默认 80kHz
-        """
+    def configure_board(self):
         # 时钟设置 (4GS/s)
         self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_4000MSPS, ats.CLOCK_EDGE_RISING, 0)
         
@@ -106,29 +102,23 @@ class AlazarNPTSystem:
         
         buffer = self.buffers[self.buffer_idx % self.bufferCount]
         
-        try:
-            # 这里的 timeout 决定了主循环的卡顿程度
-            # 如果激光是 80kHz, 1个buffer存10个record，理论只需 0.125ms
-            # 所以 timeout_ms=10 足够了
-            self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=timeout_ms)
-            
-            # 1. 拷贝数据 (非常重要！因为 DMA 会复写这块内存)
-            # data_copy = np.array(buffer.buffer, copy=True)
-            # 为了速度，可以使用 copy
-            data_copy = np.copy(buffer.buffer)
-            
-            # 2. 重新提交 Buffer
-            self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
-            self.buffer_idx += 1
-            
-            return data_copy, True
-            
-        except ats.AlazarException as e:
-            # 超时是正常的，意味着还没有攒够数据
-            if "ApiWaitTimeout" in str(e): 
-                return None, False
-            else:
-                raise e
+        
+        # 这里的 timeout 决定了主循环的卡顿程度
+        # 如果激光是 80kHz, 1个buffer存10个record，理论只需 0.125ms
+        # 所以 timeout_ms=10 足够了
+        self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=timeout_ms)
+        
+        # 1. 拷贝数据 (非常重要！因为 DMA 会复写这块内存)
+        # data_copy = np.array(buffer.buffer, copy=True)
+        # 为了速度，可以使用 copy
+        data_copy = np.copy(buffer.buffer)
+        
+        # 2. 重新提交 Buffer
+        self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+        self.buffer_idx += 1
+        
+        return data_copy, True
+
 
     def stop_capture(self):
         print("🛑 [DAQ] 停止采集")
