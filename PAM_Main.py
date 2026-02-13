@@ -1,16 +1,21 @@
 # PAM_Main_Controller.py
+gc.collect()   # 手动大扫除
+gc.disable()   # 关掉自动回收（在此期间 Python 不会暂停）
 import time
 import numpy as np
 import scipy.io as sio # 用于保存 mat 文件
 import matplotlib.pyplot as plt
 import atsapi as ats
- 
+import gc
+# 扫描开始前
 # 导入模块
+
 from instruments_class.PriorUnifiedStage import PriorUnifiedStage
 from instruments_class.AlazarNPTSystem import AlazarNPTSystem
-from instruments_class.shared_progress import progress_manager
+from instruments_class.AsyncProgress import progress_manager
+
 def main():
-    # === 1. 参数设置 ===
+    # ============================== 1. 参数设置 =================================
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
     COM_PORT = "4"
     save_path = "./data.mat"
@@ -18,13 +23,28 @@ def main():
     SCAN_W = 20       # 像素宽
     SCAN_H = 20       # 像素高
     STEP_UM = 1       # 步长 (um)
-    EXPOSURE_MS = 20    # 每个点曝光 (位移台参数)
+    EXPOSURE_MS = 20  # 每个点曝光 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 4096
     RECORDS_BUF = 16   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
     RECORDS_PER_POINT = 1024 # 每个点记录多少个record
     Buffer_Count = 4   # 用多少个buffer来收集数据，少了CPU可能忙不过来
+
+    
+    # 数据量计算与内存使用分析：
+    # 1. 基础扫描范围数据量：
+    # 20 × 20 (点) × 1024 (Rec/点) × 4096 (Sample/Rec) × 2 (Bytes) ≈ 3.3 GB
+    # 该数据量对于16GB内存是安全的。
+
+    # 2. 扩大扫描范围后的风险：
+    # 若扫描范围扩大到 100 × 100，数据量将达到 83 GB，程序会直接崩溃。
+
+    # 3. 优化建议：
+    # 如果未来需要做大图扫描，必须在 get_one_acquisition 函数中做实时平均（Averaging），
+    # 将 1024 次数据平均成 1 次，可使数据量缩小 1024 倍。
+    # ============================== 1. 参数设置 =================================
+
     progress_manager.start(total=SCAN_W*SCAN_H, desc="PAM Scan")
 
     # === 2. 初始化硬件 ===
@@ -153,3 +173,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    gc.enable()    # 恢复功能
