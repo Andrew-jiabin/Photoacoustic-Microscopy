@@ -44,26 +44,29 @@ class AlazarNPTSystem:
         self.board.setTriggerDelay(0)
         self.board.setTriggerTimeOut(0) # 无限等待触发
         
-        # 配置 AUX I/O 输出 Pacer 信号 (如果需要板卡产生80k给激光器，需要用 AUX_OUT_PACER)
         # 如果激光器自己发光并给板卡触发，则无需此步，或设为 AUX_OUT_TRIGGER
         self.board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
         print("✅ [DAQ] 板卡配置完成")
 
-    def prepare_acquisition(self, samples_per_record=4096, records_per_buffer=10, buffer_count=8):
+    def prepare_acquisition(self,num_points:int,acq_channel=ats.CHANNEL_A, samples_per_record=4096,
+                             records_per_buffer=16,buffer_count=4, records_per_point=1024, preTriggerSamples=0):
         """
         分配 DMA 内存
         """
         self.samplesPerRecord = samples_per_record
         self.recordsPerBuffer = records_per_buffer
         self.bufferCount = buffer_count
+        self.recordsPerPoint = records_per_point
+        self.preTriggerSamples = preTriggerSamples
+        self.buffersPerPoint=records_per_point/records_per_buffer
         
         # 计算大小
         _, bitsPerSample = self.board.getChannelInfo()
         bytesPerSample = (bitsPerSample.value + 7) // 8
-        self.bytesPerBuffer = bytesPerSample * samples_per_record * records_per_buffer
+        self.bytesPerBuffer = bytesPerSample * self.samplesPerRecord * self.recordsPerBuffer
         
         # 通道掩码 (只采 A 通道示例)
-        self.channels = ats.CHANNEL_A 
+        self.channels = acq_channel
         
         # 分配 Buffer
         sample_type = ctypes.c_uint8 if bytesPerSample == 1 else ctypes.c_uint16
@@ -72,52 +75,58 @@ class AlazarNPTSystem:
             self.buffers.append(ats.DMABuffer(self.board.handle, sample_type, self.bytesPerBuffer))
             
         # 提交 Buffer 给驱动
-        self.board.setRecordSize(0, samples_per_record)
+        self.board.setRecordSize(self.preTriggerSamples, self.samplesPerRecord)
         
         # 无限采集模式设置 (recordsPerAcquisition 设置为 infinite 0x7FFFFFFF)
         # 也可以设置为足够大的数
         self.board.beforeAsyncRead(self.channels,
                                    0,
-                                   samples_per_record,
-                                   records_per_buffer,
-                                   0x7FFFFFFF, 
+                                   self.samplesPerRecord,
+                                   self.recordsPerBuffer,
+                                   self.recordsPerPoint * num_points, 
                                    ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT | ats.ADMA_FIFO_ONLY_STREAMING)
 
         for buf in self.buffers:
             self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
-            
-        self.buffer_idx = 0 # 循环索引
+
+        self.buffer_idx = 0 # 循环索引    
+        
 
     def start_capture(self):
         self.board.startCapture()
         self.is_capturing = True
         print("🚀 [DAQ] 开始采集 (等待触发)...")
 
-    def fetch_next_buffer(self, timeout_ms=10):
-        """
-        尝试获取下一个 Buffer 数据 (非阻塞/短超时)
-        :return: (numpy_array, bool_success)
-        """
-        if not self.is_capturing: return None, False
+    def get_one_acquisition(self, all_data, pos_mapping, curr_pos_str, timeout_ms=10):
         
-        buffer = self.buffers[self.buffer_idx % self.bufferCount]
+        pixel_data_buffers = [] # 临时存放当前点的所有buffer数据
+        for _ in range(self.buffersPerPoint):
+            # 这里的 timeout_ms 如果超时，说明位移台还没触发够次数，或者激光停了
+            data = self.fetch_next_buffer(timeout_ms/self.buffersPerPoint)
+            pixel_data_buffers.append(data)
         
-        
-        # 这里的 timeout 决定了主循环的卡顿程度
-        # 如果激光是 80kHz, 1个buffer存10个record，理论只需 0.125ms
-        # 所以 timeout_ms=10 足够了
-        self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=timeout_ms)
-        
-        # 1. 拷贝数据 (非常重要！因为 DMA 会复写这块内存)
-        # data_copy = np.array(buffer.buffer, copy=True)
-        # 为了速度，可以使用 copy
-        data_copy = np.copy(buffer.buffer)
-        
-        # 2. 重新提交 Buffer
-        self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
-        self.buffer_idx += 1
-        
-        return data_copy, True
+        all_data.append(pixel_data_buffers)
+        pos_mapping.append(curr_pos_str)
+    
+    def _fetch_next_buffer(self, timeout_ms=10):
+        try:
+            buffer = self.buffers[self.buffer_idx % self.bufferCount]
+            
+            # 这里的 timeout 决定了主循环的卡顿程度, 如果激光是 80kHz, 1个buffer存10个record, 理论只需 0.125ms, 所以 timeout_ms=10 足够了
+            self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=timeout_ms)
+            
+            # 1. 拷贝数据 (非常重要！因为 DMA 会复写这块内存)
+            # data_copy = np.array(buffer.buffer, copy=True)
+            # 为了速度，可以使用 copy
+            data_copy = np.copy(buffer.buffer)
+            
+            # 2. 重新提交 Buffer
+            self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
+            self.buffer_idx += 1
+        except TimeoutError:
+            print("单点数据采集时间不足，无法完成采集")
+
+        return data_copy
 
 
     def stop_capture(self):
