@@ -1,4 +1,5 @@
 # PAM_Main_Controller.py
+import gc
 gc.collect()   # 手动大扫除
 gc.disable()   # 关掉自动回收（在此期间 Python 不会暂停）
 import time
@@ -6,7 +7,7 @@ import numpy as np
 import scipy.io as sio # 用于保存 mat 文件
 import matplotlib.pyplot as plt
 import atsapi as ats
-import gc
+import traceback
 # 扫描开始前
 # 导入模块
 
@@ -23,12 +24,12 @@ def main():
     SCAN_W = 20       # 像素宽
     SCAN_H = 20       # 像素高
     STEP_UM = 1       # 步长 (um)
-    EXPOSURE_MS = 20  # 每个点曝光 (位移台参数)
+    EXPOSURE_MS =  100   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 4096
     RECORDS_BUF = 16   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
-    RECORDS_PER_POINT = 1024 # 每个点记录多少个record
+    RECORDS_PER_POINT = 512 # 每个点记录多少个record
     Buffer_Count = 4   # 用多少个buffer来收集数据，少了CPU可能忙不过来
 
     
@@ -45,7 +46,7 @@ def main():
     # 将 1024 次数据平均成 1 次，可使数据量缩小 1024 倍。
     # ============================== 1. 参数设置 =================================
 
-    progress_manager.start(total=SCAN_W*SCAN_H, desc="PAM Scan")
+    
 
     # === 2. 初始化硬件 ===
     try:
@@ -70,29 +71,33 @@ def main():
         # 这里假设采集 100x100 的图像，每个位置可能有多个激光trigger
         all_data = []      # 存 DAQ 数据
         pos_mapping = []   # 存 (X,Y, Buffer_Index)
-        temp_data=[]       # 暂存一次DAQ的数据
         last_pos_str = ""
         positio_point_count = 0
-        input("Press Enter to START Experiment... (确保激光器已开)")
+        input("Press Enter to START Experiment... (确保激光器已开)\n\n")
+        print("Starting Main Loop...")
+        curr_pos_str = stage.get_pos_fast()
+        progress_manager.start(total=SCAN_W*SCAN_H, desc=f"📍 Pos: {curr_pos_str}")
         
         # === 4. 启动同步 ===
         # A. 开启 DAQ (进入等待触发状态)
         start_t = time.time()
-        print("Starting Main Loop...")
         daq.start_capture()
-        # B. 开启 位移台 (开始发出 TTL 触发 & 移动)
-        curr_pos_str = stage.get_pos_fast()
-        stage.start_scan_motion()
-        # === 5. 主循环 (Polling Loop) ===
 
+        # B. 开启 位移台 (开始发出 TTL 触发 & 移动)
+        stage.start_scan_motion()
+
+        # === 5. 主循环 (Polling Loop) ===
         while True:
             while (curr_pos_str == last_pos_str):
                 curr_pos_str = stage.get_pos_fast()
+                time.sleep(0.001) # 给 CPU 和串口缓冲的时间
 
             daq.get_one_acquisition(all_data, pos_mapping, curr_pos_str, timeout_ms=int(EXPOSURE_MS*3/4))
+            
 
             last_pos_str = curr_pos_str        
             progress_manager.update(1)
+            progress_manager.set_description(f"📍 Pos: {curr_pos_str}") # 实时显示坐标
             positio_point_count += 1
         
             if positio_point_count >= SCAN_W * SCAN_H:
@@ -100,8 +105,9 @@ def main():
                 break
 
     except StopIteration:
+        print("\n🛑 StopIteration！ 程序直接停止！")
         pass
-    except ats.ApiWaitTimeout:
+    except TimeoutError:
         print("\n❌ 采集超时！可能是激光器没开，或者位移台触发线没接好。")
     except KeyboardInterrupt:
         print("\n🛑 用户强制停止！")
@@ -111,7 +117,8 @@ def main():
         daq.stop_capture()
         try: stage.connect_sdk() 
         except: pass
-
+        progress_manager.stop()
+        gc.enable()
         duration = time.time() - start_t
         
         # --- 新版解析逻辑 ---
@@ -173,4 +180,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    gc.enable()    # 恢复功能

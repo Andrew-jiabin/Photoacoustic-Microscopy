@@ -4,7 +4,7 @@ import numpy as np
 import os
 import sys
 import time
-
+import traceback
 # 假设 atsapi 就在 Library 路径下，或者你可以直接 pip install atsapi
 # sys.path.append(os.path.join(os.path.dirname(__file__), '../..', 'Library'))
 import atsapi as ats
@@ -28,7 +28,7 @@ class AlazarNPTSystem:
         # 触发设置 (使用 Channel A 作为触发源? 还是外部 TTL?)
         # 你的描述是：激光使用内部频率(80K)进行发射,该80K的脉冲也引到trigger
         # 这意味着采集卡应该设置为【外部触发】(External Trigger)
-        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_TTL)
+        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_2V5)
         
         self.board.setTriggerOperation(ats.TRIG_ENGINE_OP_J,
                                        ats.TRIG_ENGINE_J,
@@ -58,7 +58,7 @@ class AlazarNPTSystem:
         self.bufferCount = buffer_count
         self.recordsPerPoint = records_per_point
         self.preTriggerSamples = preTriggerSamples
-        self.buffersPerPoint=records_per_point/records_per_buffer
+        self.buffersPerPoint=int(records_per_point//records_per_buffer)
         
         # 计算大小
         _, bitsPerSample = self.board.getChannelInfo()
@@ -95,20 +95,19 @@ class AlazarNPTSystem:
     def start_capture(self):
         self.board.startCapture()
         self.is_capturing = True
-        print("🚀 [DAQ] 开始采集 (等待触发)...")
 
-    def get_one_acquisition(self, all_data, pos_mapping, curr_pos_str, timeout_ms=10):
+    def get_one_acquisition(self, all_data, pos_mapping, curr_pos_str, timeout_ms):
         
         pixel_data_buffers = [] # 临时存放当前点的所有buffer数据
         for _ in range(self.buffersPerPoint):
             # 这里的 timeout_ms 如果超时，说明位移台还没触发够次数，或者激光停了
-            data = self.fetch_next_buffer(timeout_ms/self.buffersPerPoint)
+            data = self._fetch_next_buffer(int(timeout_ms/self.buffersPerPoint))
             pixel_data_buffers.append(data)
         
         all_data.append(pixel_data_buffers)
         pos_mapping.append(curr_pos_str)
     
-    def _fetch_next_buffer(self, timeout_ms=10):
+    def _fetch_next_buffer(self, timeout_ms):
         try:
             buffer = self.buffers[self.buffer_idx % self.bufferCount]
             
@@ -123,8 +122,9 @@ class AlazarNPTSystem:
             # 2. 重新提交 Buffer
             self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
             self.buffer_idx += 1
-        except TimeoutError:
-            print("单点数据采集时间不足，无法完成采集")
+            # print(self.buffer_idx)
+        except Exception as e:
+            print(traceback.format_exc())
 
         return data_copy
 

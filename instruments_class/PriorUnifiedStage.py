@@ -146,7 +146,7 @@ class PriorUnifiedStage:
         """(内部函数) 串口发送并等待回复"""
         if not self.ser: return ""
         try:
-            self.ser.flushInput()
+            # self.ser.flushInput()
             self.ser.write((cmd_text + "\r").encode('ascii'))
             return self.ser.read_until(b'\r').decode('ascii', errors='ignore').strip()
         except Exception:
