@@ -21,17 +21,17 @@ def main():
     COM_PORT = "4"
     save_path = "./data.mat"
     # 扫描参数
-    SCAN_W = 20       # 像素宽
-    SCAN_H = 20       # 像素高
+    SCAN_W = 10       # 像素宽
+    SCAN_H = 10       # 像素高
     STEP_UM = 1       # 步长 (um)
     EXPOSURE_MS =  100   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 4096
     RECORDS_BUF = 16   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
-    RECORDS_PER_POINT = 512 # 每个点记录多少个record
+    RECORDS_PER_POINT = 512 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
     Buffer_Count = 4   # 用多少个buffer来收集数据，少了CPU可能忙不过来
-
+    AVERAGE_ENABLE = True
     
     # 数据量计算与内存使用分析：
     # 1. 基础扫描范围数据量：
@@ -76,8 +76,8 @@ def main():
         input("Press Enter to START Experiment... (确保激光器已开)\n\n")
         print("Starting Main Loop...")
         curr_pos_str = stage.get_pos_fast()
-        progress_manager.start(total=SCAN_W*SCAN_H, desc=f"📍 Pos: {curr_pos_str}")
-        
+        progress_manager.start(total=SCAN_W*SCAN_H, desc=f"\033[31m📍 Pos: {curr_pos_str}\033[31m")
+        progress_manager.set_colour("cyan") # 扫描开始，设为青色
         # === 4. 启动同步 ===
         # A. 开启 DAQ (进入等待触发状态)
         start_t = time.time()
@@ -92,71 +92,82 @@ def main():
                 curr_pos_str = stage.get_pos_fast()
                 time.sleep(0.001) # 给 CPU 和串口缓冲的时间
 
-            daq.get_one_acquisition(all_data, pos_mapping, curr_pos_str, timeout_ms=int(EXPOSURE_MS*3/4))
+            daq.get_one_acquisition(all_data, pos_mapping, curr_pos_str, timeout_ms=int(EXPOSURE_MS*3/4), Average_Enable=AVERAGE_ENABLE)
             
 
             last_pos_str = curr_pos_str        
             progress_manager.update(1)
-            progress_manager.set_description(f"📍 Pos: {curr_pos_str}") # 实时显示坐标
+            progress_manager.set_description(f"📍 Pos: {curr_pos_str}",color="green") # 实时显示坐标
             positio_point_count += 1
         
             if positio_point_count >= SCAN_W * SCAN_H:
-                print("\n✅ 所有预定点位采集完成！")
                 break
 
     except StopIteration:
+        progress_manager.set_colour("red")
         print("\n🛑 StopIteration！ 程序直接停止！")
         pass
     except TimeoutError:
+        progress_manager.set_colour("red") 
         print("\n❌ 采集超时！可能是激光器没开，或者位移台触发线没接好。")
     except KeyboardInterrupt:
+        progress_manager.set_colour("red")
         print("\n🛑 用户强制停止！")
         
     finally:
         # === 6. 清理与保存 ===
+        # 立即停止硬件采集，防止 DMA 继续向已回收的内存写入
         daq.stop_capture()
+        
+        # 确保进度条完全停止并刷新终端，避免 UI 干扰接下来的打印
+        progress_manager.set_colour("green")
+        try: progress_manager.stop()
+        except: pass
+        
+        # 恢复垃圾回收机制并尝试切换回 SDK 模式
+        import gc
+        gc.enable()
         try: stage.connect_sdk() 
         except: pass
-        progress_manager.stop()
-        gc.enable()
-        duration = time.time() - start_t
-        
-        # --- 新版解析逻辑 ---
-        # 假设：
-        # N_POINTS = len(all_data)
-        # BUFS_PER_POINT = len(all_data[0]) if N_POINTS > 0 else 0
-        # RECORDS_PER_BUF = daq.recordsPerBuffer
-        # SAMPLES_PER_REC = daq.postTriggerSamples
 
+        duration = time.time() - start_t
         print(f"\n📊 实验耗时: {duration:.2f}s")
         print(f"📦 采集点数: {len(all_data)}")
 
         if len(all_data) > 0:
             print(f"💾 正在解析并保存数据至 {save_path} ... ")
+            
+            # --- 坐标解析 (数值化) ---
             try:
-                # 逻辑：对每个字符串按逗号分割，转为 float
+                # 将坐标字符串解析为 (N, 3) 的 float64 矩阵，方便 MATLAB 直接处理
                 pos_numeric = np.array([[float(v) for v in s.split(',')] for s in pos_mapping])
             except Exception as e:
-                print(f"⚠️ 坐标解析失败，可能存在非标格式: {e}")
-                pos_numeric = np.array(pos_mapping) # 降级方案：存原始字符串
+                print(f"⚠️ 坐标解析失败: {e}")
+                pos_numeric = np.array(pos_mapping) 
 
+            # --- 数据重塑与平均逻辑 ---
             try:
-                # 1. 展平嵌套列表：从 [ [buf1, buf2], [buf3, buf4] ] 变成 [buf1, buf2, buf3, buf4]
+                # 1. 展平嵌套列表
+                # 如果开启了 Average_Enable，每个子列表里现在只有 1 个 summed_data 数组
                 flattened_buffers = [buf for point_bufs in all_data for buf in point_bufs]
                 
-                # 2. 拼接为大矩阵 (shape: 总Buffer数 * 每个Buffer的采样点数)
-                # 使用 np.vstack 比 np.concatenate 在处理 1D 数组时更稳健
+                # 2. 垂直堆叠为大矩阵 (Point, Samples)
                 raw_matrix = np.vstack(flattened_buffers) 
                 
-                # 3. 重新塑形为四维或三维张量
-                # 建议形状: (点数, 每个点的记录总数, 每个记录的采样点数)
-                # 总记录数 = N_POINTS * (BUFS_PER_POINT * RECORDS_PER_BUF)
-                final_data = raw_matrix.reshape(len(all_data), -1, SAMPLES_REC)
+                if AVERAGE_ENABLE:
+                    # 计算公式: Final_Data = sum(Records) / RECORDS_ACQ
+                    # 此时 raw_matrix 的 dtype 是 uint32，除法会自动处理精度
+                    final_data = (raw_matrix / RECORDS_PER_POINT).astype(np.uint16)
+                    # 重新塑形为 (点数, 1, 采样点数) 以符合你的 3D 维度要求
+                    final_data = final_data.reshape(len(all_data), 1, SAMPLES_REC)
+                else:
+                    # 原始非平均模式
+                    final_data = raw_matrix.reshape(len(all_data), -1, SAMPLES_REC)
                 
                 # 4. 封装字典
                 mat_dict = {
-                    "raw_data": final_data,            # 维度: (Point, Record, Sample)
-                    "pos_map": pos_numeric,  # 对应的坐标字符串列表
+                    "raw_data": final_data,
+                    "pos_map": pos_numeric,
                     "scan_params": {
                         "width": SCAN_W,
                         "height": SCAN_H,
@@ -164,19 +175,22 @@ def main():
                     },
                     "daq_params": {
                         "samples_per_record": SAMPLES_REC,
-                        "records_per_buffer": RECORDS_BUF,
-                        "buffers_per_point": len(all_data[0])
+                        "records_per_point": RECORDS_PER_POINT,
+                        "is_averaged": int(AVERAGE_ENABLE)
                     }
                 }
                 
-                # 5. 保存 (针对 PhD 大数据量，开启压缩)
+                # 5. 保存文件 (如果不追求文件大小，do_compression=False 可以让保存瞬间完成)
                 sio.savemat(save_path, mat_dict, do_compression=True)
-                print(f"✅ 成功保存！矩阵维度: {final_data.shape}")
+                print(f"✅ 成功保存！最终矩阵维度: {final_data.shape}")
 
             except MemoryError:
-                print("❌ 内存爆炸！建议降低每个点的 Buffer 数量或分块保存。")
+                print("❌ 内存爆炸！可能是由于 raw_matrix 展平时申请了过大的连续空间。")
+            except Exception as e:
+                import traceback
+                print(f"❌ 数据处理发生意外错误:\n{traceback.format_exc()}")
         else:
-            print("⚠️ 未采集到任何数据。")
+            print("⚠️ 未采集到任何有效数据，跳过保存。")
 
 if __name__ == "__main__":
     main()

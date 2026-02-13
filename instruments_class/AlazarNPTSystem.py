@@ -96,16 +96,31 @@ class AlazarNPTSystem:
         self.board.startCapture()
         self.is_capturing = True
 
-    def get_one_acquisition(self, all_data, pos_mapping, curr_pos_str, timeout_ms):
+    def get_one_acquisition(self, all_data, pos_mapping, curr_pos_str, timeout_ms, Average_Enable=False):
+        pixel_data_buffers = []
+        sub_timeout = int(timeout_ms / self.buffersPerPoint)
         
-        pixel_data_buffers = [] # 临时存放当前点的所有buffer数据
         for _ in range(self.buffersPerPoint):
-            # 这里的 timeout_ms 如果超时，说明位移台还没触发够次数，或者激光停了
-            data = self._fetch_next_buffer(int(timeout_ms/self.buffersPerPoint))
-            pixel_data_buffers.append(data)
+            data = self._fetch_next_buffer(sub_timeout)
+            if data is not None:
+                pixel_data_buffers.append(data)
         
-        all_data.append(pixel_data_buffers)
+        if Average_Enable and len(pixel_data_buffers) > 0:
+            # --- 高性能简化操作 ---，1. 直接拼接原始 Buffer (不做 reshape)
+            combined_raw = np.concatenate(pixel_data_buffers)
+            
+            # 2. 仅进行整数求和 (dtype 使用 uint32 防止溢出)，这比 np.mean 快得多，因为不涉及浮点运算和除法
+            summed_data = np.sum(combined_raw.reshape(-1, self.samplesPerRecord), 
+                                 axis=0, dtype=np.uint32)
+            
+            # 3. 存入结果，不进行类型转换，留给最后处理
+            all_data.append([summed_data])
+        else:
+            all_data.append(pixel_data_buffers)
+            
         pos_mapping.append(curr_pos_str)
+
+        
     
     def _fetch_next_buffer(self, timeout_ms):
         try:
@@ -130,6 +145,6 @@ class AlazarNPTSystem:
 
 
     def stop_capture(self):
-        print("🛑 [DAQ] 停止采集")
+        # print("🛑 [DAQ] 停止采集")
         self.board.abortAsyncRead()
         self.is_capturing = False
