@@ -19,7 +19,7 @@ class AlazarNPTSystem:
         
     def configure_board(self):
         # 时钟设置 (4GS/s)
-        self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_4000MSPS, ats.CLOCK_EDGE_RISING, 0)
+        self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_2000MSPS, ats.CLOCK_EDGE_RISING, 0)
         
         # 通道设置
         self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_400_MV, ats.IMPEDANCE_50_OHM)
@@ -128,6 +128,7 @@ class AlazarNPTSystem:
             
             # 这里的 timeout 决定了主循环的卡顿程度, 如果激光是 80kHz, 1个buffer存10个record, 理论只需 0.125ms, 所以 timeout_ms=10 足够了
             self.board.waitAsyncBufferComplete(buffer.addr, timeout_ms=timeout_ms)
+            # 经验：如果出现 ApiWaitTimeout 一定要检查 Trigger 本身是不是有问题
             
             # 1. 拷贝数据 (非常重要！因为 DMA 会复写这块内存)
             # data_copy = np.array(buffer.buffer, copy=True)

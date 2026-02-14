@@ -11,10 +11,10 @@ import traceback
 # 扫描开始前
 # 导入模块
 
-from instruments_class.PriorUnifiedStage import PriorUnifiedStage
-from instruments_class.AlazarNPTSystem import AlazarNPTSystem
-from instruments_class.AsyncProgress import progress_manager
-
+from Alazar_imaging.PriorUnifiedStage import PriorUnifiedStage
+from Alazar_imaging.AlazarNPTSystem import AlazarNPTSystem
+from Alazar_imaging.AsyncProgress import progress_manager
+from Alazar_imaging.Alazar_imaging_tools import get_expected_trajectory
 def main():
     # ============================== 1. 参数设置 =================================
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
@@ -24,13 +24,14 @@ def main():
     SCAN_W = 10       # 像素宽
     SCAN_H = 10       # 像素高
     STEP_UM = 1       # 步长 (um)
-    EXPOSURE_MS =  100   # 每个点曝光时间 (位移台参数)
+    EXPOSURE_MS =  50   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
-    SAMPLES_REC = 4096
+    SAMPLES_REC = 2048
     RECORDS_BUF = 16   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
-    RECORDS_PER_POINT = 512 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
-    Buffer_Count = 4   # 用多少个buffer来收集数据，少了CPU可能忙不过来
+    RECORDS_PER_POINT = 256 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
+    Buffer_Count = 4   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
+    SETTLE_MS = int(EXPOSURE_MS/10)
     AVERAGE_ENABLE = True
     
     # 数据量计算与内存使用分析：
@@ -64,19 +65,24 @@ def main():
         
         # === 3. 配置扫描 ===
         # 准备位移台 (此时未动)
-        stage.prepare_scan_serial(SCAN_W, SCAN_H, STEP_UM, EXPOSURE_MS, 0)
+        stage.prepare_scan_serial(width_px=SCAN_W, height_px=SCAN_H,
+                                step_um=STEP_UM, exposure_ms=EXPOSURE_MS,
+                                settle_ms=SETTLE_MS, ttl_pin=0)
         
         # 准备数据存储 (内存 RAM)
         # 注意: 如果数据量太大(>8GB), 列表会爆内存。
         # 这里假设采集 100x100 的图像，每个位置可能有多个激光trigger
         all_data = []      # 存 DAQ 数据
         pos_mapping = []   # 存 (X,Y, Buffer_Index)
-        last_pos_str = ""
         positio_point_count = 0
         input("Press Enter to START Experiment... (确保激光器已开)\n\n")
         print("Starting Main Loop...")
-        curr_pos_str = stage.get_pos_fast()
-        progress_manager.start(total=SCAN_W*SCAN_H, desc=f"\033[31m📍 Pos: {curr_pos_str}\033[31m")
+        raw_pos = stage.get_pos_fast()
+
+        START_X, START_Y, _= [int(v) for v in raw_pos.split(',')]
+        expected_trajectory_str = get_expected_trajectory(SCAN_W, SCAN_H, STEP_UM, START_X, START_Y)
+
+        progress_manager.start(total=SCAN_W*SCAN_H, desc=f"\033[31m📍 Pos: {raw_pos}\033[31m")
         progress_manager.set_colour("cyan") # 扫描开始，设为青色
         # === 4. 启动同步 ===
         # A. 开启 DAQ (进入等待触发状态)
@@ -87,31 +93,47 @@ def main():
         stage.start_scan_motion()
 
         # === 5. 主循环 (Polling Loop) ===
-        while True:
-            while (curr_pos_str == last_pos_str):
-                curr_pos_str = stage.get_pos_fast()
-                time.sleep(0.001) # 给 CPU 和串口缓冲的时间
+        for target_str in expected_trajectory_str:
+            # print(expected_trajectory_str)
+            while True:
+                # 1. 快速查询并去空格
+                raw_pos = stage.get_pos_fast()
+                # 2. 第一重判定：是否到达目标字符串
+                if raw_pos == target_str:
+                    
+                    # 3. 停稳等待 (settle_ms)
+                    time.sleep(SETTLE_MS/1000.)
+                    
+                    # 4. 第二重确认：再次读取，如果还是 target_str，说明真的稳了
+                    verify_pos = stage.get_pos_fast()
+                    if verify_pos == target_str:
+                        break
+                    else:
+                        pass
+                time.sleep(SETTLE_MS/2000.)
 
-            daq.get_one_acquisition(all_data, pos_mapping, curr_pos_str, timeout_ms=int(EXPOSURE_MS*3/4), Average_Enable=AVERAGE_ENABLE)
-            
-
-            last_pos_str = curr_pos_str        
+            daq.get_one_acquisition(all_data, pos_mapping, raw_pos, timeout_ms=int(EXPOSURE_MS*4/5), Average_Enable=AVERAGE_ENABLE)
+                  
             progress_manager.update(1)
-            progress_manager.set_description(f"📍 Pos: {curr_pos_str}",color="green") # 实时显示坐标
+            progress_manager.set_description(f"📍 Pos: {raw_pos}",color="green") # 实时显示坐标
             positio_point_count += 1
         
             if positio_point_count >= SCAN_W * SCAN_H:
                 break
 
+
     except StopIteration:
         progress_manager.set_colour("red")
+        print(traceback.format_exc())
         print("\n🛑 StopIteration！ 程序直接停止！")
         pass
     except TimeoutError:
         progress_manager.set_colour("red") 
+        print(traceback.format_exc())
         print("\n❌ 采集超时！可能是激光器没开，或者位移台触发线没接好。")
     except KeyboardInterrupt:
         progress_manager.set_colour("red")
+        print(traceback.format_exc())
         print("\n🛑 用户强制停止！")
         
     finally:
