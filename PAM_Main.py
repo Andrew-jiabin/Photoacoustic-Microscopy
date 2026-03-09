@@ -19,18 +19,18 @@ def main():
     # ============================== 1. 参数设置 =================================
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
     COM_PORT = "4"
-    save_path = "./data.mat"
+    save_path = "./75-100-1.mat"
     # 扫描参数
-    SCAN_W = 10       # 像素宽
-    SCAN_H = 10       # 像素高
+    SCAN_W = 40       # 像素宽
+    SCAN_H = 40       # 像素高
     STEP_UM = 1       # 步长 (um)
-    EXPOSURE_MS =  50   # 每个点曝光时间 (位移台参数)
+    EXPOSURE_MS =  350   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 2048
-    RECORDS_BUF = 16   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
-    RECORDS_PER_POINT = 256 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
-    Buffer_Count = 4   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
+    RECORDS_BUF = 1024   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
+    RECORDS_PER_POINT = 1024 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
+    Buffer_Count = 16   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
     SETTLE_MS = int(EXPOSURE_MS/10)
     AVERAGE_ENABLE = True
     

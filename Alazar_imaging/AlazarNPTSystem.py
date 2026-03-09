@@ -41,7 +41,7 @@ class AlazarNPTSystem:
                                        128)
         
         # 设置触发延迟和超时
-        self.board.setTriggerDelay(0)
+        self.board.setTriggerDelay(1250)
         self.board.setTriggerTimeOut(0) # 无限等待触发
         
         # 如果激光器自己发光并给板卡触发，则无需此步，或设为 AUX_OUT_TRIGGER
