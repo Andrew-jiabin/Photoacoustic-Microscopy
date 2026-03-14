@@ -10,7 +10,7 @@ import atsapi as ats
 import traceback
 # 扫描开始前
 # 导入模块
-
+import datetime
 from Alazar_imaging.PriorUnifiedStage import PriorUnifiedStage
 from Alazar_imaging.AlazarNPTSystem import AlazarNPTSystem
 from Alazar_imaging.AsyncProgress import progress_manager
@@ -19,21 +19,23 @@ def main():
     # ============================== 1. 参数设置 =================================
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
     COM_PORT = "4"
-    save_path = "./75-100-1.mat"
+    
     # 扫描参数
     SCAN_W = 40       # 像素宽
     SCAN_H = 40       # 像素高
     STEP_UM = 1       # 步长 (um)
-    EXPOSURE_MS =  350   # 每个点曝光时间 (位移台参数)
+    EXPOSURE_MS =  2000   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
     SAMPLES_REC = 2048
-    RECORDS_BUF = 1024   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
-    RECORDS_PER_POINT = 1024 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
-    Buffer_Count = 16   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
+    RECORDS_BUF = 32   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
+    RECORDS_PER_POINT = 64 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
+    Buffer_Count = 256   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
     SETTLE_MS = int(EXPOSURE_MS/10)
+
     AVERAGE_ENABLE = True
-    
+    save_path = f"./W({SCAN_W})-H({SCAN_H})-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mat"
+
     # 数据量计算与内存使用分析：
     # 1. 基础扫描范围数据量：
     # 20 × 20 (点) × 1024 (Rec/点) × 4096 (Sample/Rec) × 2 (Bytes) ≈ 3.3 GB
@@ -55,7 +57,7 @@ def main():
         stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
         daq = AlazarNPTSystem(systemId=1, boardId=1)
         daq.configure_board() 
-        daq.prepare_acquisition(num_points=SCAN_W*SCAN_H+1,
+        daq.prepare_acquisition(num_points=SCAN_W*SCAN_H,
                                 acq_channel=ats.CHANNEL_A, 
                                 samples_per_record=SAMPLES_REC,
                                 records_per_buffer=RECORDS_BUF,

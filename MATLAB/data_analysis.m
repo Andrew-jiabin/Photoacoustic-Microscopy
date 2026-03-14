@@ -1,113 +1,84 @@
 function signalBrowser()
-% 交互式信号浏览工具，通过左右方向键切换100个信号并实时绘图
-
-% ========== 新增：强制设置图形渲染器 ==========
-% 先重置图形设置
+% 交互式信号浏览工具：6子图版（含线性与dB频谱）
+% ========== 环境设置 ==========
 set(0, 'DefaultFigureRenderer', 'painters');
-% 关闭Java加速（部分版本兼容问题）
-com.mathworks.services.Prefs.setBooleanPref('JavaFrameFeature加速', false);
-% =============================================
-
+try
+    com.mathworks.services.Prefs.setBooleanPref('JavaFrameFeature加速', false);
+catch
+end
 clear; close all; clc;
 
 % --------------------- 1. 核心参数设置 ---------------------
 Fs = 2e9;          % 采样率：2 GHz
 T = 1/Fs;          % 采样周期
 
-% --------------------- 2. 从工作区加载 raw_data ---------------------
-% 尝试从基础工作区获取 raw_data 变量
+% --------------------- 2. 加载数据 ---------------------
 try
     raw_data = evalin('base', 'raw_data');
 catch
-    error('在工作区中未找到变量 raw_data。请先加载数据。');
+    error('在工作区中未找到变量 raw_data。');
 end
 
-% 检查维度
-expectedSize = [100, 1, 2048];
-if ~isequal(size(raw_data), expectedSize)
-    error('raw_data 的维度应为 [100, 1, 2048]，但实际为 [%s]', num2str(size(raw_data)));
-end
-
-numSignals = size(raw_data, 1);  % 应为100
+numSignals = size(raw_data, 1);
 allSignals = cell(numSignals, 1);
 for i = 1:numSignals
-    x = squeeze(raw_data(i, 1, :));  % 提取第i个信号，2048x1 uint16
-    x = double(x);                    % 转换为 double
-    x = (x - 32768) / 65536;          % 归一化到约 [-0.5, 0.5]
-    allSignals{i} = x(:);              % 确保为列向量
+    x = squeeze(raw_data(i, 1, :));
+    x = double(x);
+    x = (x - 32768) / 65536; 
+    allSignals{i} = x(:);
 end
-% -----------------------------------------------------------------
 
-% 初始化当前索引
+% --------------------- 3. 图形初始化 ---------------------
 currentIdx = 1;
-
-% ========== 优化：显式设置图形可见性 ==========
-fig = figure('Name', '信号浏览器 (左右键切换)', ...
+fig = figure('Name', '信号浏览器 (左右键切换) - 6子图版', ...
              'NumberTitle', 'off', ...
              'KeyPressFcn', @keyPressCallback, ...
-             'Position', [100, 100, 1200, 800], ...
-             'Visible', 'on', ...  % 强制可见
-             'Renderer', 'painters');  % 强制渲染器
-% =============================================
+             'Position', [50, 50, 1400, 900], ...
+             'Color', 'white');
 
-% 预先创建四个子图的坐标轴句柄，方便更新数据而不重复创建
-ax1 = subplot(2,2,1);
-h1 = plot(NaN, NaN);  % 占位线条
-xlabel('时间 (μs)'); ylabel('幅值'); title('原始时域信号（含直流）'); grid on;
+% 布局改为 3行2列
+% 第一行：时域
+ax1 = subplot(3,2,1); h1 = plot(NaN, NaN); grid on;
+xlabel('时间 (μs)'); ylabel('幅值'); title('原始时域信号');
+ax2 = subplot(3,2,2); h2 = plot(NaN, NaN); grid on;
+xlabel('时间 (μs)'); ylabel('幅值'); title('滤波后时域信号');
 
-ax2 = subplot(2,2,2);
-h2 = plot(NaN, NaN);
-xlabel('时间 (μs)'); ylabel('幅值'); title('滤波后时域信号（无直流）'); grid on;
+% 第二行：线性频域
+ax3 = subplot(3,2,3); h3 = plot(NaN, NaN); grid on;
+xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('原始频谱 (线性)');
+ax4 = subplot(3,2,4); h4 = plot(NaN, NaN); grid on;
+xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('滤波频谱 (线性)');
 
-ax3 = subplot(2,2,3);
-h3 = plot(NaN, NaN);
-xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('原始信号频域（正频率）'); grid on;
+% 第三行：dB 频域 (新增)
+ax5 = subplot(3,2,5); h5 = plot(NaN, NaN); grid on;
+xlabel('频率 (MHz)'); ylabel('幅度 (dB)'); title('原始频谱 (dB)');
+ax6 = subplot(3,2,6); h6 = plot(NaN, NaN); grid on;
+xlabel('频率 (MHz)'); ylabel('幅度 (dB)'); title('滤波频谱 (dB)');
 
-ax4 = subplot(2,2,4);
-h4 = plot(NaN, NaN);
-xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('滤波后信号频域（正频率）'); grid on;
+infoText = uicontrol('Style', 'text', 'Position', [20, 10, 200, 25], ...
+                     'FontSize', 10, 'FontWeight', 'bold');
 
-% 添加一个文本显示当前索引
-infoText = uicontrol('Style', 'text', ...
-                     'String', sprintf('信号 %d / %d', currentIdx, numSignals), ...
-                     'Position', [50, 20, 150, 20], ...
-                     'BackgroundColor', 'white');
-
-% 首次绘制
 updatePlot();
 
-% --------------------- 嵌套函数：键盘回调 ---------------------
+% --------------------- 回调与更新函数 ---------------------
     function keyPressCallback(~, event)
-        switch event.Key
-            case 'leftarrow'
-                if currentIdx > 1
-                    currentIdx = currentIdx - 1;
-                    updatePlot();
-                end
-            case 'rightarrow'
-                if currentIdx < numSignals
-                    currentIdx = currentIdx + 1;
-                    updatePlot();
-                end
+        if strcmp(event.Key, 'leftarrow') && currentIdx > 1
+            currentIdx = currentIdx - 1; updatePlot();
+        elseif strcmp(event.Key, 'rightarrow') && currentIdx < numSignals
+            currentIdx = currentIdx + 1; updatePlot();
         end
     end
 
-% --------------------- 嵌套函数：更新绘图 ---------------------
     function updatePlot()
-        % 获取当前信号
         x = allSignals{currentIdx};
-        x = x(:);  % 确保列向量
         N = length(x);
-        t = (0:N-1)' * T;  % 时间轴列向量
-
-        % 滤除直流
+        t = (0:N-1)' * T;
         x_filtered = x - mean(x);
 
-        % 傅里叶变换（不进行fftshift，只取正频率）
+        % 频谱计算
         X_orig = fft(x);
         X_filt = fft(x_filtered);
-
-        % 生成正频率轴及对应幅度
+        
         if mod(N,2) == 0
             n_pos = 1:N/2+1;
             freq_pos = (0:N/2) * Fs / N;
@@ -115,33 +86,37 @@ updatePlot();
             n_pos = 1:(N+1)/2;
             freq_pos = (0:(N-1)/2) * Fs / N;
         end
-        X_orig_amp = abs(X_orig(n_pos)) / N;
-        X_filt_amp = abs(X_filt(n_pos)) / N;
+        
+        % 线性幅度
+        amp_orig = abs(X_orig(n_pos)) / N;
+        amp_filt = abs(X_filt(n_pos)) / N;
+        
+        % dB 幅度计算：20*log10，防止 log(0)
+        % 0 dB 通常对应归一化幅度 1.0
+        db_orig = 20 * log10(amp_orig + 1e-15); 
+        db_filt = 20 * log10(amp_filt + 1e-15);
 
-        % --- 更新图形数据 ---
-        % 时域原始信号
+        % 更新数据
         set(h1, 'XData', t*1e6, 'YData', x);
-        axis(ax1, 'tight');
-
-        % 时域滤波后信号
         set(h2, 'XData', t*1e6, 'YData', x_filtered);
-        axis(ax2, 'tight');
+        
+        set(h3, 'XData', freq_pos*1e-6, 'YData', amp_orig);
+        set(h4, 'XData', freq_pos*1e-6, 'YData', amp_filt);
+        
+        set(h5, 'XData', freq_pos*1e-6, 'YData', db_orig);
+        set(h6, 'XData', freq_pos*1e-6, 'YData', db_filt);
 
-        % 频域原始信号
-        set(h3, 'XData', freq_pos*1e-6, 'YData', X_orig_amp);
-        xlim(ax3, [0 1000]);  % 固定X轴为0~1000 MHz
-        ylim(ax3, [0 2e-5]);  % ========== 修复：原代码这里写错了，是ax3不是ax4 ==========
+        % 坐标轴控制
+        axis([ax1 ax2], 'tight');
+        xlim([ax3 ax4 ax5 ax6], [0 1000]); % 限制频率范围到 1GHz
+        
+        % 线性频谱纵轴固定 (根据你之前的设置)
+        ylim([ax3 ax4], [0 2e-5]); 
+        
+        % dB 频谱纵轴固定：通常在 -140dB 到 -80dB 左右
+        ylim([ax5 ax6], [-160 -80]); 
 
-        % 频域滤波后信号
-        set(h4, 'XData', freq_pos*1e-6, 'YData', X_filt_amp);
-        xlim(ax4, [0 1000]);
-        ylim(ax4, [0 2e-5]);
-
-        % 更新索引显示
-        set(infoText, 'String', sprintf('信号 %d / %d', currentIdx, numSignals));
-
-        % 刷新图形
+        set(infoText, 'String', sprintf('信号索引: %d / %d', currentIdx, numSignals));
         drawnow;
     end
-
 end

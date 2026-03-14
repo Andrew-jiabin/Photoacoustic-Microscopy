@@ -22,13 +22,13 @@ class AlazarNPTSystem:
         self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_2000MSPS, ats.CLOCK_EDGE_RISING, 0)
         
         # 通道设置
-        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_400_MV, ats.IMPEDANCE_50_OHM)
-        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_400_MV, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_20_MV, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_20_MV, ats.IMPEDANCE_50_OHM)
         
         # 触发设置 (使用 Channel A 作为触发源? 还是外部 TTL?)
         # 你的描述是：激光使用内部频率(80K)进行发射,该80K的脉冲也引到trigger
         # 这意味着采集卡应该设置为【外部触发】(External Trigger)
-        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_2V5)
+        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_1V_50OHM)
         
         self.board.setTriggerOperation(ats.TRIG_ENGINE_OP_J,
                                        ats.TRIG_ENGINE_J,

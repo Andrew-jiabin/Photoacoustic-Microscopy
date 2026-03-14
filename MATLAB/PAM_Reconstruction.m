@@ -4,7 +4,7 @@
 clear; clc; close all;
 set(0, 'DefaultFigureVisible', 'off'); % 禁止弹出窗口，防止远程报错
 %% 1. 加载数据
-filepath = 'D:\LJB\alazar_DAQ\Photoacoustic-Microscopy\75-100-1.mat';
+filepath = 'W(40)-H(40)-2026-03-10_20-32-39.mat';
 fprintf('⏳ 正在加载文件: %s ...\n', filepath);
 data = load(filepath);
 
