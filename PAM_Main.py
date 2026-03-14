@@ -21,16 +21,16 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数
-    SCAN_W = 40       # 像素宽
-    SCAN_H = 40       # 像素高
+    SCAN_W = 15       # 像素宽
+    SCAN_H = 15       # 像素高
     STEP_UM = 1       # 步长 (um)
     EXPOSURE_MS =  2000   # 每个点曝光时间 (位移台参数)
     
     # DAQ 参数
-    SAMPLES_REC = 2048
-    RECORDS_BUF = 32   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
+    SAMPLES_REC = 4096
+    RECORDS_BUF = 64   # 每个Buffer存50个激光脉冲数据 (降低主循环压力)
     RECORDS_PER_POINT = 64 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
-    Buffer_Count = 256   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
+    Buffer_Count = 1024   # 用多少个buffer来收集数据，太少了可能双DMA会受限制
     SETTLE_MS = int(EXPOSURE_MS/10)
 
     AVERAGE_ENABLE = True

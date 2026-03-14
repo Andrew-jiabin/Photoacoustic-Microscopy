@@ -19,16 +19,16 @@ class AlazarNPTSystem:
         
     def configure_board(self):
         # 时钟设置 (4GS/s)
-        self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_2000MSPS, ats.CLOCK_EDGE_RISING, 0)
+        self.board.setCaptureClock(ats.INTERNAL_CLOCK, ats.SAMPLE_RATE_4000MSPS, ats.CLOCK_EDGE_RISING, 0)
         
         # 通道设置
-        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_20_MV, ats.IMPEDANCE_50_OHM)
-        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_20_MV, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_100_MV, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_100_MV, ats.IMPEDANCE_50_OHM)
         
         # 触发设置 (使用 Channel A 作为触发源? 还是外部 TTL?)
         # 你的描述是：激光使用内部频率(80K)进行发射,该80K的脉冲也引到trigger
         # 这意味着采集卡应该设置为【外部触发】(External Trigger)
-        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_1V_50OHM)
+        self.board.setExternalTrigger(ats.DC_COUPLING, ats.ETR_2V5)
         
         self.board.setTriggerOperation(ats.TRIG_ENGINE_OP_J,
                                        ats.TRIG_ENGINE_J,
@@ -41,7 +41,7 @@ class AlazarNPTSystem:
                                        128)
         
         # 设置触发延迟和超时
-        self.board.setTriggerDelay(1250)
+        self.board.setTriggerDelay(1380)
         self.board.setTriggerTimeOut(0) # 无限等待触发
         
         # 如果激光器自己发光并给板卡触发，则无需此步，或设为 AUX_OUT_TRIGGER
