@@ -93,7 +93,6 @@ def main():
         # === 4. 启动同步 ===
         # A. 开启 DAQ (进入等待触发状态)
         start_t = time.time()
-        daq.start_capture()
 
         # B. 开启 位移台 (开始发出 TTL 触发 & 移动)
         stage.start_scan_motion()
