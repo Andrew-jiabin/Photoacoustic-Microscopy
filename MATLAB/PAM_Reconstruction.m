@@ -2,9 +2,9 @@
 % PAM 数据读取与逐点重建主程序
 % =========================================================================
 clear; clc; close all;
-set(0, 'DefaultFigureVisible', 'off'); % 禁止弹出窗口，防止远程报错
+set(0, 'DefaultFigureVisible', 'on'); % 禁止弹出窗口，防止远程报错
 %% 1. 加载数据
-filepath = 'W(60)-H(60)-2026-03-14_17-17-04.mat';
+filepath = './data/2026-03-17_22-16-17-W(50)-H(50)-S_4G-EXPOSURE_MS_100.mat';
 fprintf('⏳ 正在加载文件: %s ...\n', filepath);
 data = load(filepath);
 
@@ -15,8 +15,8 @@ is_averaged = double(data.daq_params.is_averaged) > 0;
 step_um = double(data.scan_params.step);
 
 N_points = size(raw_data, 1);
-fprintf('✅ 加载成功！共 %d 个像素点。当前数据状态: %s\n', ...
-    N_points, logical2str(is_averaged));
+fprintf('✅ 加载成功！共 %d 个像素点。\n', ...
+    N_points);
 
 %% 2. 坐标解析与网格分配 (完美解决蛇形扫描和机械抖动)
 X = pos_map(:, 1);
@@ -44,13 +44,14 @@ for i = 1:N_points
     % - 平均后: [1, 1, Samples] -> [Samples, 1]
     % - 未平均: [1, Records, Samples] -> [Records, Samples]
     point_data = squeeze(raw_data(i, :, :));
-    
+    length(point_data)
+
     % 调用你的自定义函数计算单点特征值
     pixel_val = calculate_pixel_value(point_data, is_averaged);
-    
+
     % 填入二维网格对应的位置
     img_matrix(Y_idx(i), X_idx(i)) = pixel_val;
-    
+
     % waitbar(i/N_points, wbar);
 end
 % if exist('wbar','var'), close(wbar); end
@@ -90,41 +91,41 @@ function val = calculate_pixel_value(point_data, is_averaged)
     %                如果 is_averaged == true，尺寸为 [Samples, 1]
     %                如果 is_averaged == false，尺寸为 [Records, Samples]
     %   is_averaged: 布尔值，标识数据是否在采集端被平均过
-    
+
     % 1. 数据类型转换 (关键：从 uint16 转为 double 防止计算溢出)
     point_data = double(point_data);
-    
+
     if is_averaged
         % -----------------------------------------------------------------
         % 模式 A: 硬件已经平均好的数据 [维度: Samples x 1]
         % -----------------------------------------------------------------
         % 这里写你的单线处理逻辑。例如最简单的最大振幅投影 (MAP):
-        
+
         % a. 去除直流偏置 (基线漂移)
         signal = point_data - mean(point_data); 
-        
+
         % b. 你可以在这里加入带通滤波代码 (类似 EEG 处理那套)
         % [b, a] = butter(4, [1e6 50e6]/(2e9/2), 'bandpass');
         % signal = filtfilt(b, a, signal);
-        
+
         % c. 提取特征值 (例如最大包络值)
-        val = max(abs(signal));
-        
+        val = mean(abs(signal));
+
     else
         % -----------------------------------------------------------------
         % 模式 B: 未平均的原始数据 [维度: Records x Samples]
         % -----------------------------------------------------------------
         % 此时你可以进行更复杂的统计操作，比如中值滤波剔除异常脉冲
-        
+
         % a. 在软件层执行平均操作 (沿第 1 维度 Records 求均值)
         % 你可以改为 median(point_data, 1) 来剔除激光闪烁的极端值
         software_averaged_signal = mean(point_data, 1); 
-        
+
         % b. 将其转为列向量以对齐模式 A
         signal = software_averaged_signal(:) - mean(software_averaged_signal);
-        
+
         % c. 提取特征值
         val = max(abs(signal));
-        
+
     end
 end

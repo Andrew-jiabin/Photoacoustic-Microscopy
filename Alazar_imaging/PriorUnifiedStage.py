@@ -137,10 +137,40 @@ class PriorUnifiedStage:
     def stage_deinitial(self):
         """[原函数复原] 断开控制器连接"""
         return self.disconnect_sdk()
+    
+    # 请添加在 PriorUnifiedStage 类内部
+    def is_busy(self):
+        """检查位移台是否还在运动 (SDK 模式)"""
+        ret, resp = self.cmd("controller.stage.busy")
+        return resp == "1"
 
-    # =====================================================
-    #  Part B: 新增的高速扫描功能 (串口直连)
-    # =====================================================
+    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_um=0.1,):
+        flag = False
+        time_count= False
+        while not flag:
+            if time_count==True:
+                flag = True
+            pos_str = self.get_position() # 获取 SDK 坐标
+            parts = pos_str.split(',')
+            curr_x, curr_y = float(parts[0]), float(parts[1])
+            if abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) < tolerance_um:
+                time.sleep(settle_time_ms/1000) # 短暂休眠，避免占用 100% CPU
+                pos_str = self.get_position() # 获取 SDK 坐标
+                parts = pos_str.split(',')
+                curr_x, curr_y = float(parts[0]), float(parts[1])
+                if abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) < tolerance_um:
+                    break
+                else:
+                    time_count=True
+                    continue
+            elif (abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) > tolerance_um) and time_count:
+                    print("settle time too short!")
+
+        return False
+
+
+
+
 
     def _serial_send_wait(self, cmd_text):
         """(内部函数) 串口发送并等待回复"""
