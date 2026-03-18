@@ -15,8 +15,8 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数 (数值格式，方便计算)
-    SCAN_W = 150    # 像素宽
-    SCAN_H = 100     # 像素高
+    SCAN_W = 40    # 像素宽
+    SCAN_H = 40     # 像素高
     STEP_UM = 1        # 步长
     SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整)
     
