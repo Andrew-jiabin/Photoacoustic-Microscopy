@@ -96,8 +96,9 @@ def main():
         progress_manager.start(total=len(trajectory), desc="🚀 PAM Scanning")
 
         for i, (tx, ty, curr_w, curr_h) in enumerate(trajectory):
-            stage.set_position([tx, ty])
-            stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
+            go_to_position(position=[START_X, START_Y],curr_position=[tx, ty],stage=stage,off_set=50)
+            # stage.set_position([tx, ty])
+            # stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
             
             current_pos_str = f"{tx},{ty},0"
             daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
@@ -140,6 +141,16 @@ def main():
         plt.ioff()
         plt.savefig(save_path.replace(".mat", ".png"))
         save_mat_data(all_data, SCAN_W, SCAN_H, STEP_UM, AVERAGE_ENABLE, RECORDS_PER_POINT, save_path)
+
+def go_to_position(position:list,curr_position:list,stage:PriorUnifiedStage,off_set:int):
+    START_X, START_Y = position
+    # 先去某个地方
+    stage.set_position([START_X+off_set,START_Y+off_set])
+    stage.wait_until_settled(START_X+off_set, START_Y+off_set, settle_time_ms=400)
+    # 然后再回来，看看会不会有偏向
+    stage.set_position([curr_position[0],curr_position[1]])
+    stage.wait_until_settled(curr_position[0], curr_position[1], settle_time_ms=400)
+    
 
 def save_mat_data(all_data, SCAN_W, SCAN_H, STEP_UM, AVERAGE_ENABLE, RECORDS_PER_POINT, save_path):
     # 此处封装你之前的保存逻辑，确保数据不丢失

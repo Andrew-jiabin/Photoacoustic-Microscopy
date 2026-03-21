@@ -120,7 +120,10 @@ def main():
                     fft_mag = np.abs(np.fft.rfft(latest_waveform))
                     log_spec = 20 * np.log10(fft_mag + 1e-6) # 转换为 dB 尺度
                     line_freq.set_ydata(log_spec[:idx_1ghz])
-                    
+                    spec_min = np.min(log_spec[:idx_1ghz])
+                    spec_max = np.max(log_spec[:idx_1ghz])
+                    # 设置动态范围：底部留 10dB 裕量，顶部留 20dB 裕量以观察峰值
+                    ax_freq.set_ylim(spec_min - 10, spec_max + 20)
                     plt.pause(0.001) 
             
             progress_manager.update(1)

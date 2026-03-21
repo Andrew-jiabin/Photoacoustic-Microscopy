@@ -163,7 +163,7 @@ class PriorUnifiedStage:
                 else:
                     time_count=True
                     continue
-            elif (abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) > tolerance_um) and time_count:
+            elif (abs(curr_x - target_x) > tolerance_um and abs(curr_y - target_y) > tolerance_um) and time_count:
                     print("settle time too short!")
 
         return False

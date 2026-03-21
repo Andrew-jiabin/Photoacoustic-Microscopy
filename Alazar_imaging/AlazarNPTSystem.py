@@ -76,20 +76,25 @@ class AlazarNPTSystem:
 
 
     def get_one_acquisition(self, all_data, curr_pos_str, timeout_ms, Average_Enable=False):
-        # ========== 核心修改点 ==========
-        # 1. 告诉采集卡：我这次只采 recordsPerPoint（例如64）个记录
-        self.board.beforeAsyncRead(self.channels,
-                                   0,
-                                   self.samplesPerRecord,
-                                   self.recordsPerBuffer,
-                                   self.recordsPerPoint, # 关键：不再是所有点的总和，而是单点所需量
-                                   ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT | ats.ADMA_FIFO_ONLY_STREAMING)
+    # 1. 彻底终止之前的异步任务，防止残留
+        self.board.abortAsyncRead()
+        
+        # 2. 【关键重置】软件索引归零
+        # 确保我们 wait 的第一个 buffer 永远是接下来 position 的第一个 buffer
+        self.buffer_idx = 0 
 
-        # 2. 挂载 Buffers 到底层
+        # 3. 重新配置本次点的采集参数
+        self.board.beforeAsyncRead(self.channels,
+                                    0,
+                                    self.samplesPerRecord,
+                                    self.recordsPerBuffer,
+                                    self.recordsPerPoint, 
+                                    ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT)
+
+        # 4. 重新挂载 Buffers
+        # 驱动现在知道：这 bufferCount 个缓冲区是按顺序给这 recordsPerPoint 用的
         for buf in self.buffers:
             self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
-            
-        self.buffer_idx = 0 
 
         # 3. 正式开始接受外部触发 (此时激光打过来的脉冲才是有效信号)
         self.board.startCapture()

@@ -15,18 +15,18 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数 (数值格式，方便计算)
-    SCAN_W = 40    # 像素宽
-    SCAN_H = 40     # 像素高
-    STEP_UM = 1        # 步长
-    SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整)
+    SCAN_W = 16    # 像素宽
+    SCAN_H = 16     # 像素高
+    STEP_UM = 4        # 步长
+    SETTLE_MS = 200     # 到位后的物理稳定时间 (根据位移台震动调整)
     
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS
     RECORDS_PER_POINT = 64 
     AVERAGE_ENABLE = True
-    SAMPLE_RATE_str = "4G"
-    RECORDS_BUF = 64 
+    # SAMPLE_RATE_str = "4G"
+    # RECORDS_BUF = 64 
     RECORDS_PER_POINT = 64 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
     Buffer_Count = 4   # 对于单点停顿采集，4个buffer游刃有余，不用1024
     save_path = f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mat"
@@ -58,7 +58,11 @@ def main():
         for w in w_range:
             target_x = START_X + (w * STEP_UM)
             target_y = START_Y + (h * STEP_UM)
-            trajectory.append((target_x, target_y, 0))
+            if h % 2 == 1:
+                trajectory.append((target_x, target_y, 1))
+            else:
+                trajectory.append((target_x, target_y, 0))
+            
 
     # === 4. 开始实验 ===
     all_data = []
@@ -68,7 +72,7 @@ def main():
         progress_manager.start(total=len(trajectory), desc="🚀 PAM Scanning")
         start_time = time.time()
 
-        for i, (tx, ty, _) in enumerate(trajectory):
+        for i, (tx, ty, flag) in enumerate(trajectory):
 
             # A. 指令位移台移动
             stage.set_position([tx, ty])
@@ -76,15 +80,17 @@ def main():
             # B. 核心握手：等待物理到位
             stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
             current_pos_str = f"{tx},{ty},0"
+            
+            # if flag==1:
+            #     time.sleep(0.500)
+            # else:
+            #     pass
             daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
-                                     timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
-            # D. 触发 Alazar 采集
-            # 注意：daq.get_one_acquisition 内部应包含对激光触发脉冲的等待
+                                    timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
+
             current_pos_str = f"{tx},{ty},0"
             progress_manager.update(1)
-            if i % 10 == 0:
-                progress_manager.set_description(f"📍 X:{tx:.1f} Y:{ty:.1f}", color="green")
-            
+
     except KeyboardInterrupt:
         print("\n🛑 用户终止")
         stage.set_position([START_X, START_Y])
@@ -93,6 +99,7 @@ def main():
         stage.set_position([START_X, START_Y])
     finally:
         stage.set_position([START_X, START_Y])
+        time.sleep(5)
         # === 5. 清理与保存 ===
         try:
             gc.enable()
@@ -143,13 +150,15 @@ def main():
                     "scan_shape": [SCAN_W, SCAN_H],
                     "step_um": STEP_UM,
                     "pos_list": index_to_pos, # 这样你在 MATLAB 里可以用这个列表找到所有的 Key
-                    "is_averaged": int(AVERAGE_ENABLE)
+                    "is_averaged": int(AVERAGE_ENABLE),
+                    "step_size":STEP_UM
                 }
 
                 # 6. 最终保存
                 sio.savemat(save_path, mat_dict)
-                print(f"✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据。")
-
+                
+                print(f"✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据，注意初始位置为 {[START_X, START_Y]}")
+            
             except Exception as e:
                 print(f"❌ 数据封装失败: {e}")
                 import traceback
