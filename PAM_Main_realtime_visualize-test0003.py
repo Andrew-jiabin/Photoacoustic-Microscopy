@@ -406,6 +406,19 @@ class PAMMainWindow(QMainWindow):
         self.worker.finished.connect(self.on_stage_moved)
         self.worker.start()
 
+    def init_hardware(self):
+        """初始化硬件设备"""
+        self.stage = PriorUnifiedStage(self.DLL_PATH, self.COM_PORT)
+        self.daq = AlazarNPTSystem(systemId=1, boardId=1)
+        self.daq.configure_board(sample_rate=self.SAMPLE_RATE)
+        self.daq.prepare_acquisition(
+            acq_channel=ats.CHANNEL_A,
+            samples_per_record=self.SAMPLES_REC,
+            records_per_buffer=self.RECORDS_PER_POINT,
+            buffer_count=4,
+            records_per_point=self.RECORDS_PER_POINT
+        )
+        
     def on_stage_moved(self):
         """移动完成回调"""
         self.is_moving = False

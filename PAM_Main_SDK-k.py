@@ -15,10 +15,10 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数 (数值格式，方便计算)
-    SCAN_W = 120    # 像素宽
-    SCAN_H = 70     # 像素高
-    STEP_UM = 1        # 步长
-    SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整)
+    SCAN_W = 16    # 像素宽
+    SCAN_H = 16     # 像素高
+    STEP_UM = 4        # 步长
+    SETTLE_MS = 200     # 到位后的物理稳定时间 (根据位移台震动调整)
     
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
@@ -55,29 +55,15 @@ def main():
     trajectory = []
     for h in range(SCAN_H):
         # w_range = range(SCAN_W) if h % 2 == 0 else reversed(range(SCAN_W))
-        w_range = reversed(range(SCAN_W))
+        w_range = range(SCAN_W)
         for w in w_range:
             target_x = START_X + (w * STEP_UM)
             target_y = START_Y + (h * STEP_UM)
-            if w == w_range[0]:
+            if h % 2 == 1:
                 trajectory.append((target_x, target_y, 1))
             else:
                 trajectory.append((target_x, target_y, 0))
             
-    # === 生成轨迹 (快轴改为 Y 轴，S型扫描) ===
-    # for w in range(SCAN_W):
-    #     # 根据列号 w 的奇偶性决定 Y 轴是正向还是反向扫描
-    #     h_range = range(SCAN_H) if w % 2 == 0 else reversed(range(SCAN_H))
-        
-    #     for h in h_range:
-    #         target_x = START_X + (w * STEP_UM)
-    #         target_y = START_Y + (h * STEP_UM)
-            
-    #         # 根据当前列的扫描方向标记状态 (可选，保留你原代码的逻辑)
-    #         if w % 2 == 1:
-    #             trajectory.append((target_x, target_y, 1))
-    #         else:
-    #             trajectory.append((target_x, target_y, 0))
 
     # === 4. 开始实验 ===
     all_data = []
@@ -96,10 +82,10 @@ def main():
             stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
             current_pos_str = f"{tx},{ty},0"
             
-            if flag==1:
-                time.sleep(0.100)
-            else:
-                pass
+            # if flag==1:
+            #     time.sleep(0.500)
+            # else:
+            #     pass
             daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
                                     timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
 
