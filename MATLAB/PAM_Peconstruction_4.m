@@ -1,5 +1,5 @@
 %% 1. 全量加载数据（保持不变）
-mat_path = "./data/2026-03-21_17-59-32.mat";
+mat_path = "./data\2026-03-21_17-24-30.mat";
 fprintf('正在将数据全量加载至内存...\n');
 tic;
 S = load(mat_path); 
@@ -12,8 +12,8 @@ scan_w = double(meta.scan_shape(1)); % X方向点数
 scan_h = double(meta.scan_shape(2)); % Y方向点数
 pos_list = cellstr(meta.pos_list);   % 格式如 "0.0, 0.5"
 
-dx=1;
-dy=1;
+dx=4;
+dy=4;
 
 % 【关键修改】：预分配二维网格图像
 % 初始化为 NaN 或 0，方便观察是否有漏采点

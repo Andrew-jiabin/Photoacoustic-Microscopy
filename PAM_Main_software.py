@@ -59,9 +59,9 @@ class MultiResolutionDataStore:
         # 当前网格参数
         self.origin_x = 0.0
         self.origin_y = 0.0
-        self.scan_w = 65      # 网格宽度（格数）
-        self.scan_h = 65      # 网格高度（格数）
-        self.step_um = 1.0    # 当前步长
+        self.scan_w = 50      # 网格宽度（格数）
+        self.scan_h = 50      # 网格高度（格数）
+        self.step_um = 2    # 当前步长
         
         # 当前光标位置 (网格索引)
         self.cursor_gx = 0
@@ -220,10 +220,8 @@ class AcquisitionWorker(QThread):
         try:
             # 移动到目标位置（带偏移校正）
             go_to_position(
-                position=[self.start_x, self.start_y],
                 curr_position=[self.target_x, self.target_y],
                 stage=self.stage,
-                off_set=self.offset
             )
             
             pos_str = f"{self.target_x},{self.target_y},0"
@@ -252,39 +250,59 @@ class MapCanvas(FigureCanvas):
     """左侧 MAP 图画布"""
     
     def __init__(self, parent=None):
-        self.fig = Figure(figsize=(7, 7), dpi=100)
+        # 1. 明确设置 Figure 背景为黑色，避免边缘白边
+        self.fig = Figure(figsize=(7, 7), dpi=100, facecolor='black')
         self.ax = self.fig.add_subplot(111)
+        # 2. 设置坐标轴背景为黑色
+        self.ax.set_facecolor('black')
+        
         super().__init__(self.fig)
         self.setParent(parent)
         
-        # 初始化空图
+        # 3. 获取 hot 色图并设置 nan 值的显示颜色为黑色
+        self.my_cmap = plt.cm.get_cmap('hot').copy()
+        self.my_cmap.set_bad(color='black')
+        
         self.img_data = np.full((65, 65), np.nan)
         self.im = self.ax.imshow(
-            self.img_data, cmap='hot',
+            self.img_data, 
+            cmap=self.my_cmap, # 使用修改后的色图
             extent=[0, 65, 65, 0],
             interpolation='nearest'
         )
-        self.cbar = self.fig.colorbar(self.im, ax=self.ax, label='P-P Intensity')
-        self.ax.set_title("Real-time MAP Reconstruction")
         
-        # 光标标记
+        # 4. 修改标题和坐标轴颜色，否则在黑底上看不见
+        self.ax.set_title("Real-time MAP Reconstruction", color='white')
+        self.ax.tick_params(axis='x', colors='white')
+        self.ax.tick_params(axis='y', colors='white')
+        
+        # 颜色条也要处理标签颜色
+        self.cbar = self.fig.colorbar(self.im, ax=self.ax)
+        self.cbar.set_label('P-P Intensity', color='white')
+        self.cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(plt.getp(self.cbar.ax.axes, 'yticklabels'), color='white')
+        
         self.cursor_rect = None
-        
         self.fig.tight_layout()
-    
+
     def update_map(self, img_data, scan_w, scan_h, step_um, cursor_gx, cursor_gy):
         """更新MAP显示"""
         self.img_data = img_data
-        
         self.im.set_data(img_data)
+        
+        # 更新范围
         self.im.set_extent([0, scan_w * step_um, scan_h * step_um, 0])
         
-        # 动态颜色范围 (忽略 nan)
+        # 动态颜色范围
         valid = img_data[~np.isnan(img_data)]
         if len(valid) > 0:
-            self.im.set_clim(vmin=0, vmax=np.max(valid) + 1)
+            v_min = np.min(valid)
+            v_max = np.max(valid)
+            # 如果最大最小值一样，略微撑开范围避免报错
+            if v_min == v_max: v_max += 1
+            self.im.set_clim(vmin=v_min, vmax=v_max)
         
-        # 更新光标
+        # 更新光标 (保持原逻辑)
         if self.cursor_rect is not None:
             self.cursor_rect.remove()
         
@@ -297,7 +315,6 @@ class MapCanvas(FigureCanvas):
         self.ax.add_patch(self.cursor_rect)
         
         self.draw_idle()
-
 
 class SignalCanvas(FigureCanvas):
     """右上方 信号 + 频谱 画布"""
@@ -378,7 +395,7 @@ class PAMMainWindow(QMainWindow):
         self.AVERAGE_ENABLE = True
         self.RECORDS_PER_POINT = 64
         self.SETTLE_MS = 100
-        self.OFFSET = 50
+        self.OFFSET = 0
         
         # ---- 初始化硬件 ----
         self.init_hardware()
@@ -446,7 +463,7 @@ class PAMMainWindow(QMainWindow):
             samples_per_record=self.SAMPLES_REC,
             sample_rate_hz=self.SAMPLE_RATE_HZ
         )
-        right_panel.addWidget(self.signal_canvas, stretch=3)
+        right_panel.addWidget(self.signal_canvas, stretch=6)
         
         # ---- 右下：参数控制区 ----
         control_frame = QFrame()
@@ -491,7 +508,23 @@ class PAMMainWindow(QMainWindow):
         nav_layout.addWidget(self.lbl_status, 5, 0, 1, 3, Qt.AlignCenter)
         
         control_layout.addWidget(nav_group)
+
+        # === 3) 精度/步长设置 ===
+        res_group = QGroupBox("精度设置 (步长 μm)")
+        res_layout = QHBoxLayout(res_group)
         
+        res_layout.addWidget(QLabel("步长:"))
+        self.spin_step = QDoubleSpinBox()
+        self.spin_step.setRange(0.01, 1000)
+        self.spin_step.setDecimals(2)
+        self.spin_step.setSingleStep(0.1)
+        self.spin_step.setValue(1.0)
+        res_layout.addWidget(self.spin_step)
+        
+        res_layout.addWidget(QLabel("μm"))
+        
+        control_layout.addWidget(res_group)
+
         # === 2) 网格范围设置 ===
         grid_group = QGroupBox("成像网格设置")
         grid_layout = QGridLayout(grid_group)
@@ -544,21 +577,7 @@ class PAMMainWindow(QMainWindow):
         
         control_layout.addWidget(grid_group)
         
-        # === 3) 精度/步长设置 ===
-        res_group = QGroupBox("精度设置 (步长 μm)")
-        res_layout = QHBoxLayout(res_group)
-        
-        res_layout.addWidget(QLabel("步长:"))
-        self.spin_step = QDoubleSpinBox()
-        self.spin_step.setRange(0.01, 1000)
-        self.spin_step.setDecimals(2)
-        self.spin_step.setSingleStep(0.1)
-        self.spin_step.setValue(1.0)
-        res_layout.addWidget(self.spin_step)
-        
-        res_layout.addWidget(QLabel("μm"))
-        
-        control_layout.addWidget(res_group)
+
         
         # === 4) 应用参数 + 保存按钮 ===
         btn_layout = QHBoxLayout()
@@ -621,6 +640,7 @@ class PAMMainWindow(QMainWindow):
         ds = self.data_store
         wx, wy = ds.grid_to_world(ds.cursor_gx, ds.cursor_gy)
         self.lbl_cursor.setText(f"光标: ({ds.cursor_gx}, {ds.cursor_gy})")
+        self.stage.set_position([wx, wy])
         self.lbl_world_pos.setText(f"世界坐标: ({wx:.2f}, {wy:.2f})")
     
     def acquire_current_point(self):
@@ -729,7 +749,10 @@ class PAMMainWindow(QMainWindow):
         # 收集所有未采集的点
         self.scan_queue = []
         for gy in range(ds.scan_h):
-            for gx in range(ds.scan_w):
+            line_gx = list(range(ds.scan_w))
+            if gy % 2 == 1:
+                line_gx.reverse() 
+            for gx in line_gx:
                 if ds.step_um not in ds.masks or (gx, gy) not in ds.masks[ds.step_um]:
                     self.scan_queue.append((gx, gy))
         
@@ -843,10 +866,7 @@ class PAMMainWindow(QMainWindow):
 # ============================================================================
 # 辅助函数 (保持与原代码一致)
 # ============================================================================
-def go_to_position(position: list, curr_position: list, stage: PriorUnifiedStage, off_set: int):
-    START_X, START_Y = position
-    stage.set_position([START_X + off_set, START_Y + off_set])
-    stage.wait_until_settled(START_X + off_set, START_Y + off_set, settle_time_ms=400)
+def go_to_position(curr_position: list, stage: PriorUnifiedStage):
     stage.set_position([curr_position[0], curr_position[1]])
     stage.wait_until_settled(curr_position[0], curr_position[1], settle_time_ms=400)
 

@@ -15,11 +15,11 @@ def main():
     COM_PORT = "4"
     
     # 扫描参数 (数值格式，方便计算)
-    SCAN_W = 120    # 像素宽
+    SCAN_W = 140    # 像素宽
     SCAN_H = 70     # 像素高
     STEP_UM = 1        # 步长
     SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整)
-    
+    offset = 5   # um 偏置，克服机械位移差
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS
@@ -56,10 +56,11 @@ def main():
     for h in range(SCAN_H):
         # w_range = range(SCAN_W) if h % 2 == 0 else reversed(range(SCAN_W))
         w_range = reversed(range(SCAN_W))
+        
         for w in w_range:
             target_x = START_X + (w * STEP_UM)
             target_y = START_Y + (h * STEP_UM)
-            if w == w_range[0]:
+            if w == (SCAN_W-1):
                 trajectory.append((target_x, target_y, 1))
             else:
                 trajectory.append((target_x, target_y, 0))
@@ -85,21 +86,24 @@ def main():
     
     try:
         progress_manager.start(total=len(trajectory), desc="🚀 PAM Scanning")
-        start_time = time.time()
 
         for i, (tx, ty, flag) in enumerate(trajectory):
-
+            if flag==1:
+                # A. 指令位移台移动
+                stage.set_position([tx+offset, ty])
+                # B. 核心握手：等待物理到位
+                stage.wait_until_settled(tx+offset, ty, settle_time_ms=SETTLE_MS)
+                current_pos_str = f"{tx+offset},{ty},0"
+            else:
+                pass
             # A. 指令位移台移动
             stage.set_position([tx, ty])
-            
+            time.sleep(0.01)
             # B. 核心握手：等待物理到位
             stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
             current_pos_str = f"{tx},{ty},0"
             
-            if flag==1:
-                time.sleep(0.100)
-            else:
-                pass
+            
             daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
                                     timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
 
