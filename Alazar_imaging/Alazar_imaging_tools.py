@@ -1,3 +1,4 @@
+import time
 def get_expected_trajectory(SCAN_W, SCAN_H, STEP_UM, START_X, START_Y):
     
     expected_trajectory_str = []
@@ -17,3 +18,14 @@ def get_expected_trajectory(SCAN_W, SCAN_H, STEP_UM, START_X, START_Y):
             expected_trajectory_str.append(target_s)
     
     return expected_trajectory_str
+
+def lbtek_wait_settled(mover_obj, handle, axis_id, timeout_s=5):
+    """
+    手动实现 LBMover 的等待到位逻辑
+    """
+    start_time = time.time()
+    while mover_obj.getDoingState(handle, axis_id) == 1:  # 0x01 表示正在运行
+        time.sleep(0.01)  # 10ms 检查一次
+        if time.time() - start_time > timeout_s:
+            print(f"⚠️ 轴 {axis_id} 移动超时！")
+            break
