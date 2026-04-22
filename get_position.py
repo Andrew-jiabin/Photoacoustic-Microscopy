@@ -13,6 +13,9 @@ stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
 raw_pos = stage.get_position()
 print(raw_pos)
 
-# 成像位点：-20340,933 
+# 成像位点：-18115,1771
 
-# 滴水位点: -27945,20773
+# 滴水位点: -17934,-26632
+
+
+# 成像范围： -18187,1645 到 -18119,1818

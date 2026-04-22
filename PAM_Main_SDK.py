@@ -16,14 +16,15 @@ def main():
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
     LB_DLL_PATH = r"D:\LJB\alazar_DAQ\Photoacoustic-Microscopy\LBTEK_SDK\x64\moverLibrary.dll"
     MODEL_NAME = b"EM-LSS65-13C1"
-    COM_PORT = "COM6" # 你的位移台串口
+    COM_PORT = "4" # 你的位移台串口 4
     # 如果不使用一维位移台, 则不要设置长宽任意为 1
-    SCAN_W = 140    
-    SCAN_H = 1      # 设置为 1 实现 1 维扫描
-    STEP_UM = 10    # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
+    SCAN_W = 70
+    SCAN_H = 170    # 设置为 1 实现 1 维扫描
+    STEP_UM = 1    # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
     # 扫描参数 (数值格式，方便计算)
-    SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整)
-    offset = 5   # um 偏置，克服机械位移差
+    SETTLE_MS = 100     # 到位后的物理稳定时间 (根据位移台震动调整)
+    offset = 5  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
+    HIGH_PRECISION = True
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS   # 如果使用 B 通道, 则只能使用2000MSPS
@@ -36,7 +37,7 @@ def main():
     save_path = f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mat"
 
     if SCAN_W == 1:
-        print("如果使用1维位移台, 只能设置 SCAN_H 为1, 不能设置 SCAN_W 为1 - ljb")
+        print("如果使用1维位移台, 只能设置 SCAN_H 为1, 不能设置 SCAN_W 为1 - 林佳斌")
         exit(0)
 
     if SCAN_H == 1:
@@ -60,6 +61,7 @@ def main():
     else:
         # === 2. 初始化硬件 ===
         stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
+        if HIGH_PRECISION: stage.cmd("controller.stage.ss.set 1")
         
 
 

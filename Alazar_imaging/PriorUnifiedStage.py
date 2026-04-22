@@ -144,7 +144,7 @@ class PriorUnifiedStage:
         ret, resp = self.cmd("controller.stage.busy")
         return resp == "1"
 
-    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_um=0.1,):
+    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_um=0.05,):
         flag = False
         time_count= False
         while not flag:
@@ -169,7 +169,30 @@ class PriorUnifiedStage:
         return False
 
 
+    def upgrade_to_high_precision(self):
+        """验证并开启亚微米精度模式"""
+        if self.mode != 'SDK': self.connect_sdk()
+        
+        # 1. 获取硬件物理极限（每微米包含多少个微步）
+        self.cmd_sdk_raw("controller.stage.steps-per-micron.get")
+        steps_per_um = int(self.rx.value.decode())
+        
+        # 2. 设置用户单位为 1 个微步 (最高精度)
+        # 注意：更改 ss 会重置 hostdirection [cite: 547]
+        self.cmd_sdk_raw("controller.stage.ss.set 1")
+        
+        # 3. 计算当前的单位分辨率
+        resolution = 1.0 / steps_per_um
+        print(f"模式已切换！当前SDK 1个单位 = {resolution:.4f} 微米")
+        return resolution
 
+    def goto_position_precision(self, x_um, y_um, resolution):
+        """移动到指定位置（输入为微米，自动转换为SDK单位）"""
+        # 将微米坐标转换为 SDK 的整数单位
+        x_steps = int(x_um / resolution)
+        y_steps = int(y_um / resolution)
+        
+        self.cmd_sdk_raw(f"controller.stage.goto-position {x_steps} {y_steps}")
 
 
     def _serial_send_wait(self, cmd_text):

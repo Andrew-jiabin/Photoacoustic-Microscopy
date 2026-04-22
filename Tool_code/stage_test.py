@@ -10,7 +10,16 @@ SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整
 stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
 
 
-stage.set_position([-18187.5,1645.5])
 
-# B. 核心握手：等待物理到位
-# stage.wait_until_settled(-18187,1645, settle_time_ms=SETTLE_MS)
+# 使用建议：
+# res = stage.upgrade_to_high_precision()
+res = stage.cmd("controller.stage.steps-per-micron.get")
+
+print(res)
+
+stage.cmd("controller.stage.ss.set 1")
+res = stage.cmd("controller.stage.steps-per-micron.get")
+
+print(res)
+
+# goto_position_precision(10.5, 20.75, res) # 这样就能实现 10.5微米的移动

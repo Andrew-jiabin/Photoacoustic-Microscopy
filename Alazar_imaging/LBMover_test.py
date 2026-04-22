@@ -1,8 +1,8 @@
-from Alazar_imaging.LBMover import LBMover
+from LBMover import LBMover
 import ctypes
 import time
 
-def run_comprehensive_test(port_name="COM4"):
+def run_comprehensive_test(port_name="COM6"):
     # 实例化类
     mv = LBMover()
     
@@ -60,4 +60,4 @@ def run_comprehensive_test(port_name="COM4"):
 
 if __name__ == "__main__":
     # 你可以在这里输入你确定的 COM 口
-    run_comprehensive_test("COM4")
+    run_comprehensive_test("COM6")
