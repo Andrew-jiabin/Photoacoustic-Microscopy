@@ -172,10 +172,7 @@ def main():
         except:
             pass
 
-        # 4. 位移台清理（修复stop_scan不存在）
         try:
-            # 替换为位移台实际的停止方法，若无则删除这行
-            # stage.stop_motion()  # 示例：如果有该方法则保留
             stage.connect_sdk()
         except AttributeError as e:
             print(f"[INFO] 位移台清理: {e}（无需处理）")

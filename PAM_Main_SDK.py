@@ -19,12 +19,12 @@ def main():
     COM_PORT = "4" # 你的位移台串口 4
     # 如果不使用一维位移台, 则不要设置长宽任意为 1
     SCAN_W = 70
-    SCAN_H = 170    # 设置为 1 实现 1 维扫描
+    SCAN_H = 70    # 设置为 1 实现 1 维扫描
     STEP_UM = 1    # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
     # 扫描参数 (数值格式，方便计算)
-    SETTLE_MS = 100     # 到位后的物理稳定时间 (根据位移台震动调整)
-    offset = 5  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
-    HIGH_PRECISION = True
+    SETTLE_MS = 100     # 到位后的物理稳定时间，参考README.md的测试结果
+    offset = 0  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
+    HIGH_PRECISION = True   #  False True
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS   # 如果使用 B 通道, 则只能使用2000MSPS
@@ -157,14 +157,14 @@ def main():
             progress_manager.start(total=len(trajectory), desc="🚀 PAM Scanning")
 
             for i, (tx, ty, flag) in enumerate(trajectory):
-                if flag==1:
+                if flag==1 and offset<1:
                     # A. 指令位移台移动
+                    print(tx+offset, ty)
                     stage.set_position([tx+offset, ty])
+                    
                     # B. 核心握手：等待物理到位
                     stage.wait_until_settled(tx+offset, ty, settle_time_ms=SETTLE_MS)
                     current_pos_str = f"{tx+offset},{ty},0"
-                else:
-                    pass
                 # A. 指令位移台移动
                 stage.set_position([tx, ty])
                 time.sleep(0.01)
@@ -200,59 +200,66 @@ def main():
         except Exception as e:
             print(f"\n❌ 发生错误: {e}")
         if len(all_data) > 0:
-            print(f"💾 正在按位点建立映射并保存至 {save_path}")
-            
-            mat_dict = {}
-            # 预留一个辅助列表，用于在 MATLAB 中方便地按索引访问坐标
-            index_to_pos = [] 
+            # --- 新增询问逻辑 ---
+            save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据到 {save_path}? (y/n): ").strip().lower()
+            while(save_confirm!="y" and save_confirm!="n"):
+                save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据到 {save_path}? (y/n): ").strip().lower()
+            if save_confirm == 'y':
+                print(f"💾 正在处理并保存数据...")
+                # 这里放你原有的保存代码...
+                mat_dict = {}
+                # 预留一个辅助列表，用于在 MATLAB 中方便地按索引访问坐标
+                index_to_pos = [] 
 
-            try:
-                for idx, item in enumerate(all_data):
-                    # 根据你 get_one_acquisition 的改版：
-                    # item[0] 是数据 (summed_data 或 buffers列表)
-                    # item[1] 是原始坐标字符串 "X,Y,Z"
-                    raw_data_content = item[0]
-                    original_pos_str = item[1]
+                try:
+                    for idx, item in enumerate(all_data):
+                        # 根据你 get_one_acquisition 的改版：
+                        # item[0] 是数据 (summed_data 或 buffers列表)
+                        # item[1] 是原始坐标字符串 "X,Y,Z"
+                        raw_data_content = item[0]
+                        original_pos_str = item[1]
 
-                    # 1. 生成合法的 MATLAB 变量名
-                    safe_key = sanitize_pos_to_key(original_pos_str)
-                    
-                    # 2. 处理数据体
-                    if AVERAGE_ENABLE:
-                        # summed_data 已经是 uint32 求和结果，转换为 uint16 节省空间
-                        # 注意：如果 RECORDS_PER_POINT 很大，请检查是否会溢出
-                        processed_data = (raw_data_content / RECORDS_PER_POINT).astype(np.uint16)
-                    else:
-                        # 如果是原始 buffer 列表，进行拼接,这里还存在很多处理逻辑上的问题
-                        if isinstance(raw_data_content, list):
-                            processed_data = np.concatenate(raw_data_content).astype(np.uint16)
+                        # 1. 生成合法的 MATLAB 变量名
+                        safe_key = sanitize_pos_to_key(original_pos_str)
+                        
+                        # 2. 处理数据体
+                        if AVERAGE_ENABLE:
+                            # summed_data 已经是 uint32 求和结果，转换为 uint16 节省空间
+                            # 注意：如果 RECORDS_PER_POINT 很大，请检查是否会溢出
+                            processed_data = (raw_data_content / RECORDS_PER_POINT).astype(np.uint16)
                         else:
-                            processed_data = raw_data_content.astype(np.uint16)
+                            # 如果是原始 buffer 列表，进行拼接,这里还存在很多处理逻辑上的问题
+                            if isinstance(raw_data_content, list):
+                                processed_data = np.concatenate(raw_data_content).astype(np.uint16)
+                            else:
+                                processed_data = raw_data_content.astype(np.uint16)
 
-                    # 3. 存入字典：坐标 -> 数据
-                    mat_dict[safe_key] = processed_data
+                        # 3. 存入字典：坐标 -> 数据
+                        mat_dict[safe_key] = processed_data
+                        
+                        # 4. 存入辅助索引映射
+                        index_to_pos.append(original_pos_str)
+
+                    # 5. 添加元数据，方便后续追溯
+                    mat_dict["metadata"] = {
+                        "scan_shape": [SCAN_W, SCAN_H],
+                        "step_um": STEP_UM,
+                        "pos_list": index_to_pos, # 这样你在 MATLAB 里可以用这个列表找到所有的 Key
+                        "is_averaged": int(AVERAGE_ENABLE),
+                        "step_size":STEP_UM
+                    }
+
+                    # 6. 最终保存
+                    sio.savemat(save_path, mat_dict)
                     
-                    # 4. 存入辅助索引映射
-                    index_to_pos.append(original_pos_str)
-
-                # 5. 添加元数据，方便后续追溯
-                mat_dict["metadata"] = {
-                    "scan_shape": [SCAN_W, SCAN_H],
-                    "step_um": STEP_UM,
-                    "pos_list": index_to_pos, # 这样你在 MATLAB 里可以用这个列表找到所有的 Key
-                    "is_averaged": int(AVERAGE_ENABLE),
-                    "step_size":STEP_UM
-                }
-
-                # 6. 最终保存
-                sio.savemat(save_path, mat_dict)
+                    print(f"✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据，注意初始位置为 {[START_X, START_Y]}")
                 
-                print(f"✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据，注意初始位置为 {[START_X, START_Y]}")
-            
-            except Exception as e:
-                print(f"❌ 数据封装失败: {e}")
-                import traceback
-                traceback.print_exc()
+                except Exception as e:
+                    print(f"❌ 数据封装失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif save_confirm == 'n':
+                print("⚠️ 用户选择不保存数据，数据已丢弃。")
         else:
             print("⚠️ 未采集到任何有效数据，跳过保存。")
 

@@ -144,7 +144,7 @@ class PriorUnifiedStage:
         ret, resp = self.cmd("controller.stage.busy")
         return resp == "1"
 
-    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_um=0.05,):
+    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_step=0):
         flag = False
         time_count= False
         while not flag:
@@ -153,17 +153,17 @@ class PriorUnifiedStage:
             pos_str = self.get_position() # 获取 SDK 坐标
             parts = pos_str.split(',')
             curr_x, curr_y = float(parts[0]), float(parts[1])
-            if abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) < tolerance_um:
+            if abs(curr_x - target_x) < tolerance_step and abs(curr_y - target_y) < tolerance_step:
                 time.sleep(settle_time_ms/1000) # 短暂休眠，避免占用 100% CPU
                 pos_str = self.get_position() # 获取 SDK 坐标
                 parts = pos_str.split(',')
                 curr_x, curr_y = float(parts[0]), float(parts[1])
-                if abs(curr_x - target_x) < tolerance_um and abs(curr_y - target_y) < tolerance_um:
+                if abs(curr_x - target_x) < tolerance_step and abs(curr_y - target_y) < tolerance_step:
                     break
                 else:
                     time_count=True
                     continue
-            elif (abs(curr_x - target_x) > tolerance_um and abs(curr_y - target_y) > tolerance_um) and time_count:
+            elif (abs(curr_x - target_x) > tolerance_step and abs(curr_y - target_y) > tolerance_step) and time_count:
                     print("settle time too short!")
 
         return False

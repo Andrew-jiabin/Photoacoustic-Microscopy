@@ -10,7 +10,7 @@ SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整
 stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
 
 
-stage.set_position([-18187.5,1645.5])
+stage.set_position([-17517,1599])
 
 # B. 核心握手：等待物理到位
-# stage.wait_until_settled(-18187,1645, settle_time_ms=SETTLE_MS)
+stage.wait_until_settled(-17517,1599, settle_time_ms=SETTLE_MS)
