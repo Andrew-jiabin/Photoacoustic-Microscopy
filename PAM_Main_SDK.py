@@ -16,13 +16,14 @@ def main():
     DLL_PATH = r"D:\LJB\PAM\PriorSDK 2.0.0\x64\PriorScientificSDK.dll"
     LB_DLL_PATH = r"D:\LJB\alazar_DAQ\Photoacoustic-Microscopy\LBTEK_SDK\x64\moverLibrary.dll"
     MODEL_NAME = b"EM-LSS65-13C1"
+    LB_MOVER = False
     COM_PORT = "4" # 你的位移台串口 4
     # 如果不使用一维位移台, 则不要设置长宽任意为 1
-    SCAN_W = 70
-    SCAN_H = 70    # 设置为 1 实现 1 维扫描
+    SCAN_W = 1
+    SCAN_H = 2    # 设置为 1 实现 1 维扫描
     STEP_UM = 1    # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
     # 扫描参数 (数值格式，方便计算)
-    SETTLE_MS = 100     # 到位后的物理稳定时间，参考README.md的测试结果
+    SETTLE_MS = 120     # 到位后的物理稳定时间，参考README.md的测试结果
     offset = 0  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
     HIGH_PRECISION = True   #  False True
     # DAQ 参数 (Alazar)
@@ -36,12 +37,10 @@ def main():
     Buffer_Count = 4   # 对于单点停顿采集，4个buffer游刃有余，不用1024
     save_path = f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mat"
 
-    if SCAN_W == 1:
-        print("如果使用1维位移台, 只能设置 SCAN_H 为1, 不能设置 SCAN_W 为1 - 林佳斌")
-        exit(0)
 
-    if SCAN_H == 1:
-        print("检测到 1D 扫描模式，切换至 LBMover 控制器...")
+
+    if LB_MOVER == True:
+        print("切换至 LBMover 控制器...")
         stage = LBMover(LB_DLL_PATH)
         handle = stage.openEmcvx(COM_PORT.encode('utf-8'))
         if handle < 0:
@@ -61,7 +60,7 @@ def main():
     else:
         # === 2. 初始化硬件 ===
         stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
-        if HIGH_PRECISION: stage.cmd("controller.stage.ss.set 1")
+        if HIGH_PRECISION: stage.cmd("controller.stage.ss.set 2")
         
 
 
@@ -81,7 +80,7 @@ def main():
 
     # === 3. 生成扫描轨迹 (蛇形扫描逻辑) ===
     # 获取初始位置作为 0,0 点
-    if SCAN_H == 1:
+    if LB_MOVER == True:
         # 获取当前位置
         start_pos, _ = stage.get_pos(0)
         trajectory = []
@@ -105,40 +104,40 @@ def main():
                 else:
                     trajectory.append((target_x, target_y, 0))
             
-    # === 生成轨迹 (快轴改为 Y 轴，S型扫描) ===
-    # for w in range(SCAN_W):
-    #     # 根据列号 w 的奇偶性决定 Y 轴是正向还是反向扫描
-    #     h_range = range(SCAN_H) if w % 2 == 0 else reversed(range(SCAN_H))
-        
-    #     for h in h_range:
-    #         target_x = START_X + (w * STEP_UM)
-    #         target_y = START_Y + (h * STEP_UM)
+        # === 生成轨迹 (快轴改为 Y 轴，S型扫描) ===
+        # for w in range(SCAN_W):
+        #     # 根据列号 w 的奇偶性决定 Y 轴是正向还是反向扫描
+        #     h_range = range(SCAN_H) if w % 2 == 0 else reversed(range(SCAN_H))
             
-    #         # 根据当前列的扫描方向标记状态 (可选，保留你原代码的逻辑)
-    #         if w % 2 == 1:
-    #             trajectory.append((target_x, target_y, 1))
-    #         else:
-    #             trajectory.append((target_x, target_y, 0))
+        #     for h in h_range:
+        #         target_x = START_X + (w * STEP_UM)
+        #         target_y = START_Y + (h * STEP_UM)
+                
+        #         # 根据当前列的扫描方向标记状态 (可选，保留你原代码的逻辑)
+        #         if w % 2 == 1:
+        #             trajectory.append((target_x, target_y, 1))
+        #         else:
+        #             trajectory.append((target_x, target_y, 0))
 
     # === 4. 开始实验 ===
     all_data = []
     try:
-        if SCAN_H == 1:
+        if LB_MOVER == True:
             progress_manager.start(total=len(trajectory), desc="🚀 1D PAM Scanning")
 
             for i, tx in enumerate(trajectory):
                 # A. 指令位移台移动 (LBMover 逻辑)
-                if SCAN_H == 1:
-                    # 1. 设置绝对目标位置
-                    stage.setAbsoluteDisp(stage.handle, 0, tx)
-                    # 2. 发送“绝对移动”指令 (0x06)
-                    stage.moveEmcvx(stage.handle, 0, 0x06)
+                
+                # 1. 设置绝对目标位置
+                stage.setAbsoluteDisp(stage.handle, 0, tx)
+                # 2. 发送“绝对移动”指令 (0x06)
+                stage.moveEmcvx(stage.handle, 0, 0x06)
+                
+                # B. 等待到位
+                lbtek_wait_settled(stage, stage.handle, 0)
+                time.sleep(SETTLE_MS / 1000.0) # 物理稳定时间
                     
-                    # B. 等待到位
-                    lbtek_wait_settled(stage, stage.handle, 0)
-                    time.sleep(SETTLE_MS / 1000.0) # 物理稳定时间
-                    
-                    current_pos_str = f"{tx:.4f},0,0" # 格式化坐标字符串用于保存
+                current_pos_str = f"{tx:.4f},0,0" # 格式化坐标字符串用于保存
                 
                 # C. 采集数据 (DAQ 逻辑不变)
                 daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
@@ -159,11 +158,10 @@ def main():
             for i, (tx, ty, flag) in enumerate(trajectory):
                 if flag==1 and offset<1:
                     # A. 指令位移台移动
-                    print(tx+offset, ty)
                     stage.set_position([tx+offset, ty])
-                    
                     # B. 核心握手：等待物理到位
                     stage.wait_until_settled(tx+offset, ty, settle_time_ms=SETTLE_MS)
+                    
                     current_pos_str = f"{tx+offset},{ty},0"
                 # A. 指令位移台移动
                 stage.set_position([tx, ty])

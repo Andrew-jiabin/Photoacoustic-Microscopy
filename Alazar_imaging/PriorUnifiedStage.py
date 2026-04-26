@@ -144,7 +144,7 @@ class PriorUnifiedStage:
         ret, resp = self.cmd("controller.stage.busy")
         return resp == "1"
 
-    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_step=0):
+    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_step=0.05):
         flag = False
         time_count= False
         while not flag:

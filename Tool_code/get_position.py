@@ -11,6 +11,8 @@ SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整
 TIMEOUT = 2.0                         # 单次移动最大等待 2 秒
 REPEATS = 100           # 每个步长重复测试次数
 
+
+
 def get_clean_pos(stage):
     raw = stage.get_position()
     return [int(x) for x in raw.split(',')]
@@ -29,58 +31,96 @@ time.sleep(1)
 base_pos = get_clean_pos(stage)
 
 
-print(f"### 位移台稳定性统计测试 (SS=2, Repeats={REPEATS})")
-print("| Step | Mean Time (ms) | Variance | Success Rate | Final Status |")
-print("| :--- | :--- | :--- | :--- | :--- |")
+# print(f"### 位移台稳定性统计测试 (SS=2, Repeats={REPEATS})")
+# print("| Step | Mean Time (ms) | Variance | Success Rate | Final Status |")
+# print("| :--- | :--- | :--- | :--- | :--- |")
 
-for step in TEST_STEPS:
-    times = []
-    success_count = 0
+# for step in TEST_STEPS:
+#     times = []
+#     success_count = 0
     
-    for _ in range(REPEATS):
-        # 1. 记录初始位置
+#     for _ in range(REPEATS):
+#         # 1. 记录初始位置
         
-        target_pos = [base_pos[0] + step, base_pos[1] + step]
+#         target_pos = [base_pos[0] + step, base_pos[1] + step]
         
-        # 2. 执行位移
-        stage.set_position(target_pos)
-        start_time = time.time()
+#         # 2. 执行位移
+#         stage.set_position(target_pos)
+#         start_time = time.time()
         
         
-        # 3. 监测稳定过程
-        last_pos = None
+#         # 3. 监测稳定过程
+#         last_pos = None
+#         stable_count = 0
+#         current_reach_time = None
+        
+#         while (time.time() - start_time) < TIMEOUT:
+#             current_pos = get_clean_pos(stage)
+#             if current_pos == last_pos:
+#                 stable_count += 1
+#             else:
+#                 stable_count = 0
+            
+#             if stable_count >= STABLE_THRESHOLD:
+#                 current_reach_time = (time.time() - start_time) * 1000
+#                 # 校验位置是否完全准确
+#                 if current_pos == target_pos:
+#                     success_count += 1
+#                     times.append(current_reach_time)
+#                 break
+            
+#             last_pos = current_pos
+#             time.sleep(CHECK_INTERVAL)
+        
+#         # 4. 强制复位，准备下一次重复测试
+#         stage.set_position(base_pos)
+#         time.sleep(2) # 给充足的复位稳定时间
+
+#     # 5. 计算统计结果
+#     mean_t, var_t = calculate_stats(times)
+#     success_rate = (success_count / REPEATS) * 100
+#     status = "✅ STABLE" if success_rate == 100 else "⚠️ UNSTABLE"
+    
+#     print(f"| {step} | {mean_t:.2f} | {var_t:.2f} | {success_rate:.0f}% | {status} |")
+
+# print("\n> 注：Mean Time 仅计入成功到达 Target_Pos 的样本。")
+# stage.set_position(base_pos) 
+# print("所有测试结束，硬件已归位。")
+
+import time
+
+def verify_polling_overhead(stage, iterations=10):
+    """
+    验证在不移动的情况下，触发 STABLE_THRESHOLD 所需的固有时间开销
+    """
+    print(f"--- 轮询开销验证 (STABLE_THRESHOLD=3) ---")
+    overheads = []
+    
+    for i in range(iterations):
+        start_test = time.time()
         stable_count = 0
-        current_reach_time = None
+        last_pos = None
         
-        while (time.time() - start_time) < TIMEOUT:
-            current_pos = get_clean_pos(stage)
+        while True:
+            # 模拟原代码中的获取和判断逻辑
+            current_pos = stage.get_position() 
             if current_pos == last_pos:
                 stable_count += 1
             else:
                 stable_count = 0
             
-            if stable_count >= STABLE_THRESHOLD:
-                current_reach_time = (time.time() - start_time) * 1000
-                # 校验位置是否完全准确
-                if current_pos == target_pos:
-                    success_count += 1
-                    times.append(current_reach_time)
+            if stable_count >= 3: # 对应你的 STABLE_THRESHOLD
+                end_test = time.time()
+                duration = (end_test - start_test) * 1000
+                overheads.append(duration)
                 break
-            
+                
             last_pos = current_pos
-            time.sleep(CHECK_INTERVAL)
-        
-        # 4. 强制复位，准备下一次重复测试
-        stage.set_position(base_pos)
-        time.sleep(2) # 给充足的复位稳定时间
+            time.sleep(0.01) # 对应你的 CHECK_INTERVAL
+            
+    avg_overhead = sum(overheads) / len(overheads)
+    print(f"单次判定『稳定』的固有代码开销: {avg_overhead:.2f} ms")
+    print(f"这意味着你的测量结果中，前 {avg_overhead:.2f} ms 可能是无效的观测误差。")
 
-    # 5. 计算统计结果
-    mean_t, var_t = calculate_stats(times)
-    success_rate = (success_count / REPEATS) * 100
-    status = "✅ STABLE" if success_rate == 100 else "⚠️ UNSTABLE"
-    
-    print(f"| {step} | {mean_t:.2f} | {var_t:.2f} | {success_rate:.0f}% | {status} |")
-
-print("\n> 注：Mean Time 仅计入成功到达 Target_Pos 的样本。")
-stage.set_position(base_pos) 
-print("所有测试结束，硬件已归位。")
+# 在你的初始化代码后调用
+verify_polling_overhead(stage)
