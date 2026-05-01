@@ -29,8 +29,26 @@ clc;
 % 2026-04-30_23-27-16-D-1600-AVER-512-resolution-4-without-h2o.mat
 % 2160nm
 
+% 2026-05-01_11-24-50-D-1600-AVER-1024-resolution-1.mat
+% 2160nm
+% 2026-05-01_11-29-58-D-1600-AVER-1024-resolution-2.mat
+% 760nm
+
+
+% 2026-05-01_11-42-42-D-1600-AVER-256-resolution-1.mat
+% 240nm 
+% 2026-05-01_11-45-28-D-1600-AVER-256-resolution-2.mat
+% 280nm
+% 2026-05-01_11-47-40-D-1600-AVER-128-resolution-1.mat
+% 240nm
+% 2026-05-01_11-50-05-D-1600-AVER-128-resolution-2.mat
+% 240nm
+% 2026-05-01_11-52-06-D-1600-AVER-64-resolution-1.mat
+% 220nm
+% 2026-05-01_11-54-02-D-1600-AVER-64-resolution-2.mat
+% 220nm
 %% 1. 数据加载与元数据准备
-data_path = "2026-04-30_23-27-16-D-1600-AVER-512-resolution-4-without-h2o.mat";
+data_path = "2026-05-01_11-50-05-D-1600-AVER-128-resolution-2.mat";
 mat_path = strcat("./data/",data_path);
 if ~exist(mat_path, 'file'), error('找不到原始数据文件，请检查路径。'); end
 

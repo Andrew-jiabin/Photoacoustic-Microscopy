@@ -8,9 +8,9 @@ SETTLE_MS = 50     # 到位后的物理稳定时间 (根据位移台震动调整
 
 # === 2. 初始化硬件 ===
 stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
-
+stage.cmd("controller.stage.ss.set 2") # 设定为 20nm 步长
 #毕设位置 202060429
-stage.set_position([-16442, -749])
+stage.set_position([-814736, -36684])
 
 # B. 核心握手：等待物理到位
-stage.wait_until_settled(-16442, -749, settle_time_ms=SETTLE_MS)
+stage.wait_until_settled(-814736, -36684, settle_time_ms=SETTLE_MS)
