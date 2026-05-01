@@ -1,5 +1,5 @@
 %% 1. 全量加载数据（保持不变）
-mat_path = "./data/2026-04-21_21-46-03.mat";
+mat_path = "./data\2026-04-30_21-24-12-D-1600-AVER-1024-resolution-2.mat";
 fprintf('正在将数据全量加载至内存...\n');
 tic;
 S = load(mat_path); 

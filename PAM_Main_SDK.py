@@ -19,9 +19,10 @@ def main():
     LB_MOVER = False
     COM_PORT = "4" # 你的位移台串口 4
     # 如果不使用一维位移台, 则不要设置长宽任意为 1
-    SCAN_W = 1
-    SCAN_H = 500    # 设置为 1 实现 1 维扫描
+    SCAN_W = 1    # 设置为 1 实现 1 维扫描,横向
+    SCAN_H = 300    # 设置为 1 实现 1 维扫描,横向
     STEP_UM = 1   # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
+    DELAY = 1600        # 丢弃的采样点数
     # 扫描参数 (数值格式，方便计算)
     SETTLE_MS = 120     # 到位后的物理稳定时间，参考README.md的测试结果
     offset = 0  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
@@ -29,11 +30,10 @@ def main():
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS   # 如果使用 B 通道, 则只能使用2000MSPS
-    RECORDS_PER_POINT = 64 
     AVERAGE_ENABLE = True
-    # SAMPLE_RATE_str = "4G"
+    # SAMPLE_RATE_str = "4G" 
     # RECORDS_BUF = 64 
-    RECORDS_PER_POINT = 64 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
+    RECORDS_PER_POINT = 512 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
     Buffer_Count = 4   # 对于单点停顿采集，4个buffer游刃有余，不用1024
     af_fix=""
 
@@ -64,7 +64,7 @@ def main():
         
 
 
-    daq = AlazarNPTSystem(systemId=1, boardId=1)
+    daq = AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY)
     daq.configure_board(sample_rate=SAMPLE_RATE)
     
     # 注意：这里去掉了 num_points 参数
@@ -141,7 +141,7 @@ def main():
                 
                 # C. 采集数据 (DAQ 逻辑不变)
                 daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
-                                        timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
+                                        timeout_ms=2000, Average_Enable=AVERAGE_ENABLE)
                 
                 progress_manager.update(1)
             
@@ -172,7 +172,7 @@ def main():
                 
                 
                 daq.get_one_acquisition(all_data=all_data, curr_pos_str=current_pos_str, 
-                                        timeout_ms=500, Average_Enable=AVERAGE_ENABLE)
+                                        timeout_ms=1000, Average_Enable=AVERAGE_ENABLE)
 
                 current_pos_str = f"{tx},{ty},0"
                 progress_manager.update(1)
@@ -197,9 +197,9 @@ def main():
             print(f"\n❌ 发生错误: {e}")
         if len(all_data) > 0:
             # --- 新增询问逻辑 ---
-            save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据到 {save_path}? (y/n): ").strip().lower()
+            save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据? (y/n): ").strip().lower()
             while(save_confirm!="y" and save_confirm!="n"):
-                save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据到 {save_path}? (y/n): ").strip().lower()
+                save_confirm = input(f"\n实验完成，共采集 {len(all_data)} 个点。是否保存数据到? (y/n): ").strip().lower()
             if save_confirm == 'y':
                 
                 print(f"💾 正在处理并保存数据...")
@@ -250,10 +250,10 @@ def main():
                         save_confirm = input(f"\n是否需要添加后缀? (y/n): ").strip().lower()
                     if save_confirm == 'y': af_fix = input(f"\n请输入英文后缀:  ").strip().lower()
                     # 6. 最终保存
-                    save_path = f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"+str(af_fix)+".mat"
+                    save_path = f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-D-{DELAY}-AVER-{RECORDS_PER_POINT}-"+str(af_fix)+".mat"
                     sio.savemat(save_path, mat_dict)
                     
-                    print(f"✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据，注意初始位置为 {[START_X, START_Y]}，已归位")
+                    print(f"\n✅ 成功保存！共计 {len(mat_dict)-1} 个坐标位点数据。\n注意初始位置为 {[START_X, START_Y]}，已归位\n数据保存至\n{save_path}")
                 
                 except Exception as e:
                     print(f"❌ 数据封装失败: {e}")

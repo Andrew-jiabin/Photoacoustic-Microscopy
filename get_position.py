@@ -13,12 +13,16 @@ def get_clean_pos(stage):
 
 # === 低精度位移定位 ===
 stage = PriorUnifiedStage(DLL_PATH, COM_PORT)
-# stage.cmd("controller.stage.ss.set 2") # 设定为 20nm 步长
+stage.cmd("controller.stage.ss.set 2") # 设定为 20nm 步长
 time.sleep(1)
 base_pos = get_clean_pos(stage)
 print(base_pos)
 
 # 20260429 毕设位置 [-16442, -749]
+
+
+# [-817420, -33901]
+
 
 # 20260429 毕设打水位置 [-16442, -27939]
 

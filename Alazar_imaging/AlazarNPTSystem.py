@@ -10,10 +10,10 @@ import traceback
 import atsapi as ats
 
 class AlazarNPTSystem:
-    def __init__(self, systemId=1, boardId=1):
+    def __init__(self, systemId=1, boardId=1, Delay=0):
         self.board = ats.Board(systemId=systemId, boardId=boardId)
         self.buffers = []
-
+        self.Delay = Delay
         self.is_capturing = False
         
     def configure_board(self,sample_rate):
@@ -40,7 +40,7 @@ class AlazarNPTSystem:
                                        128)
         
         # 设置触发延迟和超时
-        self.board.setTriggerDelay(1380)
+        self.board.setTriggerDelay(self.Delay)
         self.board.setTriggerTimeOut(0) # 无限等待触发
         
         # 如果激光器自己发光并给板卡触发，则无需此步，或设为 AUX_OUT_TRIGGER

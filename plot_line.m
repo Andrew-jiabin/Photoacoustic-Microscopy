@@ -1,0 +1,158 @@
+close all;
+clear all;
+clc;
+
+% 有用的数据的记录
+% 2026-04-30_21-24-12-D-1600-AVER-1024-resolution-1.mat             
+% Res 700nm
+% 2026-04-30_21-31-38-D-1600-AVER-1024-resolution-2.mat             
+% Rse 1060nm
+% 2026-04-30_21-42-15-D-1600-AVER-1024-resolution-3.mat             
+% Rse 1680nm
+% 2026-04-30_21-50-10-D-1600-AVER-1024-resolution-4.mat                 
+% Rse 280nm
+% 2026-04-30_22-00-49-D-1600-AVER-1024-resolution-water-failed.mat
+% Rse 300nm
+% 2026-04-30_22-30-48-D-1600-AVER-1024-resolution-5.mat
+% Res 520nm
+% 2026-04-30_22-43-54-D-1600-AVER-1024-resolution-6.mat
+% Res 180nm
+% 2026-04-30_22-57-24-D-1600-AVER-1024-resolution-7.mat
+% 320nm
+
+% 2026-04-30_23-05-43-D-1600-AVER-512-resolution-1.mat
+% 这次测量探针及其之前几次探针可能都是已经抵到了样品，这次数据完全计算不了
+% 2026-04-30_23-14-28-D-1600-AVER-512-resolution-2.mat
+% 这个数据也不正常，完全的阶跃，都没有半高全宽
+% 2026-04-30_23-21-03-D-1600-AVER-512-resolution-3-without-h2o.mat
+% 1140nm
+% 2026-04-30_23-27-16-D-1600-AVER-512-resolution-4-without-h2o.mat
+% 2160nm
+
+%% 1. 数据加载与元数据准备
+data_path = "2026-04-30_23-27-16-D-1600-AVER-512-resolution-4-without-h2o.mat";
+mat_path = strcat("./data/",data_path);
+if ~exist(mat_path, 'file'), error('找不到原始数据文件，请检查路径。'); end
+
+fprintf('正在加载原始数据...\n');
+S = load(mat_path); 
+
+[file_dir, file_name, ~] = fileparts(mat_path);
+
+meta = S.metadata;
+scan_w = double(meta.scan_shape(1));
+scan_h = double(meta.scan_shape(2));
+pos_list = cellstr(meta.pos_list);
+dx = meta.step_size; dy = meta.step_size;
+
+%% 2. 自动获取波形长度与预分配
+first_key = sanitize_key_matlab(pos_list{1});
+waveform_length = length(S.(first_key));
+fprintf('✅ 自动获取波形长度：%d\n', waveform_length);
+
+Data_Cube = zeros(scan_h, scan_w, waveform_length, 'single'); 
+fprintf('正在填充三维矩阵 [%d x %d x %d]...\n', scan_h, scan_w, waveform_length);
+
+%% 3. 基于坐标映射的 3D 数据填充
+all_coords = zeros(length(pos_list), 2);
+for i = 1:length(pos_list)
+    all_coords(i, :) = sscanf(pos_list{i}, '%f, %f')';
+end
+min_x = min(all_coords(:, 1));
+min_y = min(all_coords(:, 2));
+
+for i = 1:length(pos_list)
+    raw_pos_str = pos_list{i};
+    coords = all_coords(i, :);
+    col = round((coords(1) - min_x) / dx) + 1;
+    row = round((coords(2) - min_y) / dy) + 1;
+    
+    if row >= 1 && col >= 1 && row <= scan_h && col <= scan_w
+        safe_key = sanitize_key_matlab(raw_pos_str);
+        if isfield(S, safe_key)
+            Data_Cube(row, col, :) = single(S.(safe_key));
+        end
+    end
+end
+
+
+%% 4. 分辨率分析参数设置
+target_row = 100;    
+target_col = 1;      
+mode = 'col';        
+
+P2P_Map = compute_peak_to_peak(Data_Cube);
+
+if strcmpi(mode, 'row')
+    profile_data = P2P_Map(target_row, :);
+    axis_label = 'Column Index (X)';
+else
+    profile_data = P2P_Map(:, target_col);
+    axis_label = 'Row Index (Y)';
+end
+
+valid_mask = ~isnan(profile_data);
+x_raw = double(find(valid_mask)); x_raw = x_raw(:); 
+y_raw = double(profile_data(valid_mask)); y_raw = y_raw(:);
+
+%% 5. 拟合与 FWHM 计算 (适配正负峰)
+ft = fittype('a + (b-a) / (1 + exp(-c*(x-d)))', 'coefficients', {'a', 'b', 'c', 'd'});
+opts = fitoptions(ft);
+opts.StartPoint = [min(y_raw), max(y_raw), 1, median(x_raw)];
+[fit_result, ~] = fit(x_raw, y_raw, ft, opts);
+
+x_fit = linspace(min(x_raw), max(x_raw), 2000)';
+y_fit = fit_result(x_fit);
+dy_fit = diff(y_fit) ./ diff(x_fit);
+x_der = x_fit(1:end-1) + diff(x_fit)/2;
+
+[~, max_idx] = max(abs(dy_fit));
+peak_val = dy_fit(max_idx);
+half_max = peak_val / 2;
+
+if peak_val > 0
+    idx1 = find(dy_fit(1:max_idx) >= half_max, 1, 'first');
+    idx2_rel = find(dy_fit(max_idx:end) <= half_max, 1, 'first');
+else
+    idx1 = find(dy_fit(1:max_idx) <= half_max, 1, 'first');
+    idx2_rel = find(dy_fit(max_idx:end) >= half_max, 1, 'first');
+end
+
+if isempty(idx1) || idx1 <= 1, x_left = x_der(1);
+else, x_left = interp1(dy_fit(idx1-1:idx1), x_der(idx1-1:idx1), half_max); end
+
+if isempty(idx2_rel), x_right = x_der(end);
+else
+    idx2 = idx2_rel + max_idx - 1;
+    x_right = interp1(dy_fit(idx2-1:idx2), x_der(idx2-1:idx2), half_max);
+end
+fwhm_um = abs(x_right - x_left) * meta.step_size;
+fprintf('✅ FWHM：%d nm\n', 20*fwhm_um);
+%% 6. 绘图展示
+figure('Color', 'w', 'Position', [100, 100, 1200, 500]);
+subplot(1, 2, 1);
+plot(profile_data, 'k.', 'DisplayName', 'Raw'); hold on;
+plot(x_fit, y_fit, 'r-', 'LineWidth', 2, 'DisplayName', 'Fit');
+grid on; title('ERF (Step Response)');
+
+subplot(1, 2, 2);
+plot(x_der, dy_fit, 'b-', 'LineWidth', 2, 'DisplayName', 'LSF'); hold on;
+plot([x_left, x_right], [half_max, half_max], 'ro-', 'LineWidth', 2, 'MarkerFaceColor', 'r');
+text(x_left, half_max, sprintf('X: %.2f  ', x_left), 'HorizontalAlignment', 'right', 'Color', 'r', 'FontWeight', 'bold');
+text(x_right, half_max, sprintf('  X: %.2f', x_right), 'HorizontalAlignment', 'left', 'Color', 'r', 'FontWeight', 'bold');
+grid on; title(sprintf('Resolution: %.2f nm', fwhm_um*20));
+
+%% 辅助函数
+function P2P_Map = compute_peak_to_peak(cube)
+    P2P_Map = max(double(cube), [], 3) - min(double(cube), [], 3);
+    is_empty = all(cube == 0, 3);
+    P2P_Map(is_empty) = NaN;
+end
+
+function safe_key = sanitize_key_matlab(pos_str)
+    clean = strrep(pos_str, ' ', '');
+    clean = strrep(clean, '.', 'p');
+    clean = strrep(clean, '-', 'n');
+    clean = strrep(clean, ',', '_');
+    safe_key = ['P_', clean];
+end
