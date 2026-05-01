@@ -19,7 +19,7 @@ def main():
     LB_MOVER = False
     COM_PORT = "4" # 你的位移台串口 4
     # 如果不使用一维位移台, 则不要设置长宽任意为 1
-    MOVE_RATE = 16
+    MOVE_RATE = 8
     SCAN_W = 5*int(MOVE_RATE)    # 设置为 1 实现 1 维扫描,横向
     SCAN_H = 5*int(MOVE_RATE)    # 设置为 1 实现 1 维扫描,横向
     STEP_UM = 1   # 步长 (注意单位，麓邦通常是 mm，如果是 1um 请填 0.001)
@@ -28,14 +28,15 @@ def main():
     SETTLE_MS = 120     # 到位后的物理稳定时间，参考README.md的测试结果
     offset = 0  #偏置，克服机械位移差   如果w_range = reversed(range(SCAN_W_10NM))，则 OFFSET 为正； 如果w_range = range(SCAN_W_10NM)，则 OFFSET 为负
     HIGH_PRECISION = True   #  False True
-    HIGH_PRECISION_VALUE = 64//MOVE_RATE
+    # HIGH_PRECISION_VALUE = 64//MOVE_RATE
+    HIGH_PRECISION_VALUE = 50
     # DAQ 参数 (Alazar)
     SAMPLES_REC = 4096
     SAMPLE_RATE = ats.SAMPLE_RATE_4000MSPS   # 如果使用 B 通道, 则只能使用2000MSPS
     AVERAGE_ENABLE = True
     # SAMPLE_RATE_str = "4G" 
     # RECORDS_BUF = 64 
-    RECORDS_PER_POINT = 128 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
+    RECORDS_PER_POINT = 256 # 每个点记录多少个record，在平均的情况下，也不能大于1048832，否则uint32会溢出
     Buffer_Count = 4   # 对于单点停顿采集，4个buffer游刃有余，不用1024
     af_fix=""
 
@@ -66,7 +67,7 @@ def main():
         
 
 
-    daq = AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY)
+    daq = AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY, channel_A_range=ats.INPUT_RANGE_PM_200_MV)
     daq.configure_board(sample_rate=SAMPLE_RATE)
     
     # 注意：这里去掉了 num_points 参数

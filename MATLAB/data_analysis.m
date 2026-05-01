@@ -1,122 +1,154 @@
-function signalBrowser()
-% 交互式信号浏览工具：6子图版（含线性与dB频谱）
-% ========== 环境设置 ==========
-set(0, 'DefaultFigureRenderer', 'painters');
-try
-    com.mathworks.services.Prefs.setBooleanPref('JavaFrameFeature加速', false);
-catch
-end
-clear; close all; clc;
+function data_analysis_2D_v2()
+    % 封装为 function 以实现嵌套函数间的变量共享
+    close all; clc;
 
-% --------------------- 1. 核心参数设置 ---------------------
-Fs = 2e9;          % 采样率：2 GHz
-T = 1/Fs;          % 采样周期
+    %% 1. 数据加载与 3D 立方体重建
+    mat_path = "./data/2026-05-01_23-37-52-D-1600-AVER-256-f-image-3.mat";
+    fprintf('正在加载数据...\n');
+    S = load(mat_path); 
 
-% --------------------- 2. 加载数据 ---------------------
-try
-    raw_data = evalin('base', 'raw_data');
-catch
-    error('在工作区中未找到变量 raw_data。');
-end
+    meta = S.metadata;
+    scan_w = double(meta.scan_shape(1)); 
+    scan_h = double(meta.scan_shape(2)); 
+    pos_list = cellstr(meta.pos_list); 
+    dx = meta.step_size; dy = meta.step_size;
 
-numSignals = size(raw_data, 1);
-allSignals = cell(numSignals, 1);
-for i = 1:numSignals
-    x = squeeze(raw_data(i, 1, :));
-    x = double(x);
-    x = (x - 32768) / 65536; 
-    allSignals{i} = x(:);
-end
+    % 自动获取波形长度并预分配
+    first_key = sanitize_key_matlab(pos_list{1});
+    waveform_length = length(S.(first_key));
+    Data_Cube = zeros(scan_h, scan_w, waveform_length, 'single');
+    MAP_img = zeros(scan_h, scan_w, 'single'); 
 
-% --------------------- 3. 图形初始化 ---------------------
-currentIdx = 1;
-fig = figure('Name', '信号浏览器 (左右键切换) - 6子图版', ...
-             'NumberTitle', 'off', ...
-             'KeyPressFcn', @keyPressCallback, ...
-             'Position', [50, 50, 1400, 900], ...
-             'Color', 'white');
+    % 坐标映射重建
+    all_coords = zeros(length(pos_list), 2);
+    for i = 1:length(pos_list)
+        all_coords(i, :) = sscanf(pos_list{i}, '%f, %f')';
+    end
+    min_x = min(all_coords(:, 1)); min_y = min(all_coords(:, 2));
 
-% 布局改为 3行2列
-% 第一行：时域
-ax1 = subplot(3,2,1); h1 = plot(NaN, NaN); grid on;
-xlabel('时间 (μs)'); ylabel('幅值'); title('原始时域信号');
-ax2 = subplot(3,2,2); h2 = plot(NaN, NaN); grid on;
-xlabel('时间 (μs)'); ylabel('幅值'); title('滤波后时域信号');
-
-% 第二行：线性频域
-ax3 = subplot(3,2,3); h3 = plot(NaN, NaN); grid on;
-xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('原始频谱 (线性)');
-ax4 = subplot(3,2,4); h4 = plot(NaN, NaN); grid on;
-xlabel('频率 (MHz)'); ylabel('归一化幅度'); title('滤波频谱 (线性)');
-
-% 第三行：dB 频域 (新增)
-ax5 = subplot(3,2,5); h5 = plot(NaN, NaN); grid on;
-xlabel('频率 (MHz)'); ylabel('幅度 (dB)'); title('原始频谱 (dB)');
-ax6 = subplot(3,2,6); h6 = plot(NaN, NaN); grid on;
-xlabel('频率 (MHz)'); ylabel('幅度 (dB)'); title('滤波频谱 (dB)');
-
-infoText = uicontrol('Style', 'text', 'Position', [20, 10, 200, 25], ...
-                     'FontSize', 10, 'FontWeight', 'bold');
-
-updatePlot();
-
-% --------------------- 回调与更新函数 ---------------------
-    function keyPressCallback(~, event)
-        if strcmp(event.Key, 'leftarrow') && currentIdx > 1
-            currentIdx = currentIdx - 1; updatePlot();
-        elseif strcmp(event.Key, 'rightarrow') && currentIdx < numSignals
-            currentIdx = currentIdx + 1; updatePlot();
+    fprintf('正在重建 3D 矩阵并识别位点...\n');
+    for i = 1:length(pos_list)
+        raw_pos_str = pos_list{i};
+        coords = all_coords(i, :);
+        col = round((coords(1) - min_x) / dx) + 1;
+        row = round((coords(2) - min_y) / dy) + 1;
+        
+        if row >= 1 && col >= 1 && row <= scan_h && col <= scan_w
+            safe_key = sanitize_key_matlab(raw_pos_str);
+            if isfield(S, safe_key)
+                wf = single(S.(safe_key));
+                Data_Cube(row, col, :) = wf;
+                MAP_img(row, col) = max(wf) - min(wf); 
+            end
         end
+    end
+    fprintf('重建完成。导航：[↑][↓] 控制行(Y)，[←][→] 控制列(X)。\n');
+
+    %% 2. 交互式界面初始化
+    Fs = 2e9; T = 1/Fs;
+    curRow = 1; curCol = 1;
+    CLIPPING_THRESHOLD = 2; % 设定：连续 2 个点达到最大值即视为量程溢出隐患
+
+    fig = figure('Name', 'PAM 二维导航扫描器 - 失真监测版', 'NumberTitle', 'off', ...
+                 'KeyPressFcn', @keyPressCallback, 'Color', 'w', 'Position', [100, 100, 1300, 850]);
+
+    % 左上：时域信号
+    ax_time = subplot(2, 2, 1); h_time = plot(NaN, NaN, 'k'); grid on; 
+    xlabel('时间 (μs)'); ylabel('幅值'); title('时域信号 (Time Domain)');
+
+    % 左下：dB 频谱
+    ax_db = subplot(2, 2, 3); h_db = plot(NaN, NaN, 'b'); grid on; 
+    xlabel('频率 (MHz)'); ylabel('幅度 (dB)'); title('频谱 (dB Spectrum)');
+
+    % 右侧：二维掩码图
+    ax_mask = subplot(2, 2, [2 4]); 
+    mask_base = MAP_img; mask_base(mask_base > 0) = 0.3; 
+    imagesc(mask_base); colormap(ax_mask, 'gray'); hold on;
+    h_marker = plot(NaN, NaN, 'rs', 'MarkerSize', 12, 'LineWidth', 2, 'MarkerFaceColor', 'r'); 
+    axis image; title('扫描位点导航图');
+    xlabel('X (pixels)'); ylabel('Y (pixels)');
+
+    % 底部信息栏 (支持多行显示)
+    infoText = uicontrol('Style', 'text', 'Position', [30, 10, 600, 45], ...
+                         'FontSize', 10, 'FontWeight', 'bold', 'HorizontalAlignment', 'left', ...
+                         'BackgroundColor', 'w');
+
+    updatePlot();
+
+    %% 3. 嵌套导航与失真检测逻辑
+    function keyPressCallback(~, event)
+        switch event.Key
+            case 'leftarrow',  if curCol > 1, curCol = curCol - 1; end
+            case 'rightarrow', if curCol < scan_w, curCol = curCol + 1; end
+            case 'uparrow',    if curRow > 1, curRow = curRow - 1; end
+            case 'downarrow',  if curRow < scan_h, curRow = curRow + 1; end
+        end
+        updatePlot();
     end
 
     function updatePlot()
-        x = allSignals{currentIdx};
-        N = length(x);
-        t = (0:N-1)' * T;
-        x_filtered = x - mean(x);
-
-        % 频谱计算
-        X_orig = fft(x);
-        X_filt = fft(x_filtered);
+        % 1. 数据提取
+        x_raw = squeeze(Data_Cube(curRow, curCol, :));
+        x_data = double(x_raw);
         
-        if mod(N,2) == 0
-            n_pos = 1:N/2+1;
-            freq_pos = (0:N/2) * Fs / N;
+        % 2. 失真检测 (Clipping Detection)
+        % 检查时序信号最大值的连续性
+        [peak_val, ~] = max(abs(x_data));
+        is_at_peak = (abs(x_data) == peak_val);
+        
+        % 计算最长连续峰值长度
+        if peak_val > 0
+            diff_peak = diff([0; is_at_peak; 0]);
+            starts = find(diff_peak == 1);
+            ends = find(diff_peak == -1);
+            max_consecutive = max(ends - starts);
         else
-            n_pos = 1:(N+1)/2;
-            freq_pos = (0:(N-1)/2) * Fs / N;
+            max_consecutive = 0;
+        end
+
+        % 3. 频域计算 (dB)
+        N = length(x_data);
+        t = (0:N-1)' * T;
+        X = fft(x_data);
+        n_pos = 1:floor(N/2)+1;
+        freq_pos = (0:floor(N/2)) * Fs / N;
+        amp = abs(X(n_pos)) / N;
+        db_amp = 20 * log10(amp + 1e-15);
+
+        % 4. 更新 UI 元素
+        set(h_time, 'XData', t*1e6, 'YData', x_data);
+        set(h_db, 'XData', freq_pos*1e-6, 'YData', db_amp);
+        set(h_marker, 'XData', curCol, 'YData', curRow);
+        
+        xlim(ax_db, [0 500]); 
+        axis(ax_time, 'tight');
+
+        % 5. 状态信息更新与失真警告
+        statusColor = 'k';
+        clippingMsg = '';
+        
+        if max_consecutive >= CLIPPING_THRESHOLD
+            statusColor = 'r';
+            clippingMsg = sprintf(' | ⚠️ 警告：检测到信号平顶 (连续 %d 点)，可能已超出量程！', max_consecutive);
         end
         
-        % 线性幅度
-        amp_orig = abs(X_orig(n_pos)) / N;
-        amp_filt = abs(X_filt(n_pos)) / N;
+        if all(x_data == 0)
+            statusMsg = ' [空数据点]'; statusColor = [0.5 0.5 0.5];
+        else
+            statusMsg = '';
+        end
         
-        % dB 幅度计算：20*log10，防止 log(0)
-        % 0 dB 通常对应归一化幅度 1.0
-        db_orig = 20 * log10(amp_orig + 1e-15); 
-        db_filt = 20 * log10(amp_filt + 1e-15);
-
-        % 更新数据
-        set(h1, 'XData', t*1e6, 'YData', x);
-        set(h2, 'XData', t*1e6, 'YData', x_filtered);
+        set(infoText, 'String', sprintf('位置: Row(Y)=%d, Col(X)=%d%s\n最大连续峰值点数: %d%s', ...
+            curRow, curCol, statusMsg, max_consecutive, clippingMsg), 'ForegroundColor', statusColor);
         
-        set(h3, 'XData', freq_pos*1e-6, 'YData', amp_orig);
-        set(h4, 'XData', freq_pos*1e-6, 'YData', amp_filt);
-        
-        set(h5, 'XData', freq_pos*1e-6, 'YData', db_orig);
-        set(h6, 'XData', freq_pos*1e-6, 'YData', db_filt);
-
-        % 坐标轴控制
-        axis([ax1 ax2], 'tight');
-        xlim([ax3 ax4 ax5 ax6], [0 1000]); % 限制频率范围到 1GHz
-        
-        % 线性频谱纵轴固定 (根据你之前的设置)
-        ylim([ax3 ax4], [0 2e-5]); 
-        
-        % dB 频谱纵轴固定：通常在 -140dB 到 -80dB 左右
-        ylim([ax5 ax6], [-160 -80]); 
-
-        set(infoText, 'String', sprintf('信号索引: %d / %d', currentIdx, numSignals));
         drawnow;
+    end
+
+    function safe_key = sanitize_key_matlab(pos_str)
+        clean = strrep(pos_str, ' ', '');
+        clean = strrep(clean, '.', 'p');
+        clean = strrep(clean, '-', 'n');
+        clean = strrep(clean, ',', '_');
+        safe_key = ['P_', clean];
     end
 end

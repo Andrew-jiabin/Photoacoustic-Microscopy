@@ -10,19 +10,20 @@ import traceback
 import atsapi as ats
 
 class AlazarNPTSystem:
-    def __init__(self, systemId=1, boardId=1, Delay=0):
+    def __init__(self, systemId=1, boardId=1, Delay=0, channel_A_range=ats.INPUT_RANGE_PM_200_MV):
         self.board = ats.Board(systemId=systemId, boardId=boardId)
         self.buffers = []
         self.Delay = Delay
         self.is_capturing = False
+        self.channel_A_range = channel_A_range
         
     def configure_board(self,sample_rate):
         # 时钟设置 (4GS/s)
         self.board.setCaptureClock(ats.INTERNAL_CLOCK, sample_rate, ats.CLOCK_EDGE_RISING, 0)
         
         # 通道设置
-        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, ats.INPUT_RANGE_PM_40_MV, ats.IMPEDANCE_50_OHM)
-        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_40_MV, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_A, ats.DC_COUPLING, self.channel_A_range, ats.IMPEDANCE_50_OHM)
+        self.board.inputControlEx(ats.CHANNEL_B, ats.DC_COUPLING, ats.INPUT_RANGE_PM_200_MV, ats.IMPEDANCE_50_OHM)
         
         # 触发设置 (使用 Channel A 作为触发源? 还是外部 TTL?)
         # 你的描述是：激光使用内部频率(80K)进行发射,该80K的脉冲也引到trigger
