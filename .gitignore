@@ -1,6 +1,15 @@
-# 忽略所有 MAT 数据文件
+# Generated experiment outputs
+data/
 *.mat
 *.png
 *.txt
-*.pyc
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+*.pyo
 *.asv
+
+# Local backup files
+*.bak
+*.bak_*
