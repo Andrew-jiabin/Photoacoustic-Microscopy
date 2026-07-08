@@ -22,7 +22,10 @@ class BPC303NativeController:
     DEFAULT_SERIAL_NO = "71241834"
     DEVICE_TYPE_ID_71 = 71
     CLOSED_LOOP_MODE = 2
+    CLOSED_LOOP_SMOOTH_MODE = 4
     DEVICE_MAX_COUNT = 32767
+    STATUS_ZEROED = 0x00000010
+    STATUS_ZEROING = 0x00000020
 
     def __init__(
         self,
@@ -35,6 +38,7 @@ class BPC303NativeController:
         enable_channels=True,
         force_closed_loop=True,
         safe_max_output_voltage=75.0,
+        log_callback=None,
         auto_connect=True,
     ):
         self.serial_no = str(serial_no)
@@ -47,6 +51,7 @@ class BPC303NativeController:
         self.enable_channels = bool(enable_channels)
         self.force_closed_loop = bool(force_closed_loop)
         self.safe_max_output_voltage = float(safe_max_output_voltage)
+        self.log_callback = log_callback
 
         self._dll = None
         self._connected = False
@@ -56,6 +61,14 @@ class BPC303NativeController:
 
         if auto_connect:
             self.connect()
+
+    def _log(self, event, **fields):
+        if self.log_callback is None:
+            return
+        try:
+            self.log_callback(event, **fields)
+        except Exception:
+            pass
 
     def _load_library(self):
         if self._dll is not None:
@@ -111,6 +124,9 @@ class BPC303NativeController:
         self._PBC_RequestPosition = self._bind("PBC_RequestPosition", c_short, [c_char_p, c_short])
         self._PBC_GetPosition = self._bind("PBC_GetPosition", c_short, [c_char_p, c_short])
         self._PBC_SetPosition = self._bind("PBC_SetPosition", c_short, [c_char_p, c_short, c_short])
+        self._PBC_RequestStatusBits = self._bind("PBC_RequestStatusBits", c_short, [c_char_p, c_short])
+        self._PBC_GetStatusBits = self._bind("PBC_GetStatusBits", ctypes.c_ulong, [c_char_p, c_short])
+        self._PBC_SetZero = self._bind("PBC_SetZero", c_short, [c_char_p, c_short])
 
     def _check_result(self, result, action):
         if result != 0:
@@ -138,20 +154,41 @@ class BPC303NativeController:
         return [item for item in raw.split(",") if item]
 
     def connect(self):
+        self._log("BPC_CONNECT_LOAD_LIBRARY_BEGIN", serial=self.serial_no)
         self._load_library()
-        self._check_result(self._TLI_BuildDeviceList(), "TLI_BuildDeviceList")
+        self._log("BPC_CONNECT_LOAD_LIBRARY_DONE", serial=self.serial_no)
+
+        self._log("BPC_CONNECT_BUILD_DEVICE_LIST_BEGIN", serial=self.serial_no)
+        ret = self._TLI_BuildDeviceList()
+        self._log("BPC_CONNECT_BUILD_DEVICE_LIST_DONE", serial=self.serial_no, result=ret)
+        self._check_result(ret, "TLI_BuildDeviceList")
+
+        self._log("BPC_CONNECT_ENUMERATE_BEGIN", serial=self.serial_no, device_type=self.DEVICE_TYPE_ID_71)
         serials = self._device_list_by_type(self.DEVICE_TYPE_ID_71)
+        self._log(
+            "BPC_CONNECT_ENUMERATE_DONE",
+            serial=self.serial_no,
+            device_type=self.DEVICE_TYPE_ID_71,
+            serials=",".join(serials) if serials else "[]",
+        )
         if self.serial_no not in serials:
             raise RuntimeError(f"BPC303 serial {self.serial_no} not found in type 71 device list: {serials}")
 
-        self._check_result(self._PBC_Open(self.serial_bytes), f"PBC_Open({self.serial_no})")
+        self._log("BPC_CONNECT_OPEN_BEGIN", serial=self.serial_no)
+        ret = self._PBC_Open(self.serial_bytes)
+        self._log("BPC_CONNECT_OPEN_DONE", serial=self.serial_no, result=ret)
+        self._check_result(ret, f"PBC_Open({self.serial_no})")
         self._connected = True
-        if not self._PBC_CheckConnection(self.serial_bytes):
+        self._log("BPC_CONNECT_CHECK_CONNECTION_BEGIN", serial=self.serial_no)
+        is_connected = self._PBC_CheckConnection(self.serial_bytes)
+        self._log("BPC_CONNECT_CHECK_CONNECTION_DONE", serial=self.serial_no, connected=is_connected)
+        if not is_connected:
             raise RuntimeError(f"BPC303 {self.serial_no} did not report a valid USB connection")
 
         max_channels = int(self._PBC_MaxChannelCount(self.serial_bytes))
         num_channels = int(self._PBC_GetNumChannels(self.serial_bytes))
         for channel_id in self.channel_ids:
+            self._log("BPC_CHANNEL_SETUP_BEGIN", serial=self.serial_no, channel=channel_id)
             if channel_id > max_channels or channel_id > num_channels:
                 raise RuntimeError(
                     f"BPC303 channel {channel_id} unavailable "
@@ -160,24 +197,37 @@ class BPC303NativeController:
             if not self._PBC_IsChannelValid(self.serial_bytes, channel_id):
                 raise RuntimeError(f"BPC303 channel {channel_id} is not valid")
 
-            if not self._PBC_StartPolling(self.serial_bytes, channel_id, self.polling_ms):
+            self._log("BPC_CHANNEL_START_POLLING_BEGIN", serial=self.serial_no, channel=channel_id, polling_ms=self.polling_ms)
+            polling_started = self._PBC_StartPolling(self.serial_bytes, channel_id, self.polling_ms)
+            self._log("BPC_CHANNEL_START_POLLING_DONE", serial=self.serial_no, channel=channel_id, started=polling_started)
+            if not polling_started:
                 raise RuntimeError(f"BPC303 channel {channel_id} failed to start polling")
             self._polling_channels.add(channel_id)
             time.sleep(self.startup_delay_s)
 
             if self.enable_channels:
-                self._check_result(self._PBC_EnableChannel(self.serial_bytes, channel_id), f"PBC_EnableChannel({channel_id})")
+                self._log("BPC_CHANNEL_ENABLE_BEGIN", serial=self.serial_no, channel=channel_id)
+                ret = self._PBC_EnableChannel(self.serial_bytes, channel_id)
+                self._log("BPC_CHANNEL_ENABLE_DONE", serial=self.serial_no, channel=channel_id, result=ret)
+                self._check_result(ret, f"PBC_EnableChannel({channel_id})")
                 time.sleep(self.startup_delay_s)
 
             if self.force_closed_loop:
-                self._check_result(
-                    self._PBC_SetPositionControlMode(self.serial_bytes, channel_id, self.CLOSED_LOOP_MODE),
-                    f"PBC_SetPositionControlMode({channel_id}, closed loop)",
-                )
-                time.sleep(self.startup_delay_s)
+                self._log("BPC_CHANNEL_CLOSED_LOOP_BEGIN", serial=self.serial_no, channel=channel_id)
+                self.ensure_closed_loop_axis(channel_id, timeout_s=10.0)
+                self._log("BPC_CHANNEL_CLOSED_LOOP_DONE", serial=self.serial_no, channel=channel_id)
 
+            self._log("BPC_CHANNEL_LIMITS_BEGIN", serial=self.serial_no, channel=channel_id)
             self._cache_channel_limits(channel_id)
+            self._log(
+                "BPC_CHANNEL_LIMITS_DONE",
+                serial=self.serial_no,
+                channel=channel_id,
+                travel_um=self._travel_um.get(channel_id),
+                max_output_voltage=self._max_output_voltage.get(channel_id),
+            )
 
+        self._log("BPC_CONNECT_DONE", serial=self.serial_no)
         return self
 
     def _cache_channel_limits(self, channel_id):
@@ -241,6 +291,78 @@ class BPC303NativeController:
 
     def get_max_output_voltage(self, axis):
         return self._max_output_voltage[self._channel_id(axis)]
+
+    def get_position_control_mode(self, axis):
+        channel_id = self._channel_id(axis)
+        if not self._PBC_RequestPositionControlMode(self.serial_bytes, channel_id):
+            raise RuntimeError(f"PBC_RequestPositionControlMode({channel_id}) failed")
+        time.sleep(0.02)
+        return int(self._PBC_GetPositionControlMode(self.serial_bytes, channel_id))
+
+    def ensure_closed_loop_axis(self, axis, timeout_s=15.0):
+        channel_id = self._channel_id(axis)
+        start = time.time()
+        last_mode = None
+        while True:
+            self._check_result(
+                self._PBC_SetPositionControlMode(self.serial_bytes, channel_id, self.CLOSED_LOOP_MODE),
+                f"PBC_SetPositionControlMode({channel_id}, closed loop)",
+            )
+            time.sleep(0.1)
+            last_mode = self.get_position_control_mode(channel_id)
+            if last_mode == self.CLOSED_LOOP_MODE:
+                return True
+            if time.time() - start > timeout_s:
+                raise TimeoutError(
+                    f"BPC303 channel {channel_id} did not enter closed-loop mode; mode={last_mode}"
+                )
+            time.sleep(0.2)
+
+    def ensure_closed_loop_axes(self, axes=("x", "y", "z"), timeout_s=15.0):
+        for axis in axes:
+            self.ensure_closed_loop_axis(axis, timeout_s=timeout_s)
+
+    def get_status_bits(self, axis):
+        channel_id = self._channel_id(axis)
+        self._check_result(self._PBC_RequestStatusBits(self.serial_bytes, channel_id), f"PBC_RequestStatusBits({channel_id})")
+        time.sleep(0.02)
+        return int(self._PBC_GetStatusBits(self.serial_bytes, channel_id))
+
+    def set_zero_axis(self, axis, wait=True, settle_time_ms=0, timeout_s=60.0):
+        """
+        Run the BPC zero routine for one axis.
+
+        Thorlabs documents PBC_SetZero as setting the output voltage to zero and
+        defining the ensuing actuator position as zero. This changes the datum.
+        """
+        channel_id = self._channel_id(axis)
+        self._check_result(self._PBC_SetZero(self.serial_bytes, channel_id), f"PBC_SetZero({channel_id})")
+        if wait:
+            self.wait_until_axis_zeroed(axis, settle_time_ms=settle_time_ms, timeout_s=timeout_s)
+        if self.force_closed_loop:
+            # Zeroing can leave the channel out of closed-loop position control;
+            # PBC_SetPosition is ignored unless the channel is closed-loop again.
+            self.ensure_closed_loop_axis(channel_id, timeout_s=timeout_s)
+
+    def set_zero_axes(self, axes=("x", "y"), wait=True, settle_time_ms=0, timeout_s=60.0):
+        for axis in axes:
+            self.set_zero_axis(axis, wait=wait, settle_time_ms=settle_time_ms, timeout_s=timeout_s)
+
+    def wait_until_axis_zeroed(self, axis, settle_time_ms=0, timeout_s=60.0, zeroing_stuck_grace_s=2.0):
+        start = time.time()
+        while True:
+            status = self.get_status_bits(axis)
+            zeroed = bool(status & self.STATUS_ZEROED)
+            zeroing = bool(status & self.STATUS_ZEROING)
+            # This BPC303 can keep the zeroing bit set after the zeroed bit is
+            # already asserted, so do not wait forever for bit 0x20 to clear.
+            if zeroed and (not zeroing or time.time() - start >= zeroing_stuck_grace_s):
+                if settle_time_ms:
+                    time.sleep(settle_time_ms / 1000.0)
+                return True
+            if time.time() - start > timeout_s:
+                raise TimeoutError(f"BPC303 axis {axis} did not report zeroed status; status=0x{status:08X}")
+            time.sleep(0.05)
 
     def move_axis(self, axis, position, wait=False, settle_time_ms=0, tolerance=0.05, timeout_s=10.0):
         channel_id = self._channel_id(axis)

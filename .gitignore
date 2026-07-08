@@ -1,8 +1,10 @@
 # Generated experiment outputs
 data/
+run_logs/
 *.mat
 *.png
 *.txt
+*.log
 
 # Python and editor artifacts
 __pycache__/

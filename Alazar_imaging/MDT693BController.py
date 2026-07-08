@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from ctypes import POINTER, c_char_p, c_double, c_int, cdll, create_string_buffer
 
@@ -23,6 +24,8 @@ class MDT693BController:
         safe_max_voltage=75.0,
         axis_map=None,
         um_per_volt=None,
+        backend="serial",
+        serial_port=None,
         auto_connect=True,
     ):
         self.serial_no = str(serial_no) if serial_no else None
@@ -32,14 +35,26 @@ class MDT693BController:
         self.safe_max_voltage = None if safe_max_voltage is None else float(safe_max_voltage)
         self.axis_map = axis_map or {"x": "x", "y": "y", "z": "z"}
         self.um_per_volt = um_per_volt
+        self.backend = str(backend).lower()
+        self.serial_port = serial_port
 
         self._lib = None
         self._handle = None
+        self._serial_conn = None
+        self._active_backend = None
         self._limit_voltage = None
         self._device_id = None
 
         if auto_connect:
             self.connect()
+
+    def _import_serial(self):
+        try:
+            import serial
+            from serial.tools import list_ports
+        except Exception as exc:
+            raise RuntimeError("pyserial is required for MDT693B serial control") from exc
+        return serial, list_ports
 
     def _load_library(self):
         if self._lib is not None:
@@ -87,6 +102,10 @@ class MDT693BController:
         )
 
     def _check_connected(self):
+        if self._active_backend == "serial":
+            if self._serial_conn is None or not self._serial_conn.is_open:
+                raise RuntimeError("MDT693B is not connected")
+            return
         if self._handle is None or self._handle < 0:
             raise RuntimeError("MDT693B is not connected")
 
@@ -106,7 +125,7 @@ class MDT693BController:
 
     def _effective_max_voltage(self):
         candidates = []
-        if self._limit_voltage is not None:
+        if self._limit_voltage is not None and self._limit_voltage > 0:
             candidates.append(float(self._limit_voltage))
         if self.safe_max_voltage is not None:
             candidates.append(float(self.safe_max_voltage))
@@ -127,24 +146,101 @@ class MDT693BController:
         return value
 
     def list_devices(self):
+        devices = []
+        if self.backend in ("serial", "auto"):
+            try:
+                _, list_ports = self._import_serial()
+                for port_info in list_ports.comports():
+                    if port_info.vid == 0x1313 and port_info.pid == 0x1003:
+                        serial_no = port_info.serial_number or ""
+                        devices.append([serial_no, "MDT693B", port_info.device])
+                if devices or self.backend == "serial":
+                    return devices
+            except Exception:
+                if self.backend == "serial":
+                    raise
+
         self._load_library()
         raw = create_string_buffer(10240)
         self._check_result(self._list(raw, 10240), "MDT device list")
         fields = raw.raw.decode("utf-8", errors="replace").rstrip("\x00").split(",")
-        devices = []
         for i in range(0, len(fields) - 1, 2):
             serial = fields[i].strip()
-            model = fields[i + 1].strip()
-            if not serial:
-                continue
-            if "MDT693B" in model:
+            model_info = fields[i + 1].strip()
+            model = model_info
+            if "MDT693B" in model_info:
                 model = "MDT693B"
-            elif "MDT694B" in model:
+            elif "MDT694B" in model_info:
                 model = "MDT694B"
             devices.append([serial, model])
         return devices
 
     def connect(self):
+        if self.backend not in ("serial", "dll", "auto"):
+            raise ValueError("MDT backend must be 'serial', 'dll', or 'auto'")
+        if self.backend in ("serial", "auto"):
+            try:
+                return self._connect_serial()
+            except Exception:
+                if self.backend == "serial":
+                    raise
+                self.close()
+        return self._connect_dll()
+
+    def _find_serial_port(self):
+        if self.serial_port:
+            return self.serial_port
+        _, list_ports = self._import_serial()
+        candidates = []
+        for port_info in list_ports.comports():
+            if port_info.vid == 0x1313 and port_info.pid == 0x1003:
+                candidates.append(port_info)
+        if self.serial_no:
+            for port_info in candidates:
+                serial_number = port_info.serial_number or ""
+                hwid = port_info.hwid or ""
+                if self.serial_no == serial_number or self.serial_no in hwid:
+                    return port_info.device
+        if len(candidates) == 1:
+            return candidates[0].device
+        if candidates:
+            listed = [f"{item.device}({item.serial_number or item.hwid})" for item in candidates]
+            raise RuntimeError(f"Multiple MDT serial ports found; set serial_port explicitly: {listed}")
+        raise RuntimeError("No MDT693B serial port found for VID_1313/PID_1003")
+
+    def _connect_serial(self):
+        serial, _ = self._import_serial()
+        port = self._find_serial_port()
+        self._serial_conn = serial.Serial(
+            port=port,
+            baudrate=self.baud,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            timeout=float(self.timeout_s),
+            write_timeout=float(self.timeout_s),
+        )
+        self._active_backend = "serial"
+        self.serial_port = port
+
+        self._serial_command("ECHO=0")
+        reported_serial = self._clean_response(self._serial_command("SERIAL?"))
+        if self.serial_no is None:
+            self.serial_no = reported_serial
+        elif reported_serial and self.serial_no != reported_serial:
+            raise RuntimeError(
+                f"MDT693B serial mismatch on {port}: expected {self.serial_no}, got {reported_serial}"
+            )
+
+        self._device_id = self._clean_response(self._serial_command("ID?"))
+        self._limit_voltage = self._parse_first_number(self._serial_command("VLIMIT?"))
+        print(
+            f"MDT693B connected via {port}: serial={self.serial_no}, "
+            f"device_limit={self._limit_voltage} V, safe_limit={self._effective_max_voltage()} V"
+        )
+        return self
+
+    def _connect_dll(self):
         self._load_library()
         if self.serial_no is None:
             devices = self.list_devices()
@@ -172,7 +268,42 @@ class MDT693BController:
             f"MDT693B connected: serial={self.serial_no}, id={self._device_id}, "
             f"device_limit={self._limit_voltage} V, safe_limit={self._effective_max_voltage()} V"
         )
+        self._active_backend = "dll"
         return self
+
+    def _serial_command(self, command):
+        self._check_connected()
+        self._serial_conn.reset_input_buffer()
+        self._serial_conn.write((str(command).strip() + "\r").encode("ascii"))
+        self._serial_conn.flush()
+        deadline = time.time() + float(self.timeout_s)
+        chunks = []
+        while time.time() < deadline:
+            pending = self._serial_conn.in_waiting
+            data = self._serial_conn.read(pending or 1)
+            if data:
+                chunks.append(data)
+                if b">" in data:
+                    break
+            else:
+                time.sleep(0.01)
+        raw = b"".join(chunks).decode("ascii", errors="replace")
+        if not raw:
+            raise TimeoutError(f"MDT693B serial command {command!r} returned no response")
+        if "CMD_NOT_DEFINED" in raw or "CMD_ARG_INVALID" in raw:
+            raise RuntimeError(f"MDT693B rejected command {command!r}: {raw!r}")
+        return raw
+
+    def _clean_response(self, response):
+        text = str(response).replace(">", "").replace("\r", "\n")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return "\n".join(lines)
+
+    def _parse_first_number(self, response):
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", str(response))
+        if not match:
+            raise RuntimeError(f"Could not parse MDT voltage response: {response!r}")
+        return float(match.group(0))
 
     @property
     def handle(self):
@@ -189,6 +320,8 @@ class MDT693BController:
     def get_voltage_axis(self, axis):
         self._check_connected()
         mapped = self._axis_key(axis)
+        if self._active_backend == "serial":
+            return self._parse_first_number(self._serial_command(f"{mapped.upper()}VOLTAGE?"))
         value = c_double(0)
         getter = {
             "x": self._get_x_voltage,
@@ -198,8 +331,26 @@ class MDT693BController:
         self._check_result(getter(self._handle, value), f"Get MDT {mapped}-axis voltage")
         return float(value.value)
 
+    def get_axis_max_voltage(self, axis):
+        self._check_connected()
+        if self._active_backend != "serial":
+            raise RuntimeError("Axis max voltage query is only implemented for the MDT serial backend")
+        mapped = self._axis_key(axis)
+        return self._parse_first_number(self._serial_command(f"{mapped.upper()}MAX?"))
+
+    def set_axis_max_voltage(self, axis, voltage):
+        self._check_connected()
+        if self._active_backend != "serial":
+            raise RuntimeError("Axis max voltage setting is only implemented for the MDT serial backend")
+        mapped = self._axis_key(axis)
+        value = self._validate_voltage(voltage)
+        self._serial_command(f"{mapped.upper()}MAX={value:.6f}")
+        return self.get_axis_max_voltage(mapped)
+
     def _get_raw_voltage_xyz(self):
         self._check_connected()
+        if self._active_backend == "serial":
+            return {axis: self.get_voltage_axis(axis) for axis in ("x", "y", "z")}
         x = c_double(0)
         y = c_double(0)
         z = c_double(0)
@@ -217,6 +368,9 @@ class MDT693BController:
         self._check_connected()
         mapped = self._axis_key(axis)
         value = self._validate_voltage(voltage)
+        if self._active_backend == "serial":
+            self._serial_command(f"{mapped.upper()}VOLTAGE={value:.6f}")
+            return
         setter = {
             "x": self._set_x_voltage,
             "y": self._set_y_voltage,
@@ -235,6 +389,14 @@ class MDT693BController:
                 targets[self._axis_key(logical_axis)] = value
                 logical_targets[logical_index] = value
 
+        if self._active_backend == "serial":
+            for mapped_axis in ("x", "y", "z"):
+                if abs(targets[mapped_axis] - self.get_voltage_axis(mapped_axis)) > 1e-9:
+                    self._serial_command(f"{mapped_axis.upper()}VOLTAGE={targets[mapped_axis]:.6f}")
+            if wait:
+                self.wait_until_voltage_settled(logical_targets, settle_time_ms=settle_time_ms)
+            return
+
         ordered_targets = [targets["x"], targets["y"], targets["z"]]
         self._check_result(
             self._set_xyz_voltage(self._handle, ordered_targets[0], ordered_targets[1], ordered_targets[2]),
@@ -243,7 +405,7 @@ class MDT693BController:
         if wait:
             self.wait_until_voltage_settled(logical_targets, settle_time_ms=settle_time_ms)
 
-    def wait_until_voltage_settled(self, targets, settle_time_ms=0, tolerance_v=0.01, timeout_s=5.0):
+    def wait_until_voltage_settled(self, targets, settle_time_ms=0, tolerance_v=0.25, timeout_s=5.0):
         self._check_connected()
         target_values = [float(v) for v in targets]
         start = time.time()
@@ -270,17 +432,24 @@ class MDT693BController:
         return float(step_um) / float(self.um_per_volt)
 
     def close(self):
+        if self._serial_conn is not None:
+            try:
+                self._serial_conn.close()
+            finally:
+                self._serial_conn = None
+                self._active_backend = None
         if self._handle is not None and self._handle >= 0:
             try:
                 self._close(self._handle)
             finally:
                 self._handle = None
+                self._active_backend = None
 
     def disconnect(self):
         self.close()
 
     def __enter__(self):
-        if self._handle is None:
+        if self._handle is None and self._serial_conn is None:
             self.connect()
         return self
 
