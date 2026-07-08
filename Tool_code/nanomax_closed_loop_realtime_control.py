@@ -20,6 +20,7 @@ import datetime as _dt
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -178,6 +179,7 @@ class RealtimeClosedLoopControl:
         self.move_timeout_s = float(args.move_timeout_s)
         self.log_path = Path(args.log_path)
         self.message = "Ready. Exit preserves the current NanoMax position."
+        self.next_action: str | None = None
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
 
@@ -312,6 +314,11 @@ class RealtimeClosedLoopControl:
         try:
             if cmd in ("q", "quit", "exit"):
                 return False
+            if cmd in ("pam", "image", "imaging", "scan", "start", "run"):
+                self.next_action = "pam"
+                self.message = "Starting PAM_Main_Nanomax.py after closing BPC303 control."
+                self.log("PAM_LAUNCH_REQUESTED", command=line)
+                return False
             if cmd in ("h", "help", "?"):
                 self.message = "Help is shown in the fixed panel."
             elif cmd in ("s", "status"):
@@ -417,6 +424,7 @@ Commands after ':' then Enter:
   set y <um>                move Y to an absolute closed-loop position
   set z <um>                move Z to an absolute closed-loop position
   set xyz <X> <Y> <Z>       move all three axes
+  pam / image / scan        close pre-alignment control, then launch PAM_Main_Nanomax.py
   status                   refresh status
   quit                     exit
 
@@ -492,6 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run-y", type=float, default=0.0)
     parser.add_argument("--dry-run-z", type=float, default=0.0)
     parser.add_argument("--travel-um", type=float, default=DEFAULT_PIEZO_TRAVEL_UM, help="Dry-run travel used for preview checks.")
+    parser.add_argument("--launch-dry-run", action="store_true", help="For testing: print the PAM launch command but do not execute it.")
     parser.add_argument("--log-path", default=str(DEFAULT_LOG_PATH), help="Text log path.")
     return parser.parse_args()
 
@@ -760,6 +769,19 @@ def connect_stage(args: argparse.Namespace, config: PamScanConfig, tracker: Init
     )
 
 
+def launch_pam_main(main_file: Path, dry_run: bool = False) -> int:
+    main_file = Path(main_file).resolve()
+    command = [sys.executable, str(main_file)]
+    print("\nLaunching PAM imaging from pre-alignment:")
+    print(f"  cwd: {main_file.parent}")
+    print(f"  command: {command[0]} {command[1]}")
+    if dry_run:
+        print("Launch dry-run enabled; PAM_Main_Nanomax.py was not executed.")
+        return 0
+    completed = subprocess.run(command, cwd=str(main_file.parent))
+    return int(completed.returncode)
+
+
 def dry_run_config(args: argparse.Namespace, config: PamScanConfig) -> None:
     stage = DryRunStage(args.dry_run_x, args.dry_run_y, args.dry_run_z, args.travel_um)
     control = RealtimeClosedLoopControl(stage, args, config)
@@ -788,6 +810,7 @@ def run_live_control(args: argparse.Namespace, config: PamScanConfig) -> None:
     stage = connect_stage(args, config, tracker)
     control = RealtimeClosedLoopControl(stage, args, config)
     normal_exit = False
+    launch_after_close = False
     try:
         clear_screen()
         print("Realtime closed-loop MAX311D/BPC303 X/Y/Z pre-alignment")
@@ -856,6 +879,7 @@ def run_live_control(args: argparse.Namespace, config: PamScanConfig) -> None:
                     last_render = time.time()
             time.sleep(control.sample_interval_s)
         normal_exit = True
+        launch_after_close = control.next_action == "pam"
     finally:
         try:
             control.refresh()
@@ -866,6 +890,10 @@ def run_live_control(args: argparse.Namespace, config: PamScanConfig) -> None:
             stage.close()
             marker_text = f" Pre-alignment marker: {PREALIGN_STATE_PATH}" if normal_exit else " No ready marker was written."
             print(f"\nBPC303 controller closed; current NanoMax position was preserved.{marker_text}", flush=True)
+    if launch_after_close:
+        return_code = launch_pam_main(Path(args.main_file), dry_run=args.launch_dry_run)
+        if return_code != 0:
+            raise SystemExit(return_code)
 
 
 def main() -> None:
