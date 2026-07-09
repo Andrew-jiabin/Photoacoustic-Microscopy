@@ -11,6 +11,7 @@ from Alazar_imaging.AlazarNPTSystem import AlazarNPTSystem
 from Alazar_imaging.AsyncProgress import progress_manager
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
 from Alazar_imaging.MDT693BController import MDT693BController
+from Nanomax.daq_async import BackgroundDaqInit
 from Nanomax.data_io import save_scan_data
 from Nanomax.prealign_panel import SamplePrealignConfig, run_sample_prealignment
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
@@ -171,11 +172,28 @@ def main():
             mode=BPC303_PREFLIGHT_MODE,
         )
 
-    stage = probe_stage = probe_step_v = daq = None
+    stage = probe_stage = probe_step_v = daq = daq_init = None
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
 
     try:
+        def daq_factory(step, daq_obj):
+            if step == "create_system":
+                return AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY, channel_A_range=ats.INPUT_RANGE_PM_200_MV)
+            if step == "configure_board":
+                daq_obj.configure_board(sample_rate=SAMPLE_RATE)
+                return daq_obj
+            if step == "prepare_acquisition":
+                daq_obj.prepare_acquisition(
+                    acq_channel=ats.CHANNEL_A,
+                    samples_per_record=SAMPLES_REC,
+                    records_per_buffer=RECORDS_PER_POINT,
+                    buffer_count=BUFFER_COUNT,
+                    records_per_point=RECORDS_PER_POINT,
+                )
+                return daq_obj
+            raise ValueError(f"Unknown DAQ init step: {step}")
+
         if SCAN_TARGET == "sample_closed_loop":
             print("Using BPC303 native closed-loop control for the MAX311D sample NanoMax...")
             append_run_log("STAGE_CONNECT_BEGIN", controller="BPC303", stage_model="MAX311D")
@@ -225,6 +243,9 @@ def main():
                 f"Y={stage.get_max_travel('y'):.1f} um, Z={stage.get_max_travel('z'):.1f} um"
             )
             if SAMPLE_PREALIGN_ENABLE:
+                daq_init = BackgroundDaqInit(daq_factory, log_callback=append_run_log)
+                append_run_log("DAQ_INIT_BACKGROUND_REQUESTED", sample_rate=SAMPLE_RATE, records_per_point=RECORDS_PER_POINT, buffer_count=BUFFER_COUNT)
+                daq_init.start()
                 prealign_result = run_sample_prealignment(
                     stage,
                     SamplePrealignConfig(
@@ -241,6 +262,20 @@ def main():
                         sample_interval_s=SAMPLE_PREALIGN_INTERVAL_S,
                     ),
                     log_callback=append_run_log,
+                    status_provider=daq_init.snapshot,
+                    display_params={
+                        "DELAY": DELAY,
+                        "SAMPLES_REC": SAMPLES_REC,
+                        "SAMPLE_RATE": SAMPLE_RATE,
+                        "AVERAGE_ENABLE": AVERAGE_ENABLE,
+                        "RECORDS_PER_POINT": RECORDS_PER_POINT,
+                        "BUFFER_COUNT": BUFFER_COUNT,
+                        "POINT_LOG_INTERVAL": POINT_LOG_INTERVAL,
+                        "USER_STOP_ENABLE": USER_STOP_ENABLE,
+                        "USER_STOP_KEY": USER_STOP_KEY,
+                        "SAMPLE_START_ZERO_POLICY": SAMPLE_START_ZERO_POLICY,
+                        "SAMPLE_ZERO_XY_AT_END": SAMPLE_ZERO_XY_AT_END,
+                    },
                 )
                 START_X, START_Y, START_Z = prealign_result.x_um, prealign_result.y_um, prealign_result.z_um
                 SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = prealign_result.scan_range_x_um, prealign_result.scan_range_y_um, prealign_result.step_um
@@ -359,17 +394,32 @@ def main():
                 f"pattern={SCAN_PATTERN_LABEL}, points={len(trajectory)}."
             )
 
-        append_run_log("DAQ_INIT_BEGIN", sample_rate=SAMPLE_RATE, records_per_point=RECORDS_PER_POINT, buffer_count=BUFFER_COUNT)
-        daq = AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY, channel_A_range=ats.INPUT_RANGE_PM_200_MV)
-        daq.configure_board(sample_rate=SAMPLE_RATE)
-        daq.prepare_acquisition(
-            acq_channel=ats.CHANNEL_A,
-            samples_per_record=SAMPLES_REC,
-            records_per_buffer=RECORDS_PER_POINT,
-            buffer_count=BUFFER_COUNT,
-            records_per_point=RECORDS_PER_POINT,
-        )
-        append_run_log("DAQ_INIT_DONE")
+        if daq_init is not None:
+            snapshot = daq_init.snapshot()
+            append_run_log("DAQ_INIT_WAIT_BEGIN", status=snapshot["status"], step=snapshot["step"], elapsed_s=f"{snapshot['elapsed_s']:.3f}")
+            if snapshot["status"] != "ready":
+                print(f"Waiting for background DAQ init: status={snapshot['status']}, step={snapshot['step']}...")
+            daq = daq_init.result()
+            snapshot = daq_init.snapshot()
+            append_run_log("DAQ_INIT_DONE", mode="background", elapsed_s=f"{snapshot['elapsed_s']:.3f}", timings=snapshot["timings"])
+        else:
+            append_run_log("DAQ_INIT_BEGIN", mode="synchronous", sample_rate=SAMPLE_RATE, records_per_point=RECORDS_PER_POINT, buffer_count=BUFFER_COUNT)
+            step_start = time.time()
+            daq = AlazarNPTSystem(systemId=1, boardId=1, Delay=DELAY, channel_A_range=ats.INPUT_RANGE_PM_200_MV)
+            append_run_log("DAQ_INIT_STEP_DONE", mode="synchronous", step="create_system", duration_s=f"{time.time() - step_start:.3f}")
+            step_start = time.time()
+            daq.configure_board(sample_rate=SAMPLE_RATE)
+            append_run_log("DAQ_INIT_STEP_DONE", mode="synchronous", step="configure_board", duration_s=f"{time.time() - step_start:.3f}")
+            step_start = time.time()
+            daq.prepare_acquisition(
+                acq_channel=ats.CHANNEL_A,
+                samples_per_record=SAMPLES_REC,
+                records_per_buffer=RECORDS_PER_POINT,
+                buffer_count=BUFFER_COUNT,
+                records_per_point=RECORDS_PER_POINT,
+            )
+            append_run_log("DAQ_INIT_STEP_DONE", mode="synchronous", step="prepare_acquisition", duration_s=f"{time.time() - step_start:.3f}")
+            append_run_log("DAQ_INIT_DONE", mode="synchronous")
 
         gc.disable()
         if SCAN_TARGET == "sample_closed_loop" and SAMPLE_PREALIGN_ENABLE:
@@ -523,6 +573,12 @@ def main():
         time.sleep(1)
         try:
             gc.enable()
+            if daq is None and daq_init is not None:
+                try:
+                    daq = daq_init.result()
+                    append_run_log("DAQ_INIT_JOINED_DURING_CLEANUP", status=daq_init.snapshot()["status"])
+                except Exception as exc:
+                    append_run_log("DAQ_INIT_CLEANUP_JOIN_ERROR", error=repr(exc))
             if daq is not None:
                 daq.stop_capture()
             progress_manager.set_colour("green")

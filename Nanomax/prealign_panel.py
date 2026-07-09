@@ -104,10 +104,12 @@ def normalized_scan_pattern(value):
 
 
 class SamplePrealignPanel:
-    def __init__(self, stage, config, log_callback=None):
+    def __init__(self, stage, config, log_callback=None, status_provider=None, display_params=None):
         self.stage = stage
         self.config = config
         self.log = log_callback or (lambda *args, **kwargs: None)
+        self.status_provider = status_provider
+        self.display_params = display_params or {}
         self.x_step_um = validate_manual_step("xstep", config.x_step_um, config.min_step_um)
         self.y_step_um = validate_manual_step("ystep", config.y_step_um, config.min_step_um)
         self.z_step_um = validate_manual_step("zstep", config.z_step_um, config.min_step_um)
@@ -194,31 +196,74 @@ class SamplePrealignPanel:
     def status_lines(self, refresh=False):
         x, y, z = self.refresh() if refresh else self.last_xyz
         scan = self.evaluate_scan(refresh=False)
-        lines = [
-            "Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process",
-            f"Position: X={x:8.4f} um (Up/Down, SCAN_RANGE_X_UM/up), Y={y:8.4f} um (Left/Right, SCAN_RANGE_Y_UM/left), Z={z:8.4f} um (+/-)",
-            f"Manual step: xstep={self.x_step_um:g} um, ystep={self.y_step_um:g} um, zstep={self.z_step_um:g} um; interval={self.sample_interval_s:g} s",
-            f"Scan preview: SCAN_RANGE_X_UM={self.config.scan_range_x_um:g} um, SCAN_RANGE_Y_UM={self.config.scan_range_y_um:g} um, STEP_UM={self.config.step_um:g} um, SCAN_PATTERN={self.config.scan_pattern}",
+        daq_status = self.status_provider() if callable(self.status_provider) else {}
+        position_items = [
+            ("X_um", f"{x:.4f}", "Up/Down"),
+            ("Y_um", f"{y:.4f}", "Left/Right"),
+            ("Z_um", f"{z:.4f}", "+/-"),
+            ("X_LIMIT", f"0..{self.travel_um['x']:.2f}", "um"),
+            ("Y_LIMIT", f"0..{self.travel_um['y']:.2f}", "um"),
+            ("Z_LIMIT", f"0..{self.travel_um['z']:.2f}", "um"),
         ]
+        scan_items = [
+            ("SCAN_RANGE_X_UM", f"{self.config.scan_range_x_um:g}", "set SCAN_RANGE_X_UM n"),
+            ("SCAN_RANGE_Y_UM", f"{self.config.scan_range_y_um:g}", "set SCAN_RANGE_Y_UM n"),
+            ("STEP_UM", f"{self.config.step_um:g}", "set STEP_UM n"),
+            ("SCAN_PATTERN", self.config.scan_pattern, "set SCAN_PATTERN s|z"),
+        ]
+        motion_items = [
+            ("xstep", f"{self.x_step_um:g}", "set xstep n"),
+            ("ystep", f"{self.y_step_um:g}", "set ystep n"),
+            ("zstep", f"{self.z_step_um:g}", "set zstep n"),
+            ("interval", f"{self.sample_interval_s:g}", "set interval n"),
+            ("SETTLE_MS", f"{self.config.settle_ms:g}", "set SETTLE_MS n"),
+        ]
+        daq_items = [
+            ("DAQ_STATUS", daq_status.get("status", "-"), ""),
+            ("DAQ_STEP", daq_status.get("step", "-"), ""),
+            ("DAQ_ELAPSED_S", f"{float(daq_status.get('elapsed_s', 0.0)):.2f}", ""),
+            ("DELAY", self.display_params.get("DELAY", "-"), "read-only after init starts"),
+            ("SAMPLE_RATE", self.display_params.get("SAMPLE_RATE", "-"), "read-only after init starts"),
+            ("SAMPLES_REC", self.display_params.get("SAMPLES_REC", "-"), "read-only after init starts"),
+            ("RECORDS_PER_POINT", self.display_params.get("RECORDS_PER_POINT", "-"), "read-only after init starts"),
+            ("BUFFER_COUNT", self.display_params.get("BUFFER_COUNT", "-"), "read-only after init starts"),
+            ("AVERAGE_ENABLE", self.display_params.get("AVERAGE_ENABLE", "-"), "read-only"),
+        ]
+        runtime_items = [
+            ("POINT_LOG_INTERVAL", self.display_params.get("POINT_LOG_INTERVAL", "-"), "read-only"),
+            ("USER_STOP_ENABLE", self.display_params.get("USER_STOP_ENABLE", "-"), "read-only"),
+            ("USER_STOP_KEY", self.display_params.get("USER_STOP_KEY", "-"), "read-only"),
+            ("SAMPLE_START_ZERO_POLICY", self.display_params.get("SAMPLE_START_ZERO_POLICY", "-"), "read-only"),
+            ("SAMPLE_ZERO_XY_AT_END", self.display_params.get("SAMPLE_ZERO_XY_AT_END", "-"), "read-only"),
+        ]
+        lines = ["Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"]
+        lines += section_lines("Position", position_items)
+        lines += section_lines("Scan Parameters", scan_items)
         if scan.get("ok"):
-            lines.append(
-                f"S trajectory: shape={scan['scan_w']} x {scan['scan_h']}, points={scan['points']}, "
-                f"X={scan['x_min']:.4f}..{scan['x_max']:.4f} um, Y={scan['y_min']:.4f}..{scan['y_max']:.4f} um"
-            )
+            lines.append(f"Trajectory: shape={scan['scan_w']} x {scan['scan_h']}, points={scan['points']}, X={scan['x_min']:.4f}..{scan['x_max']:.4f} um, Y={scan['y_min']:.4f}..{scan['y_max']:.4f} um")
             lines.append(f"Travel check: OK inside X[0,{self.travel_um['x']:.4f}], Y[0,{self.travel_um['y']:.4f}], Z[0,{self.travel_um['z']:.4f}] um")
         else:
             lines.append(f"Travel/step check: OUT OF RANGE - {scan.get('error')}")
             lines.append("Use ':' commands to change SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, or move the start position.")
+        lines += section_lines("Motion / Hotkey Parameters", motion_items)
+        lines += section_lines("DAQ Background Init", daq_items)
+        lines += section_lines("Runtime Parameters", runtime_items)
+        if daq_status.get("message"):
+            lines.append(f"DAQ message: {daq_status.get('message')}")
+        if daq_status.get("timings"):
+            timings = daq_status["timings"]
+            lines.append("DAQ timings: " + ", ".join(f"{key}={float(value):.2f}s" for key, value in timings.items()))
         lines.append(f"Message: {self.message}")
         return lines
 
     def render(self, refresh=True):
         clear_screen()
-        print("=" * 78)
+        width = max(80, shutil.get_terminal_size((120, 30)).columns)
+        print("=" * min(width - 1, 118))
         print("PAM closed-loop sample prealignment")
-        print("=" * 78)
+        print("=" * min(width - 1, 118))
         print(HELP_TEXT)
-        print("=" * 78)
+        print("=" * min(width - 1, 118))
         for line in self.status_lines(refresh=refresh):
             print(truncate_line(line), flush=True)
 
@@ -269,6 +314,8 @@ class SamplePrealignPanel:
                 self.message = "Status refreshed."
             elif cmd in ("0", "zero", "home"):
                 self.set_xyz(x=0.0, y=0.0, reason="command_move_xy_to_zero")
+            elif cmd == "set":
+                self.execute_set(tokens[1:])
             elif cmd == "step" and len(tokens) == 2:
                 value = validate_manual_step("step", tokens[1], self.config.min_step_um)
                 self.x_step_um = self.y_step_um = self.z_step_um = value
@@ -285,8 +332,6 @@ class SamplePrealignPanel:
             elif cmd in ("interval", "dt") and len(tokens) == 2:
                 self.sample_interval_s = validate_positive("interval", tokens[1])
                 self.message = f"interval set to {self.sample_interval_s:g} s."
-            elif cmd == "set":
-                self.execute_set(tokens[1:])
             elif normalize_scan_variable(cmd) in {"SCAN_RANGE_X_UM", "SCAN_RANGE_Y_UM", "STEP_UM"} and len(tokens) == 2:
                 self.set_scan_variable(cmd, tokens[1])
             else:
@@ -300,10 +345,30 @@ class SamplePrealignPanel:
 
     def execute_set(self, tokens):
         if not tokens:
-            raise ValueError("Use set x/y/z/xy/xyz or set SCAN_RANGE_X_UM/SCAN_RANGE_Y_UM/STEP_UM.")
+            raise ValueError("Use fixed form: set PARAM value, for example set STEP_UM 0.02.")
         target = tokens[0].lower()
-        if normalize_scan_variable(target) in {"SCAN_RANGE_X_UM", "SCAN_RANGE_Y_UM", "STEP_UM"} and len(tokens) == 2:
+        normalized_target = normalize_scan_variable(target)
+        if normalized_target in {"SCAN_RANGE_X_UM", "SCAN_RANGE_Y_UM", "STEP_UM", "SCAN_PATTERN"} and len(tokens) == 2:
             self.set_scan_variable(target, tokens[1])
+        elif target == "step" and len(tokens) == 2:
+            value = validate_manual_step("step", tokens[1], self.config.min_step_um)
+            self.x_step_um = self.y_step_um = self.z_step_um = value
+            self.message = f"xstep/ystep/zstep set to {value:g} um."
+        elif target == "xstep" and len(tokens) == 2:
+            self.x_step_um = validate_manual_step("xstep", tokens[1], self.config.min_step_um)
+            self.message = f"xstep set to {self.x_step_um:g} um."
+        elif target == "ystep" and len(tokens) == 2:
+            self.y_step_um = validate_manual_step("ystep", tokens[1], self.config.min_step_um)
+            self.message = f"ystep set to {self.y_step_um:g} um."
+        elif target == "zstep" and len(tokens) == 2:
+            self.z_step_um = validate_manual_step("zstep", tokens[1], self.config.min_step_um)
+            self.message = f"zstep set to {self.z_step_um:g} um."
+        elif target in ("interval", "dt") and len(tokens) == 2:
+            self.sample_interval_s = validate_positive("interval", tokens[1])
+            self.message = f"interval set to {self.sample_interval_s:g} s."
+        elif target == "settle_ms" and len(tokens) == 2:
+            self.config.settle_ms = int(validate_positive("SETTLE_MS", tokens[1]))
+            self.message = f"SETTLE_MS set to {self.config.settle_ms:g}."
         elif target == "x" and len(tokens) == 2:
             self.set_xyz(x=float(tokens[1]), reason="command_set_x")
         elif target == "y" and len(tokens) == 2:
@@ -349,8 +414,24 @@ class SamplePrealignPanel:
 
 def normalize_scan_variable(text):
     normalized = str(text).strip().upper()
-    aliases = {"XRANGE": "SCAN_RANGE_X_UM", "RANGEX": "SCAN_RANGE_X_UM", "YRANGE": "SCAN_RANGE_Y_UM", "RANGEY": "SCAN_RANGE_Y_UM"}
+    aliases = {"XRANGE": "SCAN_RANGE_X_UM", "RANGEX": "SCAN_RANGE_X_UM", "YRANGE": "SCAN_RANGE_Y_UM", "RANGEY": "SCAN_RANGE_Y_UM", "PATTERN": "SCAN_PATTERN"}
     return aliases.get(normalized, normalized)
+
+
+def section_lines(title, items):
+    rows = [f"[{title}]"]
+    width = max(80, shutil.get_terminal_size((120, 30)).columns - 1)
+    columns = 2 if width < 115 else 3
+    cell_width = max(28, min(42, (width - 2) // columns))
+    cells = []
+    for name, value, hint in items:
+        text = f"{name}={value}"
+        if hint:
+            text = f"{text} ({hint})"
+        cells.append(text[: cell_width - 1].ljust(cell_width))
+    for index in range(0, len(cells), columns):
+        rows.append(" ".join(cells[index:index + columns]).rstrip())
+    return rows
 
 
 HELP_TEXT = """
@@ -365,25 +446,24 @@ Hotkeys:
 
 Commands after ':' then Enter:
   start / run / pam / image / scan   start acquisition in this same PAM_Main_Nanomax.py process
-  step <um>                          set xstep/ystep/zstep together
-  xstep <um>, ystep <um>, zstep <um> set manual closed-loop move steps
-  interval <sec>                     set key sampling interval
-  SCAN_RANGE_X_UM <um>               set scan range along X/up for this run
-  SCAN_RANGE_Y_UM <um>               set scan range along Y/left for this run
-  STEP_UM <um>                       set image pixel step for this run
+  set SCAN_RANGE_X_UM <um>           set scan range along X/up for this run
+  set SCAN_RANGE_Y_UM <um>           set scan range along Y/left for this run
+  set STEP_UM <um>                   set image pixel step for this run
+  set xstep/ystep/zstep <um>         set manual closed-loop move steps
   set x/y/z/xy/xyz ...               set absolute closed-loop position(s) in um
+  set interval <sec>, set SETTLE_MS <ms>
   q / quit / cancel                  abort before acquisition
 """.strip()
 
 
-def run_sample_prealignment(stage, config, log_callback=None):
+def run_sample_prealignment(stage, config, log_callback=None, status_provider=None, display_params=None):
     if os.name != "nt":
         print("Prealignment keyboard panel requires a Windows console; using current closed-loop position.")
-        return SamplePrealignPanel(stage, config, log_callback=log_callback).result()
+        return SamplePrealignPanel(stage, config, log_callback=log_callback, status_provider=status_provider, display_params=display_params).result()
 
     import msvcrt
 
-    panel = SamplePrealignPanel(stage, config, log_callback=log_callback)
+    panel = SamplePrealignPanel(stage, config, log_callback=log_callback, status_provider=status_provider, display_params=display_params)
     panel.log(
         "PREALIGN_PANEL_START",
         scan_range_x_um=config.scan_range_x_um,
