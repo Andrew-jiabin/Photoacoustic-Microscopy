@@ -29,6 +29,7 @@ class SamplePrealignConfig:
     z_step_um: float = 0.1
     sample_interval_s: float = 0.25
     min_step_um: float = NANOMAX_MANUAL_MIN_STEP_UM
+    allow_probe_switch: bool = False
 
 
 @dataclass
@@ -40,6 +41,7 @@ class SamplePrealignResult:
     scan_range_y_um: float
     step_um: float
     scan_pattern: str
+    next_action: str = "start"
 
 
 def clear_screen():
@@ -118,6 +120,7 @@ class SamplePrealignPanel:
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
         self.ready_to_start = False
+        self.next_action = "start"
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -305,7 +308,15 @@ class SamplePrealignPanel:
                     self.log("PREALIGN_START_BLOCKED", reason=scan.get("error"))
                     return True
                 self.ready_to_start = True
+                self.next_action = "start"
                 self.message = "Starting acquisition from this closed-loop position."
+                return False
+            if cmd in ("probe", "open", "open-loop", "mdt", "mdt693b"):
+                if not self.config.allow_probe_switch:
+                    self.message = "Open-loop probe panel is not enabled for this run."
+                    return True
+                self.next_action = "probe"
+                self.message = "Switching to open-loop probe panel."
                 return False
             if cmd in ("h", "help", "?"):
                 self.message = "Help refreshed."
@@ -409,6 +420,7 @@ class SamplePrealignPanel:
             scan_range_y_um=float(self.config.scan_range_y_um),
             step_um=float(self.config.step_um),
             scan_pattern=str(self.config.scan_pattern),
+            next_action=self.next_action,
         )
 
 
@@ -446,6 +458,7 @@ Hotkeys:
 
 Commands after ':' then Enter:
   start / run / pam / image / scan   start acquisition in this same PAM_Main_Nanomax.py process
+  probe / open / mdt693b             switch to the open-loop probe panel, if enabled
   set SCAN_RANGE_X_UM <um>           set scan range along X/up for this run
   set SCAN_RANGE_Y_UM <um>           set scan range along Y/left for this run
   set STEP_UM <um>                   set image pixel step for this run
@@ -480,6 +493,8 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
     while running:
         char = read_last_command_key(msvcrt)
         if char:
+            if char in ("q", "Q"):
+                raise KeyboardInterrupt("Prealignment cancelled by user.")
             if char in ("h", "H", "?"):
                 panel.render(refresh=True)
             elif char in ("s", "S"):
@@ -526,5 +541,6 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
         scan_range_y_um=result.scan_range_y_um,
         step_um=result.step_um,
         scan_pattern=result.scan_pattern,
+        next_action=result.next_action,
     )
     return result

@@ -80,17 +80,37 @@ def build_sample_trajectory(start_x, start_y, scan_w, scan_h, step_um, x_directi
     return trajectory
 
 
-def build_probe_trajectory(start_x, start_y, start_z, scan_w, scan_h, probe_step_v, x_direction=1.0, y_direction=1.0, serpentine=False):
+def build_probe_trajectory(
+    start_x,
+    start_y,
+    start_z,
+    scan_w,
+    scan_h,
+    probe_step_v,
+    x_direction=1.0,
+    y_direction=1.0,
+    serpentine=False,
+    fast_axis="x",
+    slow_axis="y",
+):
     """Build open-loop probe-controller voltage targets."""
+    fast_axis = str(fast_axis).strip().lower()
+    slow_axis = str(slow_axis).strip().lower()
+    if fast_axis not in ("x", "y", "z") or slow_axis not in ("x", "y", "z"):
+        raise ValueError("Probe scan axes must be selected from x/y/z.")
+    if fast_axis == slow_axis:
+        raise ValueError("Probe fast and slow scan axes must be different.")
+    start = {"x": float(start_x), "y": float(start_y), "z": float(start_z)}
     trajectory = []
     for h in range(scan_h):
         w_range = range(scan_w)
         if serpentine and h % 2 == 1:
             w_range = reversed(range(scan_w))
         for w in w_range:
-            target_x = start_x + x_direction * w * probe_step_v
-            target_y = start_y + y_direction * h * probe_step_v
-            trajectory.append((target_x, target_y, start_z))
+            target = dict(start)
+            target[fast_axis] = start[fast_axis] + float(x_direction) * w * float(probe_step_v)
+            target[slow_axis] = start[slow_axis] + float(y_direction) * h * float(probe_step_v)
+            trajectory.append((target["x"], target["y"], target["z"]))
     return trajectory
 
 
@@ -173,4 +193,3 @@ def validate_sample_bounds_from_position(start_x, start_y, scan_range_x_um, scan
     if summary["y_min"] < 0.0 or summary["y_max"] > float(max_y):
         errors.append(f"SCAN_RANGE_Y_UM gives Y range [{summary['y_min']:.4f}, {summary['y_max']:.4f}] um outside [0,{float(max_y):.4f}] um")
     return summary, errors
-

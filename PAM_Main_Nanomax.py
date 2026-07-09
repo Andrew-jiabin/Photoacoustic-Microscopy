@@ -13,7 +13,9 @@ from Alazar_imaging.BPC303NativeController import BPC303NativeController
 from Alazar_imaging.MDT693BController import MDT693BController
 from Nanomax.daq_async import BackgroundDaqInit
 from Nanomax.data_io import save_scan_data
-from Nanomax.prealign_panel import SamplePrealignConfig, run_sample_prealignment
+from Nanomax.open_loop_panel import ProbePrealignConfig
+from Nanomax.prealign_panel import SamplePrealignConfig
+from Nanomax.prealignment_workflow import run_nanomax_prealignment
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
 from Nanomax.runtime import find_other_pam_processes, poll_user_stop_request, return_to_start, run_bpc303_preflight, safe_return_to_start
 from Nanomax.scan_utils import (
@@ -91,10 +93,15 @@ def main():
     BPC303_PREFLIGHT_MODE = "open_close"
 
     # Open-loop probe NanoMax: MAX312D on MDT693B.
-    PROBE_MDT_SERIAL_NO = None
+    PROBE_MDT_SERIAL_NO, PROBE_MDT_SERIAL_PORT, PROBE_MDT_BACKEND = "2201287140-09", None, "serial"
     PROBE_MDT_DLL_PATH = r"D:\LJB\alazar_DAQ\Photoacoustic-Microscopy\Alazar_imaging\MDT_COMMAND_LIB_x64.dll"
-    PROBE_SAFE_MAX_VOLTAGE, PROBE_STEP_V, PROBE_UM_PER_V = 75.0, None, None
-    PROBE_X_DIRECTION, PROBE_Y_DIRECTION, PROBE_Z_HOLD_V, PROBE_RETURN_TO_START = 1.0, 1.0, None, True
+    PROBE_SAFE_MAX_VOLTAGE, PROBE_PIEZO_TRAVEL_UM, PROBE_PIEZO_TRAVEL_VOLTAGE = 75.0, 20.0, 75.0
+    PROBE_STEP_V, PROBE_UM_PER_V = None, PROBE_PIEZO_TRAVEL_UM / PROBE_PIEZO_TRAVEL_VOLTAGE
+    PROBE_SCAN_FAST_AXIS, PROBE_SCAN_SLOW_AXIS = "y", "z"
+    PROBE_FAST_DIRECTION, PROBE_SLOW_DIRECTION, PROBE_Z_HOLD_V, PROBE_RETURN_TO_START = 1.0, 1.0, None, True
+    PROBE_PREALIGN_ENABLE, PROBE_PREALIGN_Y_STEP_V, PROBE_PREALIGN_Z_STEP_V = True, 1.0, 1.0
+    PROBE_PREALIGN_INTERVAL_S, PROBE_PREALIGN_SET_AXIS_MAX = 0.25, True
+    PROBE_PREALIGN_REQUIRE_CONTROLLER = False
 
     # User scan geometry. Ranges are the requested travel from first to last point.
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
@@ -162,6 +169,9 @@ def main():
         bpc303_preflight_mode=BPC303_PREFLIGHT_MODE,
         bpc303_preflight_timeout_s=BPC303_PREFLIGHT_TIMEOUT_S,
         sample_prealign_enable=SAMPLE_PREALIGN_ENABLE,
+        probe_prealign_enable=PROBE_PREALIGN_ENABLE,
+        probe_scan_fast_axis=PROBE_SCAN_FAST_AXIS,
+        probe_scan_slow_axis=PROBE_SCAN_SLOW_AXIS,
     )
     other_pam_processes = find_other_pam_processes()
     if other_pam_processes:
@@ -182,6 +192,7 @@ def main():
     stage = probe_stage = probe_step_v = daq = daq_init = None
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
+    prealignment_started_acquisition = False
 
     try:
         def daq_factory(step, daq_obj):
@@ -249,13 +260,42 @@ def main():
                 f"travel X={stage.get_max_travel('x'):.1f} um, "
                 f"Y={stage.get_max_travel('y'):.1f} um, Z={stage.get_max_travel('z'):.1f} um"
             )
-            if SAMPLE_PREALIGN_ENABLE:
+            if PROBE_PREALIGN_ENABLE:
+                print("Opening MDT693B open-loop probe control for optional prealignment...")
+                append_run_log("STAGE_CONNECT_BEGIN", controller="MDT693B", stage_model="MAX312D", reason="probe_prealignment")
+                try:
+                    probe_stage = MDT693BController(
+                        serial_no=PROBE_MDT_SERIAL_NO,
+                        dll_path=PROBE_MDT_DLL_PATH,
+                        safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
+                        um_per_volt=PROBE_UM_PER_V,
+                        backend=PROBE_MDT_BACKEND,
+                        serial_port=PROBE_MDT_SERIAL_PORT,
+                    )
+                    append_run_log(
+                        "STAGE_CONNECT_DONE",
+                        controller="MDT693B",
+                        serial=probe_stage.serial_no,
+                        serial_port=probe_stage.serial_port,
+                        active_backend=getattr(probe_stage, "_active_backend", "-"),
+                        device_id=probe_stage.device_id,
+                        limit_voltage=probe_stage.limit_voltage,
+                        safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
+                        reason="probe_prealignment",
+                    )
+                except Exception as exc:
+                    append_run_log("PROBE_PREALIGN_UNAVAILABLE", error=repr(exc), required=PROBE_PREALIGN_REQUIRE_CONTROLLER)
+                    print(f"Probe prealignment unavailable; continuing with closed-loop sample panel only: {exc}")
+                    if PROBE_PREALIGN_REQUIRE_CONTROLLER:
+                        raise
+                    probe_stage = None
+            if SAMPLE_PREALIGN_ENABLE or (PROBE_PREALIGN_ENABLE and probe_stage is not None):
                 daq_init = BackgroundDaqInit(daq_factory, log_callback=append_run_log)
                 append_run_log("DAQ_INIT_BACKGROUND_REQUESTED", sample_rate=SAMPLE_RATE, records_per_point=RECORDS_PER_POINT, buffer_count=BUFFER_COUNT)
                 daq_init.start()
-                prealign_result = run_sample_prealignment(
-                    stage,
-                    SamplePrealignConfig(
+                prealign_result = run_nanomax_prealignment(
+                    sample_stage=stage if SAMPLE_PREALIGN_ENABLE else None,
+                    sample_config=SamplePrealignConfig(
                         scan_range_x_um=SCAN_RANGE_X_UM,
                         scan_range_y_um=SCAN_RANGE_Y_UM,
                         step_um=STEP_UM,
@@ -268,9 +308,22 @@ def main():
                         z_step_um=SAMPLE_PREALIGN_Z_STEP_UM,
                         sample_interval_s=SAMPLE_PREALIGN_INTERVAL_S,
                     ),
+                    probe_stage=probe_stage if (PROBE_PREALIGN_ENABLE and probe_stage is not None) else None,
+                    probe_config=ProbePrealignConfig(
+                        safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
+                        piezo_travel_um=PROBE_PIEZO_TRAVEL_UM,
+                        piezo_travel_voltage=PROBE_PIEZO_TRAVEL_VOLTAGE,
+                        y_step_v=PROBE_PREALIGN_Y_STEP_V,
+                        z_step_v=PROBE_PREALIGN_Z_STEP_V,
+                        sample_interval_s=PROBE_PREALIGN_INTERVAL_S,
+                        settle_ms=SETTLE_MS,
+                        set_axis_max=PROBE_PREALIGN_SET_AXIS_MAX,
+                    ),
+                    initial_panel="sample" if SAMPLE_PREALIGN_ENABLE else "probe",
                     log_callback=append_run_log,
                     status_provider=daq_init.snapshot,
                     display_params={
+                        "SCAN_TARGET": SCAN_TARGET,
                         "DELAY": DELAY,
                         "SAMPLES_REC": SAMPLES_REC,
                         "SAMPLE_RATE": SAMPLE_RATE,
@@ -282,23 +335,39 @@ def main():
                         "USER_STOP_KEY": USER_STOP_KEY,
                         "SAMPLE_START_ZERO_POLICY": SAMPLE_START_ZERO_POLICY,
                         "SAMPLE_ZERO_XY_AT_END": SAMPLE_ZERO_XY_AT_END,
+                        "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )
-                START_X, START_Y, START_Z = prealign_result.x_um, prealign_result.y_um, prealign_result.z_um
-                SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = prealign_result.scan_range_x_um, prealign_result.scan_range_y_um, prealign_result.step_um
-                SCAN_PATTERN = prealign_result.scan_pattern
-                SCAN_W, SCAN_H = scan_shape_from_range(SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, max_range_um=NANOMAX_PIEZO_SCAN_LIMIT_UM)
-                SERPENTINE_SCAN, SCAN_PATTERN_LABEL = resolve_scan_pattern(SCAN_PATTERN)
-                append_run_log(
-                    "PREALIGN_START_POSITION_SELECTED",
-                    x_um=f"{START_X:.4f}",
-                    y_um=f"{START_Y:.4f}",
-                    z_um=f"{START_Z:.4f}",
-                    scan_range_x_um=SCAN_RANGE_X_UM,
-                    scan_range_y_um=SCAN_RANGE_Y_UM,
-                    step_um=STEP_UM,
-                    scan_pattern=SCAN_PATTERN_LABEL,
-                )
+                prealignment_started_acquisition = True
+                if prealign_result.sample_result is not None:
+                    sample_result = prealign_result.sample_result
+                    START_X, START_Y, START_Z = sample_result.x_um, sample_result.y_um, sample_result.z_um
+                    SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = sample_result.scan_range_x_um, sample_result.scan_range_y_um, sample_result.step_um
+                    SCAN_PATTERN = sample_result.scan_pattern
+                    SCAN_W, SCAN_H = scan_shape_from_range(SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, max_range_um=NANOMAX_PIEZO_SCAN_LIMIT_UM)
+                    SERPENTINE_SCAN, SCAN_PATTERN_LABEL = resolve_scan_pattern(SCAN_PATTERN)
+                    append_run_log(
+                        "PREALIGN_START_POSITION_SELECTED",
+                        x_um=f"{START_X:.4f}",
+                        y_um=f"{START_Y:.4f}",
+                        z_um=f"{START_Z:.4f}",
+                        scan_range_x_um=SCAN_RANGE_X_UM,
+                        scan_range_y_um=SCAN_RANGE_Y_UM,
+                        step_um=STEP_UM,
+                        scan_pattern=SCAN_PATTERN_LABEL,
+                        start_panel=prealign_result.start_panel,
+                    )
+                if prealign_result.probe_result is not None:
+                    probe_result = prealign_result.probe_result
+                    append_run_log(
+                        "PROBE_PREALIGN_POSITION_SELECTED",
+                        x_v=f"{probe_result.x_v:.4f}",
+                        y_v=f"{probe_result.y_v:.4f}",
+                        z_v=f"{probe_result.z_v:.4f}",
+                        y_step_v=f"{probe_result.y_step_v:.4f}",
+                        z_step_v=f"{probe_result.z_step_v:.4f}",
+                        start_panel=prealign_result.start_panel,
+                    )
             append_run_log(
                 "SCAN_CONFIG",
                 scan_target=SCAN_TARGET,
@@ -355,11 +424,15 @@ def main():
                 dll_path=PROBE_MDT_DLL_PATH,
                 safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
                 um_per_volt=PROBE_UM_PER_V,
+                backend=PROBE_MDT_BACKEND,
+                serial_port=PROBE_MDT_SERIAL_PORT,
             )
             append_run_log(
                 "STAGE_CONNECT_DONE",
                 controller="MDT693B",
                 serial=probe_stage.serial_no,
+                serial_port=probe_stage.serial_port,
+                active_backend=getattr(probe_stage, "_active_backend", "-"),
                 device_id=probe_stage.device_id,
                 limit_voltage=probe_stage.limit_voltage,
                 safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
@@ -375,6 +448,43 @@ def main():
                 y_v=f"{START_Y:.4f}",
                 z_v=f"{START_Z:.4f}",
             )
+            if PROBE_PREALIGN_ENABLE:
+                daq_init = BackgroundDaqInit(daq_factory, log_callback=append_run_log)
+                append_run_log("DAQ_INIT_BACKGROUND_REQUESTED", sample_rate=SAMPLE_RATE, records_per_point=RECORDS_PER_POINT, buffer_count=BUFFER_COUNT)
+                daq_init.start()
+                prealign_result = run_nanomax_prealignment(
+                    probe_stage=probe_stage,
+                    probe_config=ProbePrealignConfig(
+                        safe_max_voltage=PROBE_SAFE_MAX_VOLTAGE,
+                        piezo_travel_um=PROBE_PIEZO_TRAVEL_UM,
+                        piezo_travel_voltage=PROBE_PIEZO_TRAVEL_VOLTAGE,
+                        y_step_v=PROBE_PREALIGN_Y_STEP_V,
+                        z_step_v=PROBE_PREALIGN_Z_STEP_V,
+                        sample_interval_s=PROBE_PREALIGN_INTERVAL_S,
+                        settle_ms=SETTLE_MS,
+                        set_axis_max=PROBE_PREALIGN_SET_AXIS_MAX,
+                    ),
+                    initial_panel="probe",
+                    log_callback=append_run_log,
+                    status_provider=daq_init.snapshot,
+                    display_params={
+                        "SCAN_TARGET": SCAN_TARGET,
+                        "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
+                    },
+                )
+                if prealign_result.probe_result is not None:
+                    prealignment_started_acquisition = True
+                    probe_result = prealign_result.probe_result
+                    START_X, START_Y, START_Z = probe_result.x_v, probe_result.y_v, probe_result.z_v
+                    append_run_log(
+                        "PROBE_PREALIGN_START_POSITION_SELECTED",
+                        x_v=f"{START_X:.4f}",
+                        y_v=f"{START_Y:.4f}",
+                        z_v=f"{START_Z:.4f}",
+                        y_step_v=f"{probe_result.y_step_v:.4f}",
+                        z_step_v=f"{probe_result.z_step_v:.4f}",
+                        start_panel=prealign_result.start_panel,
+                    )
             trajectory = build_probe_trajectory(
                 START_X,
                 START_Y,
@@ -382,22 +492,36 @@ def main():
                 SCAN_W,
                 SCAN_H,
                 probe_step_v,
-                x_direction=PROBE_X_DIRECTION,
-                y_direction=PROBE_Y_DIRECTION,
+                x_direction=PROBE_FAST_DIRECTION,
+                y_direction=PROBE_SLOW_DIRECTION,
                 serpentine=SERPENTINE_SCAN,
+                fast_axis=PROBE_SCAN_FAST_AXIS,
+                slow_axis=PROBE_SCAN_SLOW_AXIS,
             )
             validate_probe_trajectory(probe_stage, trajectory)
             coordinate_unit = "V"
             total_points = len(trajectory)
+            xs = [point[0] for point in trajectory]
+            ys = [point[1] for point in trajectory]
+            zs = [point[2] for point in trajectory]
             append_run_log(
                 "TRAJECTORY_READY",
                 scan_target=SCAN_TARGET,
                 points=total_points,
                 pattern=SCAN_PATTERN_LABEL,
                 probe_step_v=probe_step_v,
+                probe_scan_fast_axis=PROBE_SCAN_FAST_AXIS,
+                probe_scan_slow_axis=PROBE_SCAN_SLOW_AXIS,
+                x_min_v=f"{min(xs):.4f}",
+                x_max_v=f"{max(xs):.4f}",
+                y_min_v=f"{min(ys):.4f}",
+                y_max_v=f"{max(ys):.4f}",
+                z_min_v=f"{min(zs):.4f}",
+                z_max_v=f"{max(zs):.4f}",
             )
             print(
                 f"Probe start voltage: X={START_X:.4f} V, Y={START_Y:.4f} V, Z={START_Z:.4f} V; "
+                f"axes={PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}, "
                 f"pattern={SCAN_PATTERN_LABEL}, points={len(trajectory)}."
             )
 
@@ -429,7 +553,7 @@ def main():
             append_run_log("DAQ_INIT_DONE", mode="synchronous")
 
         gc.disable()
-        if SCAN_TARGET == "sample_closed_loop" and SAMPLE_PREALIGN_ENABLE:
+        if prealignment_started_acquisition:
             append_run_log("USER_START_CONFIRMED", source="prealign_panel_start_command")
         else:
             append_run_log("WAITING_FOR_USER_START")
