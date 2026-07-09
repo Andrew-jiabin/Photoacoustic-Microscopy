@@ -12,7 +12,7 @@ from Alazar_imaging.AsyncProgress import progress_manager
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
 from Alazar_imaging.MDT693BController import MDT693BController
 from Nanomax.data_io import save_scan_data
-from Nanomax.prealign_state import inspect_prealign_state
+from Nanomax.prealign_panel import SamplePrealignConfig, run_sample_prealignment
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
 from Nanomax.runtime import find_other_pam_processes, poll_user_stop_request, return_to_start, run_bpc303_preflight, safe_return_to_start
 from Nanomax.scan_utils import (
@@ -34,9 +34,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def main():
-    pre_run_log_mtime = os.path.getmtime(RUN_LOG_PATH) if os.path.exists(RUN_LOG_PATH) else None
     previous_run = inspect_previous_run()
-    prealign_state = inspect_prealign_state(newer_than_mtime=pre_run_log_mtime)
     CURRENT_RUN_ID = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     set_current_run_id(CURRENT_RUN_ID)
     append_run_log(
@@ -49,8 +47,6 @@ def main():
         previous_final_cleanup_done=previous_run["final_cleanup_done"],
         previous_need_start_zero=previous_run["need_start_zero"],
         previous_zero_reason=previous_run["zero_reason"],
-        prealign_ready=prealign_state["ready"],
-        prealign_reason=prealign_state["reason"],
         cwd=os.getcwd(),
         pid=os.getpid(),
     )
@@ -71,20 +67,6 @@ def main():
             "PREVIOUS_RUN_ZERO_READY",
             previous_zero_line=previous_run["zero_line"],
             previous_final_line=previous_run["final_line"],
-        )
-    if prealign_state["ready"]:
-        position = prealign_state["position_um"]
-        print(
-            "\nClosed-loop NanoMax pre-alignment marker found; the sample scan will use the current BPC303 "
-            f"position as start: X={float(position['x']):.4f} um, Y={float(position['y']):.4f} um, "
-            f"Z={float(position['z']):.4f} um."
-        )
-        append_run_log(
-            "PREALIGN_CURRENT_POSITION_READY",
-            x_um=f"{float(position['x']):.4f}",
-            y_um=f"{float(position['y']):.4f}",
-            z_um=f"{float(position['z']):.4f}",
-            marker_timestamp=prealign_state["timestamp"],
         )
 
     # Stage selection:
@@ -111,6 +93,8 @@ def main():
     # The script also checks against the BPC303-reported maximum travel before acquisition.
     SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = 2.5, 2.5, 0.01  # X is actually up; Y is actually left.
     SAMPLE_X_DIRECTION, SAMPLE_Y_DIRECTION = 1.0, 1.0
+    SAMPLE_PREALIGN_ENABLE, SAMPLE_PREALIGN_X_STEP_UM, SAMPLE_PREALIGN_Y_STEP_UM, SAMPLE_PREALIGN_Z_STEP_UM = True, 0.1, 0.1, 0.1
+    SAMPLE_PREALIGN_INTERVAL_S = 0.25
     # Startup zero policy:
     #   "auto": rebuild X/Y zero unless the previous log has a trusted low-end zero-datum marker.
     #   "always": rebuild X/Y zero every run.
@@ -131,20 +115,6 @@ def main():
     AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 256, 4
     POINT_LOG_INTERVAL, USER_STOP_ENABLE, USER_STOP_KEY = 25, True, "q"
 
-    if prealign_state["ready"] and prealign_state["config"]:
-        marker_config = prealign_state["config"]
-        SCAN_RANGE_X_UM = float(marker_config.get("SCAN_RANGE_X_UM", SCAN_RANGE_X_UM))
-        SCAN_RANGE_Y_UM = float(marker_config.get("SCAN_RANGE_Y_UM", SCAN_RANGE_Y_UM))
-        STEP_UM = float(marker_config.get("STEP_UM", STEP_UM))
-        SCAN_PATTERN = str(marker_config.get("SCAN_PATTERN", SCAN_PATTERN))
-        append_run_log(
-            "PREALIGN_SCAN_CONFIG_APPLIED",
-            scan_range_x_um=SCAN_RANGE_X_UM,
-            scan_range_y_um=SCAN_RANGE_Y_UM,
-            step_um=STEP_UM,
-            scan_pattern=SCAN_PATTERN,
-        )
-
     if SCAN_TARGET not in ("sample_closed_loop", "probe_open_loop"):
         append_run_log("RUN_END_ERROR", error=f"invalid SCAN_TARGET {SCAN_TARGET}")
         raise ValueError("SCAN_TARGET must be 'sample_closed_loop' or 'probe_open_loop'.")
@@ -160,13 +130,11 @@ def main():
             SAMPLE_START_ZERO_POLICY,
             previous_run,
         )
-        if SCAN_TARGET == "sample_closed_loop" and prealign_state["ready"] and SAMPLE_START_ZERO_POLICY != "always":
-            SAMPLE_ZERO_XY_AT_START, SAMPLE_START_ZERO_REASON = False, "prealign_current_position_ready"
     except ValueError as exc:
         append_run_log("RUN_END_ERROR", error=repr(exc), phase="scan_parameter_validation")
         raise SystemExit(f"Scan parameter error: {exc}") from None
     append_run_log(
-        "SCAN_CONFIG",
+        "SCAN_CONFIG_INITIAL",
         scan_target=SCAN_TARGET,
         scan_range_x_um=SCAN_RANGE_X_UM,
         scan_range_y_um=SCAN_RANGE_Y_UM,
@@ -185,6 +153,7 @@ def main():
         bpc303_preflight_enable=BPC303_PREFLIGHT_ENABLE,
         bpc303_preflight_mode=BPC303_PREFLIGHT_MODE,
         bpc303_preflight_timeout_s=BPC303_PREFLIGHT_TIMEOUT_S,
+        sample_prealign_enable=SAMPLE_PREALIGN_ENABLE,
     )
     other_pam_processes = find_other_pam_processes()
     if other_pam_processes:
@@ -254,6 +223,54 @@ def main():
                 f"X={START_X:.4f} um, Y={START_Y:.4f} um, Z={START_Z:.4f} um; "
                 f"travel X={stage.get_max_travel('x'):.1f} um, "
                 f"Y={stage.get_max_travel('y'):.1f} um, Z={stage.get_max_travel('z'):.1f} um"
+            )
+            if SAMPLE_PREALIGN_ENABLE:
+                prealign_result = run_sample_prealignment(
+                    stage,
+                    SamplePrealignConfig(
+                        scan_range_x_um=SCAN_RANGE_X_UM,
+                        scan_range_y_um=SCAN_RANGE_Y_UM,
+                        step_um=STEP_UM,
+                        sample_x_direction=SAMPLE_X_DIRECTION,
+                        sample_y_direction=SAMPLE_Y_DIRECTION,
+                        scan_pattern=SCAN_PATTERN,
+                        settle_ms=SETTLE_MS,
+                        x_step_um=SAMPLE_PREALIGN_X_STEP_UM,
+                        y_step_um=SAMPLE_PREALIGN_Y_STEP_UM,
+                        z_step_um=SAMPLE_PREALIGN_Z_STEP_UM,
+                        sample_interval_s=SAMPLE_PREALIGN_INTERVAL_S,
+                    ),
+                    log_callback=append_run_log,
+                )
+                START_X, START_Y, START_Z = prealign_result.x_um, prealign_result.y_um, prealign_result.z_um
+                SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = prealign_result.scan_range_x_um, prealign_result.scan_range_y_um, prealign_result.step_um
+                SCAN_PATTERN = prealign_result.scan_pattern
+                SCAN_W, SCAN_H = scan_shape_from_range(SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, max_range_um=NANOMAX_PIEZO_SCAN_LIMIT_UM)
+                SERPENTINE_SCAN, SCAN_PATTERN_LABEL = resolve_scan_pattern(SCAN_PATTERN)
+                append_run_log(
+                    "PREALIGN_START_POSITION_SELECTED",
+                    x_um=f"{START_X:.4f}",
+                    y_um=f"{START_Y:.4f}",
+                    z_um=f"{START_Z:.4f}",
+                    scan_range_x_um=SCAN_RANGE_X_UM,
+                    scan_range_y_um=SCAN_RANGE_Y_UM,
+                    step_um=STEP_UM,
+                    scan_pattern=SCAN_PATTERN_LABEL,
+                )
+            append_run_log(
+                "SCAN_CONFIG",
+                scan_target=SCAN_TARGET,
+                scan_range_x_um=SCAN_RANGE_X_UM,
+                scan_range_y_um=SCAN_RANGE_Y_UM,
+                step_um=STEP_UM,
+                scan_w=SCAN_W,
+                scan_h=SCAN_H,
+                scan_pattern=SCAN_PATTERN_LABEL,
+                sample_start_zero_policy=SAMPLE_START_ZERO_POLICY,
+                sample_zero_at_start=SAMPLE_ZERO_XY_AT_START,
+                sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
+                sample_zero_at_end=SAMPLE_ZERO_XY_AT_END,
+                sample_prealign_enable=SAMPLE_PREALIGN_ENABLE,
             )
             trajectory = build_sample_trajectory(
                 START_X,
@@ -355,9 +372,12 @@ def main():
         append_run_log("DAQ_INIT_DONE")
 
         gc.disable()
-        append_run_log("WAITING_FOR_USER_START")
-        input("Press Enter to START Experiment... (make sure the laser is enabled)")
-        append_run_log("USER_START_CONFIRMED")
+        if SCAN_TARGET == "sample_closed_loop" and SAMPLE_PREALIGN_ENABLE:
+            append_run_log("USER_START_CONFIRMED", source="prealign_panel_start_command")
+        else:
+            append_run_log("WAITING_FOR_USER_START")
+            input("Press Enter to START Experiment... (make sure the laser is enabled)")
+            append_run_log("USER_START_CONFIRMED", source="enter_prompt")
         if USER_STOP_ENABLE:
             print(f"During acquisition, press '{USER_STOP_KEY}' to stop gracefully after the current point. Enter is optional.")
             append_run_log("USER_STOP_POLLING_ENABLED", stop_key=USER_STOP_KEY)
