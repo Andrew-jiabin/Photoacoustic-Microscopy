@@ -193,6 +193,7 @@ def main():
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
     prealignment_started_acquisition = False
+    probe_connect_error = ""
 
     try:
         def daq_factory(step, daq_obj):
@@ -284,6 +285,7 @@ def main():
                         reason="probe_prealignment",
                     )
                 except Exception as exc:
+                    probe_connect_error = repr(exc)
                     append_run_log("PROBE_PREALIGN_UNAVAILABLE", error=repr(exc), required=PROBE_PREALIGN_REQUIRE_CONTROLLER)
                     print(f"Probe prealignment unavailable; continuing with closed-loop sample panel only: {exc}")
                     if PROBE_PREALIGN_REQUIRE_CONTROLLER:
@@ -324,6 +326,20 @@ def main():
                     status_provider=daq_init.snapshot,
                     display_params={
                         "SCAN_TARGET": SCAN_TARGET,
+                        "SAMPLE_CONTROLLER": "BPC303",
+                        "SAMPLE_STAGE_MODEL": "MAX311D",
+                        "SAMPLE_CONNECTION": "connected",
+                        "SAMPLE_SERIAL": BPC303_SERIAL_NO,
+                        "SAMPLE_AXIS_MAP": "1/2/3=X/Y/Z",
+                        "PROBE_CONTROLLER": "MDT693B",
+                        "PROBE_STAGE_MODEL": "MAX312D",
+                        "PROBE_CONNECTION": "connected" if probe_stage is not None else ("unavailable" if PROBE_PREALIGN_ENABLE else "disabled"),
+                        "PROBE_SERIAL": getattr(probe_stage, "serial_no", PROBE_MDT_SERIAL_NO or "-") if probe_stage is not None else (PROBE_MDT_SERIAL_NO or "-"),
+                        "PROBE_PORT": getattr(probe_stage, "serial_port", PROBE_MDT_SERIAL_PORT or "-") if probe_stage is not None else (PROBE_MDT_SERIAL_PORT or "-"),
+                        "PROBE_BACKEND": getattr(probe_stage, "_active_backend", PROBE_MDT_BACKEND) if probe_stage is not None else PROBE_MDT_BACKEND,
+                        "PROBE_DEVICE_ID": getattr(probe_stage, "device_id", "-") if probe_stage is not None else "-",
+                        "PROBE_LIMIT_V": getattr(probe_stage, "limit_voltage", "-") if probe_stage is not None else "-",
+                        "PROBE_CONNECT_ERROR": probe_connect_error,
                         "DELAY": DELAY,
                         "SAMPLES_REC": SAMPLES_REC,
                         "SAMPLE_RATE": SAMPLE_RATE,
@@ -469,6 +485,19 @@ def main():
                     status_provider=daq_init.snapshot,
                     display_params={
                         "SCAN_TARGET": SCAN_TARGET,
+                        "SAMPLE_CONTROLLER": "BPC303",
+                        "SAMPLE_STAGE_MODEL": "MAX311D",
+                        "SAMPLE_CONNECTION": "not-opened",
+                        "SAMPLE_SERIAL": BPC303_SERIAL_NO,
+                        "SAMPLE_AXIS_MAP": "1/2/3=X/Y/Z",
+                        "PROBE_CONTROLLER": "MDT693B",
+                        "PROBE_STAGE_MODEL": "MAX312D",
+                        "PROBE_CONNECTION": "connected",
+                        "PROBE_SERIAL": probe_stage.serial_no,
+                        "PROBE_PORT": probe_stage.serial_port,
+                        "PROBE_BACKEND": getattr(probe_stage, "_active_backend", PROBE_MDT_BACKEND),
+                        "PROBE_DEVICE_ID": probe_stage.device_id,
+                        "PROBE_LIMIT_V": probe_stage.limit_voltage,
                         "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )

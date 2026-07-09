@@ -204,6 +204,11 @@ class ProbePrealignPanel:
             if cmd in ("q", "quit", "exit", "cancel"):
                 raise KeyboardInterrupt("Probe prealignment cancelled by user.")
             if cmd in ("start", "run", "pam", "image", "scan"):
+                start_allowed, reason = self.start_gate()
+                if not start_allowed:
+                    self.message = f"Cannot start: {reason}"
+                    self.log("PROBE_PREALIGN_START_BLOCKED", reason=reason)
+                    return True
                 self.next_action = "start"
                 self.message = "Starting acquisition from the current positions."
                 return False
@@ -273,9 +278,34 @@ class ProbePrealignPanel:
         else:
             raise ValueError("Use set y <V>, set z <V>, set yz <Y> <Z>, set ystep <V>, or set zstep <V>.")
 
+    def start_gate(self):
+        if (
+            self.display_params.get("SCAN_TARGET") == "sample_closed_loop"
+            and self.display_params.get("SAMPLE_SCAN_READY") == "NO"
+        ):
+            return False, self.display_params.get("SAMPLE_SCAN_ERROR", "closed-loop sample scan is not ready")
+        return True, "OK"
+
     def status_lines(self, refresh=False):
         x, y, z = self.refresh() if refresh else self.last_xyz
         daq_status = self.status_provider() if callable(self.status_provider) else {}
+        daq_state = str(daq_status.get("status", "not_started"))
+        daq_ready = daq_state == "ready"
+        start_allowed, start_reason = self.start_gate()
+        if not start_allowed:
+            start_hint = f"NO - {start_reason}"
+        elif daq_ready:
+            start_hint = "YES - type ':' then start/run/pam to begin acquisition."
+        else:
+            start_hint = f"YES - type ':' then start/run/pam; acquisition will wait for DAQ status={daq_state}."
+        connection_items = [
+            ("PROBE_CTRL", self.display_params.get("PROBE_CONTROLLER", "MDT693B"), self.display_params.get("PROBE_CONNECTION", "connected")),
+            ("PROBE_SERIAL", self.display_params.get("PROBE_SERIAL", getattr(self.stage, "serial_no", "-")), f"port={self.display_params.get('PROBE_PORT', getattr(self.stage, 'serial_port', '-'))}"),
+            ("PROBE_BACKEND", self.display_params.get("PROBE_BACKEND", getattr(self.stage, "_active_backend", "-")), f"id={self.display_params.get('PROBE_DEVICE_ID', getattr(self.stage, 'device_id', '-'))}"),
+            ("PROBE_LIMIT_V", self.display_params.get("PROBE_LIMIT_V", getattr(self.stage, "limit_voltage", "-")), f"safe={self.safe_max_voltage:g}"),
+            ("SAMPLE_CTRL", self.display_params.get("SAMPLE_CONTROLLER", "BPC303"), self.display_params.get("SAMPLE_CONNECTION", "not-opened")),
+            ("SAMPLE_PANEL", "available" if self.config.allow_sample_switch else "unavailable", "use :sample" if self.config.allow_sample_switch else "-"),
+        ]
         position_items = [
             ("X_V", f"{x:.4f}", "read-only here"),
             ("Y_V", f"{y:.4f}", f"~= {self.voltage_to_um(y):.2f} um"),
@@ -291,14 +321,24 @@ class ProbePrealignPanel:
         daq_items = [
             ("DAQ_STATUS", daq_status.get("status", "-"), ""),
             ("DAQ_STEP", daq_status.get("step", "-"), ""),
+            ("DAQ_READY", "YES" if daq_ready else "NO", "background init complete"),
             ("DAQ_ELAPSED_S", f"{float(daq_status.get('elapsed_s', 0.0)):.2f}", ""),
             ("SCAN_TARGET", self.display_params.get("SCAN_TARGET", "-"), "read-only"),
             ("PROBE_SCAN_AXES", self.display_params.get("PROBE_SCAN_AXES", "-"), "read-only"),
         ]
+        start_items = [
+            ("START_ALLOWED", "YES" if start_allowed else "NO", "command=:start/:run/:pam"),
+            ("DAQ_CHECK", "READY" if daq_ready else f"WAIT:{daq_state}", daq_status.get("step", "")),
+            ("SAMPLE_SCAN", self.display_params.get("SAMPLE_SCAN_READY", "n/a"), self.display_params.get("SAMPLE_SCAN_ERROR", "")),
+            ("POSITION_CHECK", "OK", "current Y/Z clamped by panel"),
+        ]
         lines = ["Open-loop MAX312D/MDT693B probe prealignment phase - same PAM_Main_Nanomax.py process"]
+        lines += section_lines("Connections", connection_items)
         lines += section_lines("Probe Position", position_items)
         lines += section_lines("Motion / Hotkey Parameters", motion_items)
         lines += section_lines("DAQ / Runtime", daq_items)
+        lines += section_lines("Start Gate", start_items)
+        lines.append(f"Start prompt: {start_hint}")
         lines.append("Position display is an open-loop estimate, not closed-loop feedback.")
         lines.append(f"Message: {self.message}")
         return lines

@@ -42,6 +42,8 @@ class SamplePrealignResult:
     step_um: float
     scan_pattern: str
     next_action: str = "start"
+    scan_ok: bool = True
+    scan_error: str = ""
 
 
 def clear_screen():
@@ -200,6 +202,24 @@ class SamplePrealignPanel:
         x, y, z = self.refresh() if refresh else self.last_xyz
         scan = self.evaluate_scan(refresh=False)
         daq_status = self.status_provider() if callable(self.status_provider) else {}
+        daq_state = str(daq_status.get("status", "not_started"))
+        daq_ready = daq_state == "ready"
+        scan_ok = bool(scan.get("ok"))
+        start_allowed = scan_ok
+        if not scan_ok:
+            start_hint = f"NO - fix scan range/step first: {scan.get('error')}"
+        elif daq_ready:
+            start_hint = "YES - type ':' then start/run/pam to begin acquisition."
+        else:
+            start_hint = f"YES - type ':' then start/run/pam; acquisition will wait for DAQ status={daq_state}."
+        connection_items = [
+            ("SAMPLE_CTRL", self.display_params.get("SAMPLE_CONTROLLER", "BPC303"), self.display_params.get("SAMPLE_CONNECTION", "connected")),
+            ("SAMPLE_SERIAL", self.display_params.get("SAMPLE_SERIAL", "-"), self.display_params.get("SAMPLE_STAGE_MODEL", "MAX311D")),
+            ("SAMPLE_AXES", self.display_params.get("SAMPLE_AXIS_MAP", "1/2/3=X/Y/Z"), "closed-loop um"),
+            ("PROBE_CTRL", self.display_params.get("PROBE_CONTROLLER", "MDT693B"), self.display_params.get("PROBE_CONNECTION", "unknown")),
+            ("PROBE_SERIAL", self.display_params.get("PROBE_SERIAL", "-"), f"port={self.display_params.get('PROBE_PORT', '-')}, backend={self.display_params.get('PROBE_BACKEND', '-')}"),
+            ("PROBE_PANEL", "available" if self.config.allow_probe_switch else "unavailable", "use :probe" if self.config.allow_probe_switch else self.display_params.get("PROBE_CONNECT_ERROR", "-")),
+        ]
         position_items = [
             ("X_um", f"{x:.4f}", "Up/Down"),
             ("Y_um", f"{y:.4f}", "Left/Right"),
@@ -224,6 +244,7 @@ class SamplePrealignPanel:
         daq_items = [
             ("DAQ_STATUS", daq_status.get("status", "-"), ""),
             ("DAQ_STEP", daq_status.get("step", "-"), ""),
+            ("DAQ_READY", "YES" if daq_ready else "NO", "background init complete"),
             ("DAQ_ELAPSED_S", f"{float(daq_status.get('elapsed_s', 0.0)):.2f}", ""),
             ("DELAY", self.display_params.get("DELAY", "-"), "read-only after init starts"),
             ("SAMPLE_RATE", self.display_params.get("SAMPLE_RATE", "-"), "read-only after init starts"),
@@ -239,7 +260,13 @@ class SamplePrealignPanel:
             ("SAMPLE_START_ZERO_POLICY", self.display_params.get("SAMPLE_START_ZERO_POLICY", "-"), "read-only"),
             ("SAMPLE_ZERO_XY_AT_END", self.display_params.get("SAMPLE_ZERO_XY_AT_END", "-"), "read-only"),
         ]
+        start_items = [
+            ("START_ALLOWED", "YES" if start_allowed else "NO", "command=:start/:run/:pam"),
+            ("SCAN_CHECK", "OK" if scan_ok else "BLOCKED", scan.get("error", "")),
+            ("DAQ_CHECK", "READY" if daq_ready else f"WAIT:{daq_state}", daq_status.get("step", "")),
+        ]
         lines = ["Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"]
+        lines += section_lines("Connections", connection_items)
         lines += section_lines("Position", position_items)
         lines += section_lines("Scan Parameters", scan_items)
         if scan.get("ok"):
@@ -250,6 +277,8 @@ class SamplePrealignPanel:
             lines.append("Use ':' commands to change SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, or move the start position.")
         lines += section_lines("Motion / Hotkey Parameters", motion_items)
         lines += section_lines("DAQ Background Init", daq_items)
+        lines += section_lines("Start Gate", start_items)
+        lines.append(f"Start prompt: {start_hint}")
         lines += section_lines("Runtime Parameters", runtime_items)
         if daq_status.get("message"):
             lines.append(f"DAQ message: {daq_status.get('message')}")
@@ -412,6 +441,7 @@ class SamplePrealignPanel:
 
     def result(self):
         x, y, z = self.refresh()
+        scan = self.evaluate_scan(refresh=False)
         return SamplePrealignResult(
             x_um=x,
             y_um=y,
@@ -421,6 +451,8 @@ class SamplePrealignPanel:
             step_um=float(self.config.step_um),
             scan_pattern=str(self.config.scan_pattern),
             next_action=self.next_action,
+            scan_ok=bool(scan.get("ok")),
+            scan_error=str(scan.get("error", "")),
         )
 
 
@@ -542,5 +574,7 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
         step_um=result.step_um,
         scan_pattern=result.scan_pattern,
         next_action=result.next_action,
+        scan_ok=result.scan_ok,
+        scan_error=result.scan_error,
     )
     return result

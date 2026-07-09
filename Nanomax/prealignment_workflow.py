@@ -56,6 +56,9 @@ def run_nanomax_prealignment(
                 display_params=display_params,
             )
             if getattr(sample_result, "next_action", "start") == "probe" and has_probe:
+                display_params = dict(display_params)
+                display_params["SAMPLE_SCAN_READY"] = "YES" if getattr(sample_result, "scan_ok", False) else "NO"
+                display_params["SAMPLE_SCAN_ERROR"] = getattr(sample_result, "scan_error", "")
                 active = "probe"
                 continue
             return NanoMaxPrealignmentResult(sample_result=sample_result, probe_result=probe_result, start_panel="sample")
