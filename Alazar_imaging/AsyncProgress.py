@@ -2,6 +2,7 @@ import queue
 import threading
 from tqdm import tqdm
 import time
+import sys
 
 class AsyncProgress:
     COLORS = {
@@ -51,11 +52,13 @@ class AsyncProgress:
 
     def set_colour(self, color_name):
         """主程序调用的变色接口"""
-        self.update_queue.put(str(color_name))
+        if self.pbar is not None:
+            self.update_queue.put(str(color_name))
 
     def update(self, n=1):
         """更新进度数值"""
-        self.update_queue.put(n)
+        if self.pbar is not None:
+            self.update_queue.put(n)
 
     def set_description(self, text, color=None):
         """
@@ -68,17 +71,30 @@ class AsyncProgress:
             formatted_desc = f"{self.COLORS[color]}{text}{self.COLORS['reset']}"
         else:
             formatted_desc = text
-        self.update_queue.put(str(formatted_desc))
+        if self.pbar is not None:
+            self.update_queue.put(str(formatted_desc))
+
+    def write(self, message):
+        """Print without corrupting the active tqdm progress bar."""
+        text = str(message)
+        if self.pbar is not None:
+            tqdm.write(text, file=sys.stdout)
+            self.pbar.refresh()
+        else:
+            print(text, flush=True)
 
     def start(self, total, desc="PAM Scan"):
+        self.stop()
         self.stop_event.clear()
         # 整合你看到的彩色和自动对齐参数
         self.pbar = tqdm(
             total=total, 
             desc=desc, 
+            file=sys.stdout,
             unit="pixel",           # [新] 显示为 pixel/s
             leave=True, 
             dynamic_ncols=True,     # [新] 自动适应终端宽度
+            position=0,
             colour="cyan",          # [新] 你可以根据喜好改成 blue, green 等
             ascii=False,             # 确保使用平滑的方块而不是 # 号
             smoothing=0.3
@@ -92,9 +108,11 @@ class AsyncProgress:
         self.stop_event.set()
         if self.worker_thread:
             self.worker_thread.join()
+            self.worker_thread = None
         if self.pbar:
             self.pbar.refresh()
             self.pbar.close()
+            self.pbar = None
 
 # 暴露给外部的单例对象
 progress_manager = AsyncProgress()

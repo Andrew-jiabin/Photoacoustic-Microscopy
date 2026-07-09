@@ -162,7 +162,7 @@ if __name__ == "__main__":
     return stdout
 
 
-def poll_user_stop_request(enabled=True, stop_key="q"):
+def poll_user_stop_request(enabled=True, stop_key="q", notify=None):
     """Check once for a graceful stop key without competing with later input prompts."""
     if not enabled:
         return False
@@ -194,10 +194,18 @@ def poll_user_stop_request(enabled=True, stop_key="q"):
 
     if requested:
         append_run_log("USER_STOP_REQUESTED", stop_key=normalized_key)
-        print(
-            f"\nGraceful stop requested by '{normalized_key}'. "
+        message = (
+            f"Graceful stop requested by '{normalized_key}'. "
             "The current point will finish, then the stage will return and close normally."
         )
+        if notify is not None:
+            try:
+                notify(message)
+            except Exception as exc:
+                append_run_log("USER_STOP_NOTIFY_FAILED", error=repr(exc))
+                print(message, flush=True)
+        else:
+            print(message, flush=True)
     return requested
 
 

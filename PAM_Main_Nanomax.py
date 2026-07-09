@@ -34,6 +34,13 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="replace")
 
 
+def refresh_terminal_for_acquisition():
+    """Clear old setup output immediately before showing the acquisition progress bar."""
+    if not sys.stdout.isatty():
+        return
+    os.system("cls" if os.name == "nt" else "clear")
+
+
 def main():
     previous_run = inspect_previous_run()
     CURRENT_RUN_ID = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -428,11 +435,13 @@ def main():
             append_run_log("WAITING_FOR_USER_START")
             input("Press Enter to START Experiment... (make sure the laser is enabled)")
             append_run_log("USER_START_CONFIRMED", source="enter_prompt")
+        progress_desc = "PAM sample closed-loop scan" if SCAN_TARGET == "sample_closed_loop" else "PAM probe open-loop scan"
+        refresh_terminal_for_acquisition()
+        print(f"{progress_desc} starting: {len(trajectory)} points.")
         if USER_STOP_ENABLE:
             print(f"During acquisition, press '{USER_STOP_KEY}' to stop gracefully after the current point. Enter is optional.")
             append_run_log("USER_STOP_POLLING_ENABLED", stop_key=USER_STOP_KEY)
 
-        progress_desc = "PAM sample closed-loop scan" if SCAN_TARGET == "sample_closed_loop" else "PAM probe open-loop scan"
         progress_manager.start(total=len(trajectory), desc=progress_desc)
         append_run_log("ACQUISITION_START", points=len(trajectory), desc=progress_desc)
 
@@ -457,7 +466,7 @@ def main():
                         y_um=f"{ty:.4f}",
                     )
                 progress_manager.update(1)
-                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY):
+                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY, notify=progress_manager.write):
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
@@ -489,7 +498,7 @@ def main():
                         z_v=f"{vz:.4f}",
                     )
                 progress_manager.update(1)
-                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY):
+                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY, notify=progress_manager.write):
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
@@ -501,6 +510,7 @@ def main():
                         z_v=f"{vz:.4f}",
                     )
                     break
+        progress_manager.stop()
         end_reason = "user_stop" if user_stop_requested else "completed"
         append_run_log(
             "ACQUISITION_DONE",
