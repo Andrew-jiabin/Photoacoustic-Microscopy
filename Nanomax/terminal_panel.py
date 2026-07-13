@@ -107,7 +107,7 @@ def _highlight_keywords(line):
 def _highlight_keys(line):
     return re.sub(
         r"(?<!\S)([A-Za-z][A-Za-z0-9_./-]{0,31})(=)",
-        lambda match: colorize(match.group(1), BOLD, FG_WHITE) + match.group(2),
+        lambda match: colorize(match.group(1), BOLD, FG_BRIGHT_GREEN) + match.group(2),
         line,
     )
 
@@ -119,7 +119,7 @@ def _style_indented_line(line):
     if not match:
         return line
     indent, key, rest = match.groups()
-    return indent + colorize(key, BOLD, FG_WHITE) + colorize(rest, FG_WHITE)
+    return indent + colorize(key, BOLD, FG_BRIGHT_GREEN) + colorize(rest, FG_WHITE)
 
 
 class TerminalPanelRenderer:
