@@ -106,10 +106,20 @@ def _highlight_keywords(line):
 
 def _highlight_keys(line):
     return re.sub(
-        r"([A-Za-z][A-Za-z0-9_./ -]{1,32})(=)",
-        lambda match: colorize(match.group(1), FG_CYAN) + match.group(2),
+        r"(?<!\S)([A-Za-z][A-Za-z0-9_./-]{0,31})(=)",
+        lambda match: colorize(match.group(1), BOLD, FG_WHITE) + match.group(2),
         line,
     )
+
+
+def _style_indented_line(line):
+    if "=" in line:
+        return _highlight_keywords(_highlight_keys(line))
+    match = re.match(r"(\s{2,})(\S[^ ]*(?:\s*/\s*\S[^ ]*)?)(.*)", line)
+    if not match:
+        return line
+    indent, key, rest = match.groups()
+    return indent + colorize(key, BOLD, FG_WHITE) + colorize(rest, FG_WHITE)
 
 
 class TerminalPanelRenderer:
@@ -145,7 +155,7 @@ class TerminalPanelRenderer:
         if plain.startswith("Hotkeys:") or plain.startswith("Commands after"):
             return colorize(plain, BOLD, FG_BRIGHT_YELLOW)
         if plain.startswith("  "):
-            return _highlight_keywords(colorize(plain[:18], FG_BRIGHT_CYAN) + colorize(plain[18:], FG_WHITE))
+            return _highlight_keywords(_style_indented_line(plain))
         if plain.startswith("Message:"):
             return colorize("Message:", BOLD, FG_BRIGHT_YELLOW) + _highlight_keywords(plain[len("Message:"):])
         if plain.startswith("Start prompt:"):
