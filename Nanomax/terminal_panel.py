@@ -14,37 +14,45 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
-FG_RED = "\033[31m"
-FG_GREEN = "\033[32m"
-FG_YELLOW = "\033[33m"
-FG_BLUE = "\033[34m"
-FG_CYAN = "\033[36m"
-FG_WHITE = "\033[37m"
-FG_BRIGHT_BLACK = "\033[90m"
-FG_BRIGHT_RED = "\033[91m"
-FG_BRIGHT_GREEN = "\033[92m"
-FG_BRIGHT_YELLOW = "\033[93m"
-FG_BRIGHT_CYAN = "\033[96m"
-BG_BLUE = "\033[44m"
+
+
+def rgb(r, g, b):
+    return f"\033[38;2;{int(r)};{int(g)};{int(b)}m"
+
+
+def bg_rgb(r, g, b):
+    return f"\033[48;2;{int(r)};{int(g)};{int(b)}m"
+
+
+FG_TEXT = rgb(232, 236, 241)
+FG_DIM = rgb(136, 145, 155)
+FG_SECTION = rgb(96, 196, 255)
+FG_LABEL = rgb(120, 224, 142)
+FG_VALUE = rgb(242, 134, 124)
+FG_GOOD = rgb(124, 234, 150)
+FG_WARN = rgb(255, 210, 92)
+FG_BAD = rgb(255, 118, 118)
+FG_MUTED = rgb(180, 186, 194)
+BG_HEADER = bg_rgb(33, 94, 164)
 KEYWORD_STYLES = {
-    "OK": (BOLD, FG_BRIGHT_GREEN),
-    "YES": (BOLD, FG_BRIGHT_GREEN),
-    "READY": (BOLD, FG_BRIGHT_GREEN),
-    "CONNECTED": (BOLD, FG_BRIGHT_GREEN),
-    "NORMAL": (BOLD, FG_BRIGHT_GREEN),
-    "COMPLETED": (BOLD, FG_BRIGHT_GREEN),
-    "TRUE": (BOLD, FG_BRIGHT_GREEN),
-    "WAIT": (BOLD, FG_BRIGHT_YELLOW),
-    "WARNING": (BOLD, FG_BRIGHT_YELLOW),
-    "WARN": (BOLD, FG_BRIGHT_YELLOW),
-    "DISABLED": (BOLD, FG_BRIGHT_YELLOW),
-    "UNAVAILABLE": (BOLD, FG_BRIGHT_YELLOW),
-    "NO": (BOLD, FG_BRIGHT_RED),
-    "BLOCKED": (BOLD, FG_BRIGHT_RED),
-    "ERROR": (BOLD, FG_BRIGHT_RED),
-    "FAILED": (BOLD, FG_BRIGHT_RED),
-    "FAIL": (BOLD, FG_BRIGHT_RED),
-    "OUT": (BOLD, FG_BRIGHT_RED),
+    "OK": (BOLD, FG_GOOD),
+    "YES": (BOLD, FG_GOOD),
+    "READY": (BOLD, FG_GOOD),
+    "CONNECTED": (BOLD, FG_GOOD),
+    "NORMAL": (BOLD, FG_GOOD),
+    "COMPLETED": (BOLD, FG_GOOD),
+    "TRUE": (BOLD, FG_GOOD),
+    "WAIT": (BOLD, FG_WARN),
+    "WARNING": (BOLD, FG_WARN),
+    "WARN": (BOLD, FG_WARN),
+    "DISABLED": (BOLD, FG_WARN),
+    "UNAVAILABLE": (BOLD, FG_WARN),
+    "NO": (BOLD, FG_BAD),
+    "BLOCKED": (BOLD, FG_BAD),
+    "ERROR": (BOLD, FG_BAD),
+    "FAILED": (BOLD, FG_BAD),
+    "FAIL": (BOLD, FG_BAD),
+    "OUT": (BOLD, FG_BAD),
 }
 KEYWORD_RE = re.compile(
     r"\b(OK|YES|READY|CONNECTED|NORMAL|COMPLETED|TRUE|WAIT|WARNING|WARN|DISABLED|UNAVAILABLE|NO|BLOCKED|ERROR|FAILED|FAIL|OUT)\b",
@@ -105,7 +113,7 @@ def _highlight_keywords(line):
 def _highlight_keys(line):
     return re.sub(
         r"(?<!\S)([A-Za-z][A-Za-z0-9_./-]{0,31})(=)",
-        lambda match: colorize(match.group(1), BOLD, FG_BRIGHT_GREEN) + match.group(2),
+        lambda match: colorize(match.group(1), BOLD, FG_LABEL) + match.group(2),
         line,
     )
 
@@ -116,14 +124,26 @@ def _style_value(text):
     for match in KEYWORD_RE.finditer(text):
         prefix = text[start:match.start()]
         if prefix:
-            parts.append(colorize(prefix, FG_BRIGHT_RED))
+            parts.append(colorize(prefix, FG_VALUE))
         style = KEYWORD_STYLES.get(match.group(0).upper())
         parts.append(colorize(match.group(0), *style))
         start = match.end()
     suffix = text[start:]
     if suffix:
-        parts.append(colorize(suffix, FG_BRIGHT_RED))
-    return "".join(parts) if parts else colorize(text, FG_BRIGHT_RED)
+        parts.append(colorize(suffix, FG_VALUE))
+    return "".join(parts) if parts else colorize(text, FG_VALUE)
+
+
+def _style_command_segment(text):
+    def replace(match):
+        token = match.group(0)
+        if token.startswith("<") and token.endswith(">"):
+            return colorize(token, BOLD, FG_WARN)
+        if token in {"/", "|", ":", "->", "=>", "+=", "-="}:
+            return colorize(token, FG_MUTED)
+        return colorize(token, BOLD, FG_LABEL)
+
+    return re.sub(r"<[^>]+>|/|\||:|->|=>|\+=|-=|[A-Za-z0-9_./+-]+", replace, text)
 
 
 def _style_assignment_cells(line):
@@ -139,18 +159,32 @@ def _style_assignment_cells(line):
             styled.append(token)
             continue
         key, value = token.split("=", 1)
-        styled.append(colorize(key, BOLD, FG_BRIGHT_GREEN) + "=" + _style_value(value))
+        styled.append(colorize(key, BOLD, FG_LABEL) + "=" + _style_value(value))
     return "".join(styled)
 
 
 def _style_indented_line(line):
     if "=" in line:
         return _style_assignment_cells(line)
-    match = re.match(r"(\s{2,})(\S[^ ]*(?:\s*/\s*\S[^ ]*)?)(.*)", line)
-    if not match:
-        return line
-    indent, key, rest = match.groups()
-    return indent + colorize(key, BOLD, FG_BRIGHT_GREEN) + colorize(rest, FG_WHITE)
+    match = re.match(r"(\s*)(.*)", line)
+    indent, body = match.groups()
+    pieces = re.split(r"(\s{2,})", body)
+    text_pieces = [piece for piece in pieces if piece and not re.fullmatch(r"\s{2,}", piece)]
+    styled = [indent]
+    text_index = 0
+    total_text = len(text_pieces)
+    for piece in pieces:
+        if not piece:
+            continue
+        if re.fullmatch(r"\s{2,}", piece):
+            styled.append(piece)
+            continue
+        text_index += 1
+        if text_index < total_text:
+            styled.append(_style_command_segment(piece))
+        else:
+            styled.append(colorize(piece, FG_TEXT))
+    return "".join(styled)
 
 
 class TerminalPanelRenderer:
@@ -177,23 +211,23 @@ class TerminalPanelRenderer:
     def _style_line(self, line, width):
         plain = str(line)
         if set(plain) == {"="}:
-            return colorize(plain, FG_BRIGHT_BLACK)
+            return colorize(plain, FG_DIM)
         if plain.startswith("PAM "):
-            return colorize(plain.center(width - 1), BOLD, FG_WHITE, BG_BLUE)
+            return colorize(plain.center(width - 1), BOLD, FG_TEXT, BG_HEADER)
         if plain.startswith("[") and "]" in plain:
             title, rest = plain.split("]", 1)
-            return colorize(title + "]", BOLD, FG_BRIGHT_CYAN) + colorize(rest, FG_BRIGHT_BLACK)
+            return colorize(title + "]", BOLD, FG_SECTION) + colorize(rest, FG_DIM)
         if plain.startswith("Hotkeys:") or plain.startswith("Commands after"):
-            return colorize(plain, BOLD, FG_BRIGHT_YELLOW)
+            return colorize(plain, BOLD, FG_WARN)
         if plain.startswith("  "):
             return _highlight_keywords(_style_indented_line(plain))
         if plain.startswith("Message:"):
-            return colorize("Message:", BOLD, FG_BRIGHT_YELLOW) + _highlight_keywords(plain[len("Message:"):])
+            return colorize("Message:", BOLD, FG_WARN) + _highlight_keywords(colorize(plain[len("Message:"):], FG_TEXT))
         if plain.startswith("Start prompt:"):
-            return colorize("Start prompt:", BOLD, FG_BRIGHT_CYAN) + _highlight_keywords(plain[len("Start prompt:"):])
+            return colorize("Start prompt:", BOLD, FG_SECTION) + _highlight_keywords(colorize(plain[len("Start prompt:"):], FG_TEXT))
         if plain.startswith(("Trajectory:", "Travel check:", "Travel/step check:", "DAQ message:", "DAQ timings:")):
             prefix, rest = plain.split(":", 1)
-            return colorize(prefix + ":", BOLD, FG_BRIGHT_CYAN) + _highlight_keywords(rest)
+            return colorize(prefix + ":", BOLD, FG_SECTION) + _highlight_keywords(colorize(rest, FG_TEXT))
         return _highlight_keywords(_highlight_keys(plain))
 
     def render(self, lines):
