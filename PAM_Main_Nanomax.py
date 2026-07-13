@@ -43,13 +43,52 @@ def refresh_terminal_for_acquisition():
     os.system("cls" if os.name == "nt" else "clear")
 
 
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    return default if value is None else float(value)
+
+
+def env_int(name, default):
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+def env_str(name, default):
+    value = os.environ.get(name)
+    return default if value is None else value
+
+
 def main():
+    # These startup decisions must be available before writing RUN_START or
+    # explaining whether a sample zero-datum rebuild will be attempted.
+    SCAN_TARGET = env_str("PAM_SCAN_TARGET", "sample_closed_loop")
+    SAMPLE_START_ZERO_POLICY = env_str("PAM_SAMPLE_START_ZERO_POLICY", "auto")
+
     previous_run = inspect_previous_run()
     CURRENT_RUN_ID = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     set_current_run_id(CURRENT_RUN_ID)
+    try:
+        SAMPLE_ZERO_XY_AT_START, SAMPLE_START_ZERO_REASON = resolve_start_zero_policy(
+            SAMPLE_START_ZERO_POLICY,
+            previous_run,
+        )
+    except ValueError as exc:
+        append_run_log("RUN_END_ERROR", error=repr(exc), phase="startup_zero_policy_validation")
+        raise SystemExit(f"Startup zero policy error: {exc}") from None
     append_run_log(
         "RUN_START",
         log_path=RUN_LOG_PATH,
+        scan_target=SCAN_TARGET,
+        sample_start_zero_policy=SAMPLE_START_ZERO_POLICY,
+        sample_zero_at_start=SAMPLE_ZERO_XY_AT_START,
+        sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
         previous_status=previous_run["status"],
         previous_run_id=previous_run["run_id"],
         previous_event=previous_run["event"],
@@ -60,13 +99,22 @@ def main():
         cwd=os.getcwd(),
         pid=os.getpid(),
     )
-    if previous_run["need_start_zero"]:
+    if SCAN_TARGET != "sample_closed_loop":
+        append_run_log("START_ZERO_SKIPPED_FOR_TARGET", scan_target=SCAN_TARGET)
+    elif SAMPLE_ZERO_XY_AT_START:
         print(
             "\nPrevious PAM run did not leave a trusted normal-cleanup + low-end X/Y zero-datum marker; "
             f"status={previous_run['status']}, run_id={previous_run['run_id']}, reason={previous_run['zero_reason']}. "
-            "Startup X/Y zero will be rebuilt when sample_closed_loop is used."
+            f"Startup X/Y zero will be rebuilt (policy={SAMPLE_START_ZERO_POLICY})."
         )
         append_run_log("PREVIOUS_RUN_WARNING", previous_line=previous_run["line"])
+    elif SAMPLE_START_ZERO_POLICY.strip().lower() == "never":
+        print(
+            "\nStartup X/Y zero rebuild is disabled by PAM_SAMPLE_START_ZERO_POLICY=never; "
+            f"previous status={previous_run['status']}, run_id={previous_run['run_id']}, reason={previous_run['zero_reason']}. "
+            "Use this only when the current sample datum is already valid."
+        )
+        append_run_log("START_ZERO_SKIPPED_BY_POLICY", previous_line=previous_run["line"])
     else:
         print(
             "\nPrevious PAM run completed normal cleanup and left a trusted low-end X/Y datum marker; "
@@ -82,7 +130,6 @@ def main():
     # Stage selection:
     #   sample_closed_loop: move the MAX311D sample stage with BPC303 in microns.
     #   probe_open_loop: keep the sample fixed and move the MAX312D probe stage by MDT693B voltages.
-    SCAN_TARGET = "sample_closed_loop"
 
     # Closed-loop sample NanoMax: MAX311D on BPC303. User-confirmed axis mapping: channel 1/2/3 = X/Y/Z.
     BPC303_SERIAL_NO, BPC303_KINESIS_DIR = "71241834", r"C:\Program Files\Thorlabs\Kinesis"
@@ -99,24 +146,29 @@ def main():
     PROBE_STEP_V, PROBE_UM_PER_V = None, PROBE_PIEZO_TRAVEL_UM / PROBE_PIEZO_TRAVEL_VOLTAGE
     PROBE_SCAN_FAST_AXIS, PROBE_SCAN_SLOW_AXIS = "y", "z"
     PROBE_FAST_DIRECTION, PROBE_SLOW_DIRECTION, PROBE_Z_HOLD_V, PROBE_RETURN_TO_START = 1.0, 1.0, None, True
-    PROBE_PREALIGN_ENABLE, PROBE_PREALIGN_Y_STEP_V, PROBE_PREALIGN_Z_STEP_V = True, 1.0, 1.0
+    PROBE_PREALIGN_ENABLE, PROBE_PREALIGN_Y_STEP_V, PROBE_PREALIGN_Z_STEP_V = env_bool("PAM_PROBE_PREALIGN_ENABLE", True), 1.0, 1.0
     PROBE_PREALIGN_INTERVAL_S, PROBE_PREALIGN_SET_AXIS_MAX = 0.25, True
     PROBE_PREALIGN_REQUIRE_CONTROLLER = False
 
     # User scan geometry. Ranges are the requested travel from first to last point.
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
     # The script also checks against the BPC303-reported maximum travel before acquisition.
-    SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = 2.5, 2.5, 0.01  # X is actually up; Y is actually left.
+    SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = (
+        env_float("PAM_SCAN_RANGE_X_UM", 2.5),
+        env_float("PAM_SCAN_RANGE_Y_UM", 2.5),
+        env_float("PAM_STEP_UM", 0.01),
+    )  # X is actually up; Y is actually left.
     SAMPLE_X_DIRECTION, SAMPLE_Y_DIRECTION = 1.0, 1.0
-    SAMPLE_PREALIGN_ENABLE, SAMPLE_PREALIGN_X_STEP_UM, SAMPLE_PREALIGN_Y_STEP_UM, SAMPLE_PREALIGN_Z_STEP_UM = True, 0.1, 0.1, 0.1
+    SAMPLE_PREALIGN_ENABLE, SAMPLE_PREALIGN_X_STEP_UM, SAMPLE_PREALIGN_Y_STEP_UM, SAMPLE_PREALIGN_Z_STEP_UM = env_bool("PAM_SAMPLE_PREALIGN_ENABLE", True), 0.1, 0.1, 0.1
     SAMPLE_PREALIGN_INTERVAL_S = 0.25
     # Startup zero policy:
     #   "auto": rebuild X/Y zero unless the previous log has a trusted low-end zero-datum marker.
     #   "always": rebuild X/Y zero every run.
     #   "never": never rebuild at start; only use this when you know the current datum is valid.
     # Z is intentionally excluded by default to avoid changing focus/clearance.
-    SAMPLE_START_ZERO_POLICY, SAMPLE_ZERO_XY_AT_START, SAMPLE_START_ZERO_REASON = "auto", True, "not_resolved"
-    SAMPLE_ZERO_AXES, SAMPLE_LOW_END_RESIDUAL_TOLERANCE_UM, SAMPLE_RETURN_XY_TO_ZERO_AT_END = ("x", "y"), 0.01, True
+    SAMPLE_ZERO_AXES = ("x", "y")
+    SAMPLE_LOW_END_RESIDUAL_TOLERANCE_UM = 0.01
+    SAMPLE_RETURN_XY_TO_ZERO_AT_END = env_bool("PAM_SAMPLE_RETURN_XY_TO_ZERO_AT_END", True)
     # False avoids a ~45-60 s BPC303 SetZero cycle at every normal end.
     # Set True only when you explicitly want the controller outputs forced to 0 V after each run.
     SAMPLE_ZERO_XY_AT_END = False
@@ -128,6 +180,7 @@ def main():
     # DAQ parameters.
     DELAY, SAMPLES_REC, SAMPLE_RATE = 1320, 4096, ats.SAMPLE_RATE_4000MSPS
     AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 256, 4
+    ACQ_TIMEOUT_MS = env_int("PAM_ACQ_TIMEOUT_MS", 1000)
     POINT_LOG_INTERVAL, USER_STOP_ENABLE, USER_STOP_KEY = 25, True, "q"
 
     if SCAN_TARGET not in ("sample_closed_loop", "probe_open_loop"):
@@ -141,10 +194,6 @@ def main():
             max_range_um=NANOMAX_PIEZO_SCAN_LIMIT_UM,
         )
         SERPENTINE_SCAN, SCAN_PATTERN_LABEL = resolve_scan_pattern(SCAN_PATTERN)
-        SAMPLE_ZERO_XY_AT_START, SAMPLE_START_ZERO_REASON = resolve_start_zero_policy(
-            SAMPLE_START_ZERO_POLICY,
-            previous_run,
-        )
     except ValueError as exc:
         append_run_log("RUN_END_ERROR", error=repr(exc), phase="scan_parameter_validation")
         raise SystemExit(f"Scan parameter error: {exc}") from None
@@ -344,6 +393,7 @@ def main():
                         "SAMPLES_REC": SAMPLES_REC,
                         "SAMPLE_RATE": SAMPLE_RATE,
                         "AVERAGE_ENABLE": AVERAGE_ENABLE,
+                        "ACQ_TIMEOUT_MS": ACQ_TIMEOUT_MS,
                         "RECORDS_PER_POINT": RECORDS_PER_POINT,
                         "BUFFER_COUNT": BUFFER_COUNT,
                         "POINT_LOG_INTERVAL": POINT_LOG_INTERVAL,
@@ -606,7 +656,7 @@ def main():
                 daq.get_one_acquisition(
                     all_data=all_data,
                     curr_pos_str=current_pos_str,
-                    timeout_ms=1000,
+                    timeout_ms=ACQ_TIMEOUT_MS,
                     Average_Enable=AVERAGE_ENABLE,
                 )
                 acquired_points += 1
@@ -637,7 +687,7 @@ def main():
                 daq.get_one_acquisition(
                     all_data=all_data,
                     curr_pos_str=current_pos_str,
-                    timeout_ms=1000,
+                    timeout_ms=ACQ_TIMEOUT_MS,
                     Average_Enable=AVERAGE_ENABLE,
                 )
                 acquired_points += 1
