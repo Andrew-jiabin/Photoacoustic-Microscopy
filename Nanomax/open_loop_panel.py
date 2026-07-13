@@ -5,6 +5,8 @@ import sys
 import time
 from dataclasses import dataclass
 
+from Nanomax.terminal_panel import TerminalPanelRenderer, terminal_width
+
 
 VK_LEFT = 0x25
 VK_UP = 0x26
@@ -12,9 +14,6 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 KEY_ARROW_PREFIXES = ("\x00", "\xe0")
 DEFAULT_AUTO_REFRESH_S = 5.0
-ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-STD_OUTPUT_HANDLE = -11
-_VT_ENABLED = False
 
 
 @dataclass
@@ -40,29 +39,6 @@ class ProbePrealignResult:
     y_step_v: float
     z_step_v: float
     next_action: str = "start"
-
-
-def enable_virtual_terminal():
-    global _VT_ENABLED
-    if _VT_ENABLED or os.name != "nt" or not sys.stdout.isatty():
-        return
-    try:
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-        _VT_ENABLED = True
-    except Exception:
-        _VT_ENABLED = True
-
-
-def clear_screen():
-    if not sys.stdout.isatty():
-        return
-    enable_virtual_terminal()
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
 
 
 def truncate_line(text):
@@ -111,7 +87,7 @@ def section_lines(title, items):
     rows = [f"[{title}]"]
     width = max(80, shutil.get_terminal_size((120, 30)).columns - 1)
     columns = 2 if width < 115 else 3
-    cell_width = max(28, min(42, (width - 2) // columns))
+    cell_width = max(28, min(42, (width - 4) // columns))
     cells = []
     for name, value, hint in items:
         text = f"{name}={value}"
@@ -119,7 +95,7 @@ def section_lines(title, items):
             text = f"{text} ({hint})"
         cells.append(text[: cell_width - 1].ljust(cell_width))
     for index in range(0, len(cells), columns):
-        rows.append(" ".join(cells[index:index + columns]).rstrip())
+        rows.append("  " + " ".join(cells[index:index + columns]).rstrip())
     return rows
 
 
@@ -140,6 +116,7 @@ class ProbePrealignPanel:
         self.last_xyz = [float(value) for value in self.stage.get_voltage_xyz()]
         self.message = "Use hotkeys to set probe Y/Z, then ':' and 'start' to begin imaging."
         self.next_action = "start"
+        self.renderer = TerminalPanelRenderer()
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_voltage_xyz()]
@@ -380,15 +357,17 @@ class ProbePrealignPanel:
         return lines
 
     def render(self, refresh=True):
-        clear_screen()
-        width = max(80, shutil.get_terminal_size((120, 30)).columns)
-        print("=" * min(width - 1, 118))
-        print("PAM open-loop probe prealignment")
-        print("=" * min(width - 1, 118))
-        print(HELP_TEXT)
-        print("=" * min(width - 1, 118))
-        for line in self.status_lines(refresh=refresh):
-            print(truncate_line(line), flush=True)
+        width = terminal_width()
+        separator = "=" * min(width - 1, 118)
+        lines = [
+            separator,
+            "PAM open-loop probe prealignment",
+            separator,
+            HELP_TEXT,
+            separator,
+        ]
+        lines.extend(self.status_lines(refresh=refresh))
+        self.renderer.render(lines)
 
     def result(self):
         x, y, z = self.refresh()
@@ -465,6 +444,7 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
         char = read_last_command_key(msvcrt)
         if char:
             if char in ("q", "Q"):
+                panel.renderer.show_cursor()
                 raise KeyboardInterrupt("Probe prealignment cancelled by user.")
             if char in ("h", "H", "?"):
                 redraw(refresh=True)
@@ -486,6 +466,7 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
                 panel.message = f"Y/Z steps halved to {panel.y_step_v:g} V."
                 redraw(refresh=True)
             elif char == ":":
+                panel.renderer.show_cursor()
                 sys.stdout.write("\ncmd> ")
                 sys.stdout.flush()
                 line = input()
@@ -509,6 +490,7 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
     if config.return_yz_zero_on_exit and panel.next_action != "start":
         panel.set_yz(0.0, 0.0, reason="prealign_exit_zero")
 
+    panel.renderer.show_cursor()
     result = panel.result()
     panel.log(
         "PROBE_PREALIGN_PANEL_DONE",

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 
 from Nanomax.scan_utils import NANOMAX_MANUAL_MIN_STEP_UM, scan_shape_from_range
+from Nanomax.terminal_panel import TerminalPanelRenderer, terminal_width
 
 
 VK_LEFT = 0x25
@@ -14,9 +15,6 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 KEY_ARROW_PREFIXES = ("\x00", "\xe0")
 DEFAULT_AUTO_REFRESH_S = 5.0
-ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-STD_OUTPUT_HANDLE = -11
-_VT_ENABLED = False
 
 
 @dataclass
@@ -49,29 +47,6 @@ class SamplePrealignResult:
     next_action: str = "start"
     scan_ok: bool = True
     scan_error: str = ""
-
-
-def enable_virtual_terminal():
-    global _VT_ENABLED
-    if _VT_ENABLED or os.name != "nt" or not sys.stdout.isatty():
-        return
-    try:
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-        _VT_ENABLED = True
-    except Exception:
-        _VT_ENABLED = True
-
-
-def clear_screen():
-    if not sys.stdout.isatty():
-        return
-    enable_virtual_terminal()
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
 
 
 def truncate_line(text):
@@ -144,6 +119,7 @@ class SamplePrealignPanel:
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
         self.ready_to_start = False
         self.next_action = "start"
+        self.renderer = TerminalPanelRenderer()
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -319,15 +295,17 @@ class SamplePrealignPanel:
         return lines
 
     def render(self, refresh=True):
-        clear_screen()
-        width = max(80, shutil.get_terminal_size((120, 30)).columns)
-        print("=" * min(width - 1, 118))
-        print("PAM closed-loop sample prealignment")
-        print("=" * min(width - 1, 118))
-        print(HELP_TEXT)
-        print("=" * min(width - 1, 118))
-        for line in self.status_lines(refresh=refresh):
-            print(truncate_line(line), flush=True)
+        width = terminal_width()
+        separator = "=" * min(width - 1, 118)
+        lines = [
+            separator,
+            "PAM closed-loop sample prealignment",
+            separator,
+            HELP_TEXT,
+            separator,
+        ]
+        lines.extend(self.status_lines(refresh=refresh))
+        self.renderer.render(lines)
 
     def set_scan_variable(self, name, value):
         name = normalize_scan_variable(name)
@@ -502,7 +480,7 @@ def section_lines(title, items):
     rows = [f"[{title}]"]
     width = max(80, shutil.get_terminal_size((120, 30)).columns - 1)
     columns = 2 if width < 115 else 3
-    cell_width = max(28, min(42, (width - 2) // columns))
+    cell_width = max(28, min(42, (width - 4) // columns))
     cells = []
     for name, value, hint in items:
         text = f"{name}={value}"
@@ -510,7 +488,7 @@ def section_lines(title, items):
             text = f"{text} ({hint})"
         cells.append(text[: cell_width - 1].ljust(cell_width))
     for index in range(0, len(cells), columns):
-        rows.append(" ".join(cells[index:index + columns]).rstrip())
+        rows.append("  " + " ".join(cells[index:index + columns]).rstrip())
     return rows
 
 
@@ -572,6 +550,7 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
         char = read_last_command_key(msvcrt)
         if char:
             if char in ("q", "Q"):
+                panel.renderer.show_cursor()
                 raise KeyboardInterrupt("Prealignment cancelled by user.")
             if char in ("h", "H", "?"):
                 redraw(refresh=True)
@@ -591,6 +570,7 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
                 drain_keyboard_buffer(msvcrt)
                 redraw(refresh=True)
             elif char == ":":
+                panel.renderer.show_cursor()
                 sys.stdout.write("\ncmd> ")
                 sys.stdout.flush()
                 line = input()
@@ -611,6 +591,7 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
                     redraw(refresh=True)
         time.sleep(panel.sample_interval_s)
 
+    panel.renderer.show_cursor()
     result = panel.result()
     panel.log(
         "PREALIGN_PANEL_DONE",
