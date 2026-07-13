@@ -26,6 +26,30 @@ FG_BRIGHT_GREEN = "\033[92m"
 FG_BRIGHT_YELLOW = "\033[93m"
 FG_BRIGHT_CYAN = "\033[96m"
 BG_BLUE = "\033[44m"
+KEYWORD_STYLES = {
+    "OK": (BOLD, FG_BRIGHT_GREEN),
+    "YES": (BOLD, FG_BRIGHT_GREEN),
+    "READY": (BOLD, FG_BRIGHT_GREEN),
+    "CONNECTED": (BOLD, FG_BRIGHT_GREEN),
+    "NORMAL": (BOLD, FG_BRIGHT_GREEN),
+    "COMPLETED": (BOLD, FG_BRIGHT_GREEN),
+    "TRUE": (BOLD, FG_BRIGHT_GREEN),
+    "WAIT": (BOLD, FG_BRIGHT_YELLOW),
+    "WARNING": (BOLD, FG_BRIGHT_YELLOW),
+    "WARN": (BOLD, FG_BRIGHT_YELLOW),
+    "DISABLED": (BOLD, FG_BRIGHT_YELLOW),
+    "UNAVAILABLE": (BOLD, FG_BRIGHT_YELLOW),
+    "NO": (BOLD, FG_BRIGHT_RED),
+    "BLOCKED": (BOLD, FG_BRIGHT_RED),
+    "ERROR": (BOLD, FG_BRIGHT_RED),
+    "FAILED": (BOLD, FG_BRIGHT_RED),
+    "FAIL": (BOLD, FG_BRIGHT_RED),
+    "OUT": (BOLD, FG_BRIGHT_RED),
+}
+KEYWORD_RE = re.compile(
+    r"\b(OK|YES|READY|CONNECTED|NORMAL|COMPLETED|TRUE|WAIT|WARNING|WARN|DISABLED|UNAVAILABLE|NO|BLOCKED|ERROR|FAILED|FAIL|OUT)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def enable_virtual_terminal():
@@ -70,38 +94,12 @@ def colorize(text, *styles):
 
 
 def _highlight_keywords(line):
-    colors = {
-        "OK": (BOLD, FG_BRIGHT_GREEN),
-        "YES": (BOLD, FG_BRIGHT_GREEN),
-        "READY": (BOLD, FG_BRIGHT_GREEN),
-        "CONNECTED": (BOLD, FG_BRIGHT_GREEN),
-        "NORMAL": (BOLD, FG_BRIGHT_GREEN),
-        "COMPLETED": (BOLD, FG_BRIGHT_GREEN),
-        "TRUE": (BOLD, FG_BRIGHT_GREEN),
-        "WAIT": (BOLD, FG_BRIGHT_YELLOW),
-        "WARNING": (BOLD, FG_BRIGHT_YELLOW),
-        "WARN": (BOLD, FG_BRIGHT_YELLOW),
-        "DISABLED": (BOLD, FG_BRIGHT_YELLOW),
-        "UNAVAILABLE": (BOLD, FG_BRIGHT_YELLOW),
-        "NO": (BOLD, FG_BRIGHT_RED),
-        "BLOCKED": (BOLD, FG_BRIGHT_RED),
-        "ERROR": (BOLD, FG_BRIGHT_RED),
-        "FAILED": (BOLD, FG_BRIGHT_RED),
-        "FAIL": (BOLD, FG_BRIGHT_RED),
-        "OUT": (BOLD, FG_BRIGHT_RED),
-    }
-
     def replace(match):
         word = match.group(0)
-        style = colors.get(word.upper())
+        style = KEYWORD_STYLES.get(word.upper())
         return colorize(word, *style) if style else word
 
-    return re.sub(
-        r"\b(OK|YES|READY|CONNECTED|NORMAL|COMPLETED|TRUE|WAIT|WARNING|WARN|DISABLED|UNAVAILABLE|NO|BLOCKED|ERROR|FAILED|FAIL|OUT)\b",
-        replace,
-        line,
-        flags=re.IGNORECASE,
-    )
+    return KEYWORD_RE.sub(replace, line)
 
 
 def _highlight_keys(line):
@@ -112,9 +110,42 @@ def _highlight_keys(line):
     )
 
 
+def _style_value(text):
+    parts = []
+    start = 0
+    for match in KEYWORD_RE.finditer(text):
+        prefix = text[start:match.start()]
+        if prefix:
+            parts.append(colorize(prefix, FG_BRIGHT_RED))
+        style = KEYWORD_STYLES.get(match.group(0).upper())
+        parts.append(colorize(match.group(0), *style))
+        start = match.end()
+    suffix = text[start:]
+    if suffix:
+        parts.append(colorize(suffix, FG_BRIGHT_RED))
+    return "".join(parts) if parts else colorize(text, FG_BRIGHT_RED)
+
+
+def _style_assignment_cells(line):
+    tokens = re.split(r"(\s{2,})", line)
+    styled = []
+    for token in tokens:
+        if not token:
+            continue
+        if re.fullmatch(r"\s{2,}", token):
+            styled.append(token)
+            continue
+        if "=" not in token:
+            styled.append(token)
+            continue
+        key, value = token.split("=", 1)
+        styled.append(colorize(key, BOLD, FG_BRIGHT_GREEN) + "=" + _style_value(value))
+    return "".join(styled)
+
+
 def _style_indented_line(line):
     if "=" in line:
-        return _highlight_keywords(_highlight_keys(line))
+        return _style_assignment_cells(line)
     match = re.match(r"(\s{2,})(\S[^ ]*(?:\s*/\s*\S[^ ]*)?)(.*)", line)
     if not match:
         return line
