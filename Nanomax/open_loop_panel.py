@@ -11,6 +11,10 @@ VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
 KEY_ARROW_PREFIXES = ("\x00", "\xe0")
+DEFAULT_AUTO_REFRESH_S = 5.0
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+STD_OUTPUT_HANDLE = -11
+_VT_ENABLED = False
 
 
 @dataclass
@@ -21,6 +25,7 @@ class ProbePrealignConfig:
     y_step_v: float = 1.0
     z_step_v: float = 1.0
     sample_interval_s: float = 0.25
+    auto_refresh_s: float = DEFAULT_AUTO_REFRESH_S
     settle_ms: int = 80
     set_axis_max: bool = True
     allow_sample_switch: bool = False
@@ -37,12 +42,27 @@ class ProbePrealignResult:
     next_action: str = "start"
 
 
+def enable_virtual_terminal():
+    global _VT_ENABLED
+    if _VT_ENABLED or os.name != "nt" or not sys.stdout.isatty():
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        _VT_ENABLED = True
+    except Exception:
+        _VT_ENABLED = True
+
+
 def clear_screen():
-    if os.name == "nt":
-        os.system("cls")
-    else:
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+    if not sys.stdout.isatty():
+        return
+    enable_virtual_terminal()
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
 
 
 def truncate_line(text):
@@ -116,6 +136,7 @@ class ProbePrealignPanel:
         self.y_step_v = validate_positive("y_step_v", config.y_step_v)
         self.z_step_v = validate_positive("z_step_v", config.z_step_v)
         self.sample_interval_s = validate_positive("sample_interval_s", config.sample_interval_s)
+        self.auto_refresh_s = validate_positive("auto_refresh_s", config.auto_refresh_s)
         self.last_xyz = [float(value) for value in self.stage.get_voltage_xyz()]
         self.message = "Use hotkeys to set probe Y/Z, then ':' and 'start' to begin imaging."
         self.next_action = "start"
@@ -123,6 +144,14 @@ class ProbePrealignPanel:
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_voltage_xyz()]
         return self.last_xyz
+
+    def status_signature(self):
+        daq_status = self.status_provider() if callable(self.status_provider) else {}
+        return (
+            daq_status.get("status", "-"),
+            daq_status.get("step", "-"),
+            daq_status.get("message", ""),
+        )
 
     def voltage_to_um(self, voltage):
         return float(voltage) / self.piezo_travel_voltage * self.piezo_travel_um
@@ -239,6 +268,9 @@ class ProbePrealignPanel:
             elif cmd in ("interval", "dt") and len(tokens) == 2:
                 self.sample_interval_s = validate_positive("interval", tokens[1])
                 self.message = f"interval set to {self.sample_interval_s:g} s."
+            elif cmd in ("refresh", "redraw") and len(tokens) == 2:
+                self.auto_refresh_s = validate_positive("refresh", tokens[1])
+                self.message = f"auto refresh set to {self.auto_refresh_s:g} s."
             elif cmd in ("max", "safe", "limit") and len(tokens) == 2:
                 self.set_safe_max(float(tokens[1]))
             elif cmd == "set":
@@ -275,6 +307,9 @@ class ProbePrealignPanel:
         elif target in ("interval", "dt") and len(tokens) == 2:
             self.sample_interval_s = validate_positive("interval", tokens[1])
             self.message = f"interval set to {self.sample_interval_s:g} s."
+        elif target in ("refresh", "redraw") and len(tokens) == 2:
+            self.auto_refresh_s = validate_positive("refresh", tokens[1])
+            self.message = f"auto refresh set to {self.auto_refresh_s:g} s."
         else:
             raise ValueError("Use set y <V>, set z <V>, set yz <Y> <Z>, set ystep <V>, or set zstep <V>.")
 
@@ -316,6 +351,7 @@ class ProbePrealignPanel:
             ("ystep", f"{self.y_step_v:g}", f"~= {self.voltage_to_um(self.y_step_v):g} um"),
             ("zstep", f"{self.z_step_v:g}", f"~= {self.voltage_to_um(self.z_step_v):g} um"),
             ("interval", f"{self.sample_interval_s:g}", "set interval n"),
+            ("refresh", f"{self.auto_refresh_s:g}", "set refresh n"),
             ("SETTLE_MS", f"{self.config.settle_ms:g}", "fixed from config"),
         ]
         daq_items = [
@@ -381,7 +417,8 @@ Commands after ':' then Enter:
   sample / closed / bpc303           switch to the closed-loop sample panel, if enabled
   set y <V>, set z <V>, set yz <Y> <Z>
   set ystep <V>, set zstep <V>, set step <V>
-  set interval <sec>
+  set interval <sec>                 hotkey polling interval
+  set refresh <sec>                  automatic screen redraw interval
   max <V>                            set program safe upper limit and MDT YMAX/ZMAX
   zero                               set Y/Z to 0 V
   q / quit / cancel                  abort before acquisition
@@ -415,6 +452,14 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
     panel.render(refresh=True)
     drain_keyboard_buffer(msvcrt)
     last_render = time.time()
+    last_status_signature = panel.status_signature()
+
+    def redraw(refresh=True):
+        nonlocal last_render, last_status_signature
+        panel.render(refresh=refresh)
+        last_render = time.time()
+        last_status_signature = panel.status_signature()
+
     running = True
     while running:
         char = read_last_command_key(msvcrt)
@@ -422,41 +467,43 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
             if char in ("q", "Q"):
                 raise KeyboardInterrupt("Probe prealignment cancelled by user.")
             if char in ("h", "H", "?"):
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char in ("s", "S"):
                 panel.message = "Status refreshed."
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char in ("0", "r", "R"):
                 panel.set_yz(0.0, 0.0, reason="hotkey_zero_yz")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == "+":
                 panel.y_step_v *= 2.0
                 panel.z_step_v *= 2.0
                 panel.message = f"Y/Z steps doubled to {panel.y_step_v:g} V."
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == "-":
                 panel.y_step_v = max(panel.y_step_v / 2.0, 1e-6)
                 panel.z_step_v = max(panel.z_step_v / 2.0, 1e-6)
                 panel.message = f"Y/Z steps halved to {panel.y_step_v:g} V."
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == ":":
                 sys.stdout.write("\ncmd> ")
                 sys.stdout.flush()
                 line = input()
                 running = panel.execute_command(line)
-                panel.render(refresh=True)
+                redraw(refresh=True)
 
         if running:
             y_delta, z_delta, reason = panel.sample_arrow_delta()
             if y_delta or z_delta:
                 panel.move_delta(y_delta=y_delta, z_delta=z_delta, reason=f"key_state_{reason}")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
-                last_render = time.time()
-            elif time.time() - last_render >= 1.0:
-                panel.render(refresh=True)
-                last_render = time.time()
+                redraw(refresh=True)
+            else:
+                status_signature = panel.status_signature()
+                if status_signature != last_status_signature:
+                    redraw(refresh=False)
+                elif time.time() - last_render >= panel.auto_refresh_s:
+                    redraw(refresh=True)
         time.sleep(panel.sample_interval_s)
 
     if config.return_yz_zero_on_exit and panel.next_action != "start":

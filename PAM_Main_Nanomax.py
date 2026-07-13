@@ -149,6 +149,7 @@ def main():
     PROBE_PREALIGN_ENABLE, PROBE_PREALIGN_Y_STEP_V, PROBE_PREALIGN_Z_STEP_V = env_bool("PAM_PROBE_PREALIGN_ENABLE", True), 1.0, 1.0
     PROBE_PREALIGN_INTERVAL_S, PROBE_PREALIGN_SET_AXIS_MAX = 0.25, True
     PROBE_PREALIGN_REQUIRE_CONTROLLER = False
+    PANEL_AUTO_REFRESH_S = env_float("PAM_PANEL_AUTO_REFRESH_S", 5.0)
 
     # User scan geometry. Ranges are the requested travel from first to last point.
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
@@ -219,6 +220,7 @@ def main():
         bpc303_preflight_timeout_s=BPC303_PREFLIGHT_TIMEOUT_S,
         sample_prealign_enable=SAMPLE_PREALIGN_ENABLE,
         probe_prealign_enable=PROBE_PREALIGN_ENABLE,
+        panel_auto_refresh_s=PANEL_AUTO_REFRESH_S,
         probe_scan_fast_axis=PROBE_SCAN_FAST_AXIS,
         probe_scan_slow_axis=PROBE_SCAN_SLOW_AXIS,
     )
@@ -358,6 +360,7 @@ def main():
                         y_step_um=SAMPLE_PREALIGN_Y_STEP_UM,
                         z_step_um=SAMPLE_PREALIGN_Z_STEP_UM,
                         sample_interval_s=SAMPLE_PREALIGN_INTERVAL_S,
+                        auto_refresh_s=PANEL_AUTO_REFRESH_S,
                     ),
                     probe_stage=probe_stage if (PROBE_PREALIGN_ENABLE and probe_stage is not None) else None,
                     probe_config=ProbePrealignConfig(
@@ -367,6 +370,7 @@ def main():
                         y_step_v=PROBE_PREALIGN_Y_STEP_V,
                         z_step_v=PROBE_PREALIGN_Z_STEP_V,
                         sample_interval_s=PROBE_PREALIGN_INTERVAL_S,
+                        auto_refresh_s=PANEL_AUTO_REFRESH_S,
                         settle_ms=SETTLE_MS,
                         set_axis_max=PROBE_PREALIGN_SET_AXIS_MAX,
                     ),
@@ -401,6 +405,7 @@ def main():
                         "USER_STOP_KEY": USER_STOP_KEY,
                         "SAMPLE_START_ZERO_POLICY": SAMPLE_START_ZERO_POLICY,
                         "SAMPLE_ZERO_XY_AT_END": SAMPLE_ZERO_XY_AT_END,
+                        "PANEL_AUTO_REFRESH_S": PANEL_AUTO_REFRESH_S,
                         "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )
@@ -527,6 +532,7 @@ def main():
                         y_step_v=PROBE_PREALIGN_Y_STEP_V,
                         z_step_v=PROBE_PREALIGN_Z_STEP_V,
                         sample_interval_s=PROBE_PREALIGN_INTERVAL_S,
+                        auto_refresh_s=PANEL_AUTO_REFRESH_S,
                         settle_ms=SETTLE_MS,
                         set_axis_max=PROBE_PREALIGN_SET_AXIS_MAX,
                     ),
@@ -548,6 +554,7 @@ def main():
                         "PROBE_BACKEND": getattr(probe_stage, "_active_backend", PROBE_MDT_BACKEND),
                         "PROBE_DEVICE_ID": probe_stage.device_id,
                         "PROBE_LIMIT_V": probe_stage.limit_voltage,
+                        "PANEL_AUTO_REFRESH_S": PANEL_AUTO_REFRESH_S,
                         "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )

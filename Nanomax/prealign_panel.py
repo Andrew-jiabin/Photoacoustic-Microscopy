@@ -13,6 +13,10 @@ VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
 KEY_ARROW_PREFIXES = ("\x00", "\xe0")
+DEFAULT_AUTO_REFRESH_S = 5.0
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+STD_OUTPUT_HANDLE = -11
+_VT_ENABLED = False
 
 
 @dataclass
@@ -28,6 +32,7 @@ class SamplePrealignConfig:
     y_step_um: float = 0.1
     z_step_um: float = 0.1
     sample_interval_s: float = 0.25
+    auto_refresh_s: float = DEFAULT_AUTO_REFRESH_S
     min_step_um: float = NANOMAX_MANUAL_MIN_STEP_UM
     allow_probe_switch: bool = False
 
@@ -46,12 +51,27 @@ class SamplePrealignResult:
     scan_error: str = ""
 
 
+def enable_virtual_terminal():
+    global _VT_ENABLED
+    if _VT_ENABLED or os.name != "nt" or not sys.stdout.isatty():
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        _VT_ENABLED = True
+    except Exception:
+        _VT_ENABLED = True
+
+
 def clear_screen():
-    if os.name == "nt":
-        os.system("cls")
-    else:
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+    if not sys.stdout.isatty():
+        return
+    enable_virtual_terminal()
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
 
 
 def truncate_line(text):
@@ -118,6 +138,7 @@ class SamplePrealignPanel:
         self.y_step_um = validate_manual_step("ystep", config.y_step_um, config.min_step_um)
         self.z_step_um = validate_manual_step("zstep", config.z_step_um, config.min_step_um)
         self.sample_interval_s = validate_positive("sample_interval_s", config.sample_interval_s)
+        self.auto_refresh_s = validate_positive("auto_refresh_s", config.auto_refresh_s)
         self.message = "Use hotkeys to set the start position, then ':' and 'start' to begin imaging."
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
@@ -127,6 +148,14 @@ class SamplePrealignPanel:
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         return self.last_xyz
+
+    def status_signature(self):
+        daq_status = self.status_provider() if callable(self.status_provider) else {}
+        return (
+            daq_status.get("status", "-"),
+            daq_status.get("step", "-"),
+            daq_status.get("message", ""),
+        )
 
     def clamp_axis(self, axis, value):
         low, high = 0.0, self.travel_um[axis]
@@ -239,6 +268,7 @@ class SamplePrealignPanel:
             ("ystep", f"{self.y_step_um:g}", "set ystep n"),
             ("zstep", f"{self.z_step_um:g}", "set zstep n"),
             ("interval", f"{self.sample_interval_s:g}", "set interval n"),
+            ("refresh", f"{self.auto_refresh_s:g}", "set refresh n"),
             ("SETTLE_MS", f"{self.config.settle_ms:g}", "set SETTLE_MS n"),
         ]
         daq_items = [
@@ -372,6 +402,9 @@ class SamplePrealignPanel:
             elif cmd in ("interval", "dt") and len(tokens) == 2:
                 self.sample_interval_s = validate_positive("interval", tokens[1])
                 self.message = f"interval set to {self.sample_interval_s:g} s."
+            elif cmd in ("refresh", "redraw") and len(tokens) == 2:
+                self.auto_refresh_s = validate_positive("refresh", tokens[1])
+                self.message = f"auto refresh set to {self.auto_refresh_s:g} s."
             elif normalize_scan_variable(cmd) in {"SCAN_RANGE_X_UM", "SCAN_RANGE_Y_UM", "STEP_UM"} and len(tokens) == 2:
                 self.set_scan_variable(cmd, tokens[1])
             else:
@@ -406,6 +439,9 @@ class SamplePrealignPanel:
         elif target in ("interval", "dt") and len(tokens) == 2:
             self.sample_interval_s = validate_positive("interval", tokens[1])
             self.message = f"interval set to {self.sample_interval_s:g} s."
+        elif target in ("refresh", "redraw") and len(tokens) == 2:
+            self.auto_refresh_s = validate_positive("refresh", tokens[1])
+            self.message = f"auto refresh set to {self.auto_refresh_s:g} s."
         elif target == "settle_ms" and len(tokens) == 2:
             self.config.settle_ms = int(validate_positive("SETTLE_MS", tokens[1]))
             self.message = f"SETTLE_MS set to {self.config.settle_ms:g}."
@@ -496,7 +532,9 @@ Commands after ':' then Enter:
   set STEP_UM <um>                   set image pixel step for this run
   set xstep/ystep/zstep <um>         set manual closed-loop move steps
   set x/y/z/xy/xyz ...               set absolute closed-loop position(s) in um
-  set interval <sec>, set SETTLE_MS <ms>
+  set interval <sec>                 hotkey polling interval
+  set refresh <sec>                  automatic screen redraw interval
+  set SETTLE_MS <ms>
   q / quit / cancel                  abort before acquisition
 """.strip()
 
@@ -521,6 +559,14 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
     panel.render(refresh=True)
     drain_keyboard_buffer(msvcrt)
     last_render = time.time()
+    last_status_signature = panel.status_signature()
+
+    def redraw(refresh=True):
+        nonlocal last_render, last_status_signature
+        panel.render(refresh=refresh)
+        last_render = time.time()
+        last_status_signature = panel.status_signature()
+
     running = True
     while running:
         char = read_last_command_key(msvcrt)
@@ -528,39 +574,41 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
             if char in ("q", "Q"):
                 raise KeyboardInterrupt("Prealignment cancelled by user.")
             if char in ("h", "H", "?"):
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char in ("s", "S"):
                 panel.message = "Status refreshed."
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char in ("0", "r", "R"):
                 panel.set_xyz(x=0.0, y=0.0, reason="hotkey_move_xy_to_zero")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == "+":
                 panel.move_delta(z_delta=panel.z_step_um, reason="hotkey_z_plus")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == "-":
                 panel.move_delta(z_delta=-panel.z_step_um, reason="hotkey_z_minus")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
+                redraw(refresh=True)
             elif char == ":":
                 sys.stdout.write("\ncmd> ")
                 sys.stdout.flush()
                 line = input()
                 running = panel.execute_command(line)
-                panel.render(refresh=True)
+                redraw(refresh=True)
 
         if running:
             x_delta, y_delta, reason = panel.sample_arrow_delta()
             if x_delta or y_delta:
                 panel.move_delta(x_delta=x_delta, y_delta=y_delta, reason=f"key_state_{reason}")
                 drain_keyboard_buffer(msvcrt)
-                panel.render(refresh=True)
-                last_render = time.time()
-            elif time.time() - last_render >= 1.0:
-                panel.render(refresh=True)
-                last_render = time.time()
+                redraw(refresh=True)
+            else:
+                status_signature = panel.status_signature()
+                if status_signature != last_status_signature:
+                    redraw(refresh=False)
+                elif time.time() - last_render >= panel.auto_refresh_s:
+                    redraw(refresh=True)
         time.sleep(panel.sample_interval_s)
 
     result = panel.result()
