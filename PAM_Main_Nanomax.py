@@ -8,16 +8,17 @@ import traceback
 import atsapi as ats
 
 from Alazar_imaging.AlazarNPTSystem import AlazarNPTSystem
-from Alazar_imaging.AsyncProgress import progress_manager
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
+from Alazar_imaging.laser_runtime import LaserRunOptions, PamLaserManager
 from Alazar_imaging.MDT693BController import MDT693BController
+from Nanomax.acquisition_panel import AcquisitionDashboard
 from Nanomax.daq_async import BackgroundDaqInit
 from Nanomax.data_io import save_scan_data
 from Nanomax.open_loop_panel import ProbePrealignConfig
 from Nanomax.prealign_panel import SamplePrealignConfig
 from Nanomax.prealignment_workflow import run_nanomax_prealignment
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
-from Nanomax.runtime import find_other_pam_processes, poll_user_stop_request, return_to_start, run_bpc303_preflight, safe_return_to_start
+from Nanomax.runtime import find_other_pam_processes, return_to_start, run_bpc303_preflight, safe_return_to_start
 from Nanomax.scan_utils import (
     NANOMAX_PIEZO_SCAN_LIMIT_UM,
     build_probe_trajectory,
@@ -151,6 +152,20 @@ def main():
     PROBE_PREALIGN_REQUIRE_CONTROLLER = False
     PANEL_AUTO_REFRESH_S = env_float("PAM_PANEL_AUTO_REFRESH_S", 5.0)
 
+    # Laser status/control. Startup is read-only: these options only decide
+    # whether final cleanup sends safe shutdown commands.
+    LASER_OPTIONS = LaserRunOptions(
+        cbox_enabled=env_bool("PAM_532_ENABLE", True),
+        cbox_serial=env_str("PAM_532_FTDI_SERIAL", "BS7VJICA"),
+        cbox_close_at_end=env_bool("PAM_532_CLOSE_AT_END", False),
+        toptica_enabled=env_bool("PAM_TOPTICA_ENABLE", True),
+        toptica_host=env_str("PAM_TOPTICA_HOST", "192.168.1.11"),
+        toptica_port=env_int("PAM_TOPTICA_PORT", 1998),
+        toptica_close_at_end=env_bool("PAM_TOPTICA_CLOSE_AT_END", False),
+    )
+    laser_manager = PamLaserManager(LASER_OPTIONS, log_callback=append_run_log)
+    laser_manager.refresh_status()
+
     # User scan geometry. Ranges are the requested travel from first to last point.
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
     # The script also checks against the BPC303-reported maximum travel before acquisition.
@@ -223,6 +238,12 @@ def main():
         panel_auto_refresh_s=PANEL_AUTO_REFRESH_S,
         probe_scan_fast_axis=PROBE_SCAN_FAST_AXIS,
         probe_scan_slow_axis=PROBE_SCAN_SLOW_AXIS,
+        laser_532_enabled=LASER_OPTIONS.cbox_enabled,
+        laser_532_close_at_end=LASER_OPTIONS.cbox_close_at_end,
+        toptica_enabled=LASER_OPTIONS.toptica_enabled,
+        toptica_host=LASER_OPTIONS.toptica_host,
+        toptica_port=LASER_OPTIONS.toptica_port,
+        toptica_close_at_end=LASER_OPTIONS.toptica_close_at_end,
     )
     other_pam_processes = find_other_pam_processes()
     if other_pam_processes:
@@ -240,7 +261,7 @@ def main():
             mode=BPC303_PREFLIGHT_MODE,
         )
 
-    stage = probe_stage = probe_step_v = daq = daq_init = None
+    stage = probe_stage = probe_step_v = daq = daq_init = acquisition_dashboard = None
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
     prealignment_started_acquisition = False
@@ -378,6 +399,7 @@ def main():
                     log_callback=append_run_log,
                     status_provider=daq_init.snapshot,
                     display_params={
+                        "LASER_MANAGER": laser_manager,
                         "SCAN_TARGET": SCAN_TARGET,
                         "SAMPLE_CONTROLLER": "BPC303",
                         "SAMPLE_STAGE_MODEL": "MAX311D",
@@ -540,6 +562,7 @@ def main():
                     log_callback=append_run_log,
                     status_provider=daq_init.snapshot,
                     display_params={
+                        "LASER_MANAGER": laser_manager,
                         "SCAN_TARGET": SCAN_TARGET,
                         "SAMPLE_CONTROLLER": "BPC303",
                         "SAMPLE_STAGE_MODEL": "MAX311D",
@@ -646,13 +669,59 @@ def main():
             input("Press Enter to START Experiment... (make sure the laser is enabled)")
             append_run_log("USER_START_CONFIRMED", source="enter_prompt")
         progress_desc = "PAM sample closed-loop scan" if SCAN_TARGET == "sample_closed_loop" else "PAM probe open-loop scan"
-        refresh_terminal_for_acquisition()
-        print(f"{progress_desc} starting: {len(trajectory)} points.")
+        laser_manager.refresh_status()
         if USER_STOP_ENABLE:
-            print(f"During acquisition, press '{USER_STOP_KEY}' to stop gracefully after the current point. Enter is optional.")
             append_run_log("USER_STOP_POLLING_ENABLED", stop_key=USER_STOP_KEY)
-
-        progress_manager.start(total=len(trajectory), desc=progress_desc)
+        scan_dashboard_items = [
+            ("SCAN_TARGET", SCAN_TARGET, "frozen"),
+            ("SCAN_PATTERN", SCAN_PATTERN_LABEL, "frozen"),
+            ("SCAN_W", SCAN_W, "frozen"),
+            ("SCAN_H", SCAN_H, "frozen"),
+            ("TOTAL_POINTS", len(trajectory), "frozen"),
+            ("SCAN_RANGE_X_UM", f"{SCAN_RANGE_X_UM:g}", "frozen"),
+            ("SCAN_RANGE_Y_UM", f"{SCAN_RANGE_Y_UM:g}", "frozen"),
+            ("STEP_UM", f"{STEP_UM:g}", "frozen"),
+            ("START_X", f"{float(START_X):.4f}", f"{coordinate_unit}; frozen"),
+            ("START_Y", f"{float(START_Y):.4f}", f"{coordinate_unit}; frozen"),
+            ("START_Z", f"{float(START_Z):.4f}", f"{coordinate_unit}; frozen"),
+            ("SETTLE_MS", SETTLE_MS, "frozen"),
+        ]
+        if SCAN_TARGET == "probe_open_loop":
+            scan_dashboard_items.extend(
+                [
+                    ("PROBE_STEP_V", f"{float(probe_step_v):.6f}", "frozen"),
+                    ("PROBE_SCAN_AXES", f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}", "frozen"),
+                ]
+            )
+        daq_dashboard_items = [
+            ("DELAY", DELAY, "frozen"),
+            ("SAMPLE_RATE", SAMPLE_RATE, "frozen"),
+            ("SAMPLES_REC", SAMPLES_REC, "frozen"),
+            ("RECORDS_PER_POINT", RECORDS_PER_POINT, "frozen"),
+            ("BUFFER_COUNT", BUFFER_COUNT, "frozen"),
+            ("AVERAGE_ENABLE", AVERAGE_ENABLE, "frozen"),
+            ("ACQ_TIMEOUT_MS", ACQ_TIMEOUT_MS, "frozen"),
+        ]
+        runtime_dashboard_items = [
+            ("POINT_LOG_INTERVAL", POINT_LOG_INTERVAL, "frozen"),
+            ("USER_STOP_ENABLE", USER_STOP_ENABLE, "frozen"),
+            ("USER_STOP_KEY", USER_STOP_KEY, "frozen"),
+            ("SAMPLE_START_ZERO_POLICY", SAMPLE_START_ZERO_POLICY, "frozen"),
+            ("SAMPLE_RETURN_XY_TO_ZERO_AT_END", SAMPLE_RETURN_XY_TO_ZERO_AT_END, "frozen"),
+            ("SAMPLE_ZERO_XY_AT_END", SAMPLE_ZERO_XY_AT_END, "frozen"),
+        ]
+        refresh_terminal_for_acquisition()
+        acquisition_dashboard = AcquisitionDashboard(
+            desc=progress_desc,
+            total=len(trajectory),
+            laser_manager=laser_manager,
+            stop_key=USER_STOP_KEY,
+            scan_items=scan_dashboard_items,
+            daq_items=daq_dashboard_items,
+            runtime_items=runtime_dashboard_items,
+            log_callback=append_run_log,
+        )
+        acquisition_dashboard.start()
         append_run_log("ACQUISITION_START", points=len(trajectory), desc=progress_desc)
 
         if SCAN_TARGET == "sample_closed_loop":
@@ -675,8 +744,12 @@ def main():
                         x_um=f"{tx:.4f}",
                         y_um=f"{ty:.4f}",
                     )
-                progress_manager.update(1)
-                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY, notify=progress_manager.write):
+                if acquisition_dashboard is not None:
+                    acquisition_dashboard.update(
+                        acquired_points,
+                        current_position=f"X={tx:.4f} um, Y={ty:.4f} um",
+                    )
+                if USER_STOP_ENABLE and acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
@@ -707,8 +780,12 @@ def main():
                         y_v=f"{vy:.4f}",
                         z_v=f"{vz:.4f}",
                     )
-                progress_manager.update(1)
-                if poll_user_stop_request(USER_STOP_ENABLE, USER_STOP_KEY, notify=progress_manager.write):
+                if acquisition_dashboard is not None:
+                    acquisition_dashboard.update(
+                        acquired_points,
+                        current_position=f"X={vx:.4f} V, Y={vy:.4f} V, Z={vz:.4f} V",
+                    )
+                if USER_STOP_ENABLE and acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
@@ -720,7 +797,9 @@ def main():
                         z_v=f"{vz:.4f}",
                     )
                     break
-        progress_manager.stop()
+        if acquisition_dashboard is not None:
+            acquisition_dashboard.update(acquired_points, message="Acquisition loop finished; returning stages.")
+            acquisition_dashboard.close()
         end_reason = "user_stop" if user_stop_requested else "completed"
         append_run_log(
             "ACQUISITION_DONE",
@@ -801,8 +880,10 @@ def main():
                     append_run_log("DAQ_INIT_CLEANUP_JOIN_ERROR", error=repr(exc))
             if daq is not None:
                 daq.stop_capture()
-            progress_manager.set_colour("green")
-            progress_manager.stop()
+            if acquisition_dashboard is not None:
+                acquisition_dashboard.close()
+            for laser_message in laser_manager.finalize_close_at_end():
+                print(laser_message)
             if probe_stage is not None:
                 probe_stage.close()
             if stage is not None:

@@ -35,6 +35,8 @@ class BPC303NativeController:
         axis_map=None,
         polling_ms=200,
         startup_delay_s=0.25,
+        device_list_retries=3,
+        device_list_retry_s=0.75,
         enable_channels=True,
         force_closed_loop=True,
         safe_max_output_voltage=75.0,
@@ -48,6 +50,8 @@ class BPC303NativeController:
         self.axis_map = axis_map or {"x": 1, "y": 2, "z": 3}
         self.polling_ms = int(polling_ms)
         self.startup_delay_s = float(startup_delay_s)
+        self.device_list_retries = max(1, int(device_list_retries))
+        self.device_list_retry_s = max(0.0, float(device_list_retry_s))
         self.enable_channels = bool(enable_channels)
         self.force_closed_loop = bool(force_closed_loop)
         self.safe_max_output_voltage = float(safe_max_output_voltage)
@@ -91,6 +95,11 @@ class BPC303NativeController:
 
     def _bind_functions(self):
         self._TLI_BuildDeviceList = self._bind("TLI_BuildDeviceList", c_short, [])
+        self._TLI_GetDeviceListExt = self._bind(
+            "TLI_GetDeviceListExt",
+            c_short,
+            [ctypes.c_char_p, ctypes.c_ulong],
+        )
         self._TLI_GetDeviceListByTypeExt = self._bind(
             "TLI_GetDeviceListByTypeExt",
             c_short,
@@ -153,6 +162,13 @@ class BPC303NativeController:
         raw = buffer.value.decode("ascii", errors="replace")
         return [item for item in raw.split(",") if item]
 
+    def _device_list_all(self):
+        buffer = create_string_buffer(4096)
+        ret = self._TLI_GetDeviceListExt(buffer, 4096)
+        self._check_result(ret, "TLI_GetDeviceListExt")
+        raw = buffer.value.decode("ascii", errors="replace")
+        return [item for item in raw.split(",") if item]
+
     def connect(self):
         self._log("BPC_CONNECT_LOAD_LIBRARY_BEGIN", serial=self.serial_no)
         self._load_library()
@@ -163,16 +179,40 @@ class BPC303NativeController:
         self._log("BPC_CONNECT_BUILD_DEVICE_LIST_DONE", serial=self.serial_no, result=ret)
         self._check_result(ret, "TLI_BuildDeviceList")
 
-        self._log("BPC_CONNECT_ENUMERATE_BEGIN", serial=self.serial_no, device_type=self.DEVICE_TYPE_ID_71)
-        serials = self._device_list_by_type(self.DEVICE_TYPE_ID_71)
-        self._log(
-            "BPC_CONNECT_ENUMERATE_DONE",
-            serial=self.serial_no,
-            device_type=self.DEVICE_TYPE_ID_71,
-            serials=",".join(serials) if serials else "[]",
-        )
+        serials = []
+        all_serials = []
+        for attempt in range(1, self.device_list_retries + 1):
+            self._log(
+                "BPC_CONNECT_ENUMERATE_BEGIN",
+                serial=self.serial_no,
+                device_type=self.DEVICE_TYPE_ID_71,
+                attempt=attempt,
+            )
+            serials = self._device_list_by_type(self.DEVICE_TYPE_ID_71)
+            try:
+                all_serials = self._device_list_all()
+            except Exception:
+                all_serials = []
+            self._log(
+                "BPC_CONNECT_ENUMERATE_DONE",
+                serial=self.serial_no,
+                device_type=self.DEVICE_TYPE_ID_71,
+                attempt=attempt,
+                serials=",".join(serials) if serials else "[]",
+                all_serials=",".join(all_serials) if all_serials else "[]",
+            )
+            if self.serial_no in serials:
+                break
+            if attempt < self.device_list_retries and self.device_list_retry_s > 0:
+                time.sleep(self.device_list_retry_s)
+                self._TLI_BuildDeviceList()
         if self.serial_no not in serials:
-            raise RuntimeError(f"BPC303 serial {self.serial_no} not found in type 71 device list: {serials}")
+            raise RuntimeError(
+                f"BPC303 serial {self.serial_no} not found in type 71 device list after "
+                f"{self.device_list_retries} attempt(s): {serials}; all Kinesis serials={all_serials}. "
+                "If Windows Device Manager shows APT USB Device with this serial, unplug/replug the BPC303 "
+                "or wait a few seconds and restart PAM_Main_Nanomax.py."
+            )
 
         self._log("BPC_CONNECT_OPEN_BEGIN", serial=self.serial_no)
         ret = self._PBC_Open(self.serial_bytes)

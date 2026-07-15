@@ -30,6 +30,7 @@ FG_DIM = rgb(128, 136, 145)
 FG_SECTION = rgb(112, 191, 206)
 FG_LABEL = rgb(142, 201, 120)
 FG_VALUE = rgb(226, 156, 138)
+FG_FROZEN_VALUE = rgb(150, 186, 232)
 FG_GOOD = rgb(122, 214, 152)
 FG_WARN = rgb(224, 192, 104)
 FG_BAD = rgb(228, 124, 108)
@@ -54,9 +55,10 @@ KEYWORD_STYLES = {
     "FAILED": (BOLD, FG_BAD),
     "FAIL": (BOLD, FG_BAD),
     "OUT": (BOLD, FG_BAD),
+    "FROZEN": (BOLD, FG_FROZEN_VALUE),
 }
 KEYWORD_RE = re.compile(
-    r"\b(OK|YES|READY|CONNECTED|NORMAL|COMPLETED|TRUE|WAIT|WARNING|WARN|DISABLED|UNAVAILABLE|NO|BLOCKED|ERROR|FAILED|FAIL|OUT)\b",
+    r"\b(OK|YES|READY|CONNECTED|NORMAL|COMPLETED|TRUE|WAIT|WARNING|WARN|DISABLED|UNAVAILABLE|NO|BLOCKED|ERROR|FAILED|FAIL|OUT|FROZEN)\b",
     flags=re.IGNORECASE,
 )
 
@@ -119,20 +121,21 @@ def _highlight_keys(line):
     )
 
 
-def _style_value(text):
+def _style_value(text, frozen=False):
     parts = []
     start = 0
+    value_style = FG_FROZEN_VALUE if frozen else FG_VALUE
     for match in KEYWORD_RE.finditer(text):
         prefix = text[start:match.start()]
         if prefix:
-            parts.append(colorize(prefix, FG_VALUE))
+            parts.append(colorize(prefix, value_style))
         style = KEYWORD_STYLES.get(match.group(0).upper())
         parts.append(colorize(match.group(0), *style))
         start = match.end()
     suffix = text[start:]
     if suffix:
-        parts.append(colorize(suffix, FG_VALUE))
-    return "".join(parts) if parts else colorize(text, FG_VALUE)
+        parts.append(colorize(suffix, value_style))
+    return "".join(parts) if parts else colorize(text, value_style)
 
 
 def _style_command_segment(text):
@@ -160,7 +163,8 @@ def _style_assignment_cells(line):
             styled.append(token)
             continue
         key, value = token.split("=", 1)
-        styled.append(colorize(key, BOLD, FG_LABEL) + "=" + _style_value(value))
+        frozen = "frozen" in token.lower()
+        styled.append(colorize(key, BOLD, FG_LABEL) + "=" + _style_value(value, frozen=frozen))
     return "".join(styled)
 
 

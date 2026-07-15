@@ -113,6 +113,7 @@ class SamplePrealignPanel:
         self.ready_to_start = False
         self.next_action = "start"
         self.renderer = TerminalPanelRenderer()
+        self.laser_manager = self.display_params.get("LASER_MANAGER")
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -125,6 +126,11 @@ class SamplePrealignPanel:
             daq_status.get("step", "-"),
             daq_status.get("message", ""),
         )
+
+    def refresh_lasers(self):
+        if self.laser_manager is None:
+            return
+        self.laser_manager.refresh_status()
 
     def clamp_axis(self, axis, value):
         low, high = 0.0, self.travel_um[axis]
@@ -259,6 +265,9 @@ class SamplePrealignPanel:
             ("SAMPLE_START_ZERO_POLICY", self.display_params.get("SAMPLE_START_ZERO_POLICY", "-"), "read-only"),
             ("SAMPLE_ZERO_XY_AT_END", self.display_params.get("SAMPLE_ZERO_XY_AT_END", "-"), "read-only"),
         ]
+        laser_items = []
+        if self.laser_manager is not None:
+            laser_items = self.laser_manager.panel_items(acquisition=False)
         start_items = [
             ("START_ALLOWED", "YES" if start_allowed else "NO", "command=:start/:run/:pam"),
             ("SCAN_CHECK", "OK" if scan_ok else "BLOCKED", scan.get("error", "")),
@@ -275,6 +284,8 @@ class SamplePrealignPanel:
             lines.append(f"Travel/step check: OUT OF RANGE - {scan.get('error')}")
             lines.append("Use ':' commands to change SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, or move the start position.")
         lines += section_lines("Motion / Hotkey Parameters", motion_items)
+        if laser_items:
+            lines += section_lines("Lasers", laser_items)
         lines += section_lines("DAQ Background Init", daq_items)
         lines += section_lines("Start Gate", start_items)
         lines.append(f"Start prompt: {start_hint}")
@@ -329,6 +340,11 @@ class SamplePrealignPanel:
             return True
         cmd = tokens[0].lower()
         try:
+            if self.laser_manager is not None:
+                laser_message = self.laser_manager.execute_prealign_command(tokens)
+                if laser_message is not None:
+                    self.message = laser_message
+                    return True
             if cmd in ("q", "quit", "exit", "cancel"):
                 raise KeyboardInterrupt("Prealignment cancelled by user.")
             if cmd in ("start", "run", "pam", "image", "scan"):
@@ -352,6 +368,7 @@ class SamplePrealignPanel:
                 self.message = "Help refreshed."
             elif cmd in ("s", "status"):
                 self.refresh()
+                self.refresh_lasers()
                 self.message = "Status refreshed."
             elif cmd in ("0", "zero", "home"):
                 self.set_xyz(x=0.0, y=0.0, reason="command_move_xy_to_zero")
@@ -494,6 +511,12 @@ Commands after ':' then Enter:
   set interval <sec>                 hotkey polling interval
   set refresh <sec>                  automatic screen redraw interval
   set SETTLE_MS <ms>
+  laser refresh                      read 532/TOPTICA status only
+  532 emission on/off                explicitly change CBOX emission
+  532 trigger ext/int                explicitly change CBOX trigger source
+  532 close-at-end on/off            choose whether final cleanup closes 532 emission
+  toptica cc/pc/external/scan on/off explicitly change TOPTICA controls
+  toptica close-at-end on/off        choose whether final cleanup runs TOPTICA safe off
   q / quit / cancel                  abort before acquisition
 """.strip()
 
@@ -536,6 +559,7 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
             if char in ("h", "H", "?"):
                 redraw(refresh=True)
             elif char in ("s", "S"):
+                panel.refresh_lasers()
                 panel.message = "Status refreshed."
                 redraw(refresh=True)
             elif char in ("0", "r", "R"):
