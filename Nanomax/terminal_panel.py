@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import textwrap
 
 
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
@@ -24,16 +25,16 @@ def bg_rgb(r, g, b):
     return f"\033[48;2;{int(r)};{int(g)};{int(b)}m"
 
 
-FG_TEXT = rgb(232, 236, 241)
-FG_DIM = rgb(136, 145, 155)
-FG_SECTION = rgb(96, 196, 255)
-FG_LABEL = rgb(120, 224, 142)
-FG_VALUE = rgb(242, 134, 124)
-FG_GOOD = rgb(124, 234, 150)
-FG_WARN = rgb(255, 210, 92)
-FG_BAD = rgb(255, 118, 118)
-FG_MUTED = rgb(180, 186, 194)
-BG_HEADER = bg_rgb(33, 94, 164)
+FG_TEXT = rgb(226, 229, 233)
+FG_DIM = rgb(128, 136, 145)
+FG_SECTION = rgb(112, 191, 206)
+FG_LABEL = rgb(142, 201, 120)
+FG_VALUE = rgb(226, 156, 138)
+FG_GOOD = rgb(122, 214, 152)
+FG_WARN = rgb(224, 192, 104)
+FG_BAD = rgb(228, 124, 108)
+FG_MUTED = rgb(170, 177, 185)
+BG_HEADER = bg_rgb(43, 53, 66)
 KEYWORD_STYLES = {
     "OK": (BOLD, FG_GOOD),
     "YES": (BOLD, FG_GOOD),
@@ -139,11 +140,11 @@ def _style_command_segment(text):
         token = match.group(0)
         if token.startswith("<") and token.endswith(">"):
             return colorize(token, BOLD, FG_WARN)
-        if token in {"/", "|", ":", "->", "=>", "+=", "-="}:
-            return colorize(token, FG_MUTED)
+        if token in {"/", "|", ":", "->", "=>", "+=", "-=", "...", ","}:
+            return colorize(token, DIM, FG_LABEL)
         return colorize(token, BOLD, FG_LABEL)
 
-    return re.sub(r"<[^>]+>|/|\||:|->|=>|\+=|-=|[A-Za-z0-9_./+-]+", replace, text)
+    return re.sub(r"<[^>]+>|/|\||:|->|=>|\+=|-=|\.{3}|,|[A-Za-z0-9_./+-]+", replace, text)
 
 
 def _style_assignment_cells(line):
@@ -185,6 +186,95 @@ def _style_indented_line(line):
         else:
             styled.append(colorize(piece, FG_TEXT))
     return "".join(styled)
+
+
+def _wrap_cell_text(text, width):
+    width = max(12, int(width))
+    chunks = textwrap.wrap(
+        str(text),
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if not chunks:
+        return [""]
+    wrapped = []
+    for chunk in chunks:
+        if len(chunk) <= width:
+            wrapped.append(chunk)
+        else:
+            wrapped.extend(
+                textwrap.wrap(
+                    chunk,
+                    width=width,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+            )
+    return wrapped or [""]
+
+
+def _wrap_plain_line(text, width):
+    text = str(text)
+    if len(text) <= width:
+        return [text]
+    wrap_prefixes = (
+        "Message:",
+        "Start prompt:",
+        "Trajectory:",
+        "Travel check:",
+        "Travel/step check:",
+        "DAQ message:",
+        "DAQ timings:",
+    )
+    for prefix in wrap_prefixes:
+        if text.startswith(prefix):
+            body = text[len(prefix):].lstrip()
+            usable = max(12, width - len(prefix) - 1)
+            chunks = _wrap_cell_text(body, usable)
+            lines = [f"{prefix} {chunks[0]}"]
+            lines.extend("  " + chunk for chunk in chunks[1:])
+            return lines
+    if not text.startswith("  "):
+        return [truncate_line(text, width + 1)]
+    match = re.match(r"(\s*)(.*)", text)
+    indent, body = match.groups()
+    usable = max(12, width - len(indent))
+    lines = _wrap_cell_text(body, usable)
+    return [indent + line for line in lines]
+
+
+def format_section_lines(title, items, width=None):
+    rows = [f"[{title}]"]
+    width = terminal_width() if width is None else max(80, int(width))
+    available = max(40, width - 3)
+    gap = "  "
+    texts = []
+    for name, value, hint in items:
+        text = f"{name}={value}"
+        if hint:
+            text = f"{text} ({hint})"
+        texts.append(text)
+
+    columns = 3 if width >= 120 else 2 if width >= 92 else 1
+    while columns > 1:
+        cell_width = (available - (columns - 1) * len(gap)) // columns
+        if max(len(text) for text in texts) <= cell_width:
+            break
+        columns -= 1
+    cell_width = max(24, min(64, (available - (columns - 1) * len(gap)) // columns))
+    wrapped_cells = [_wrap_cell_text(text, cell_width) for text in texts]
+
+    for index in range(0, len(wrapped_cells), columns):
+        group = wrapped_cells[index:index + columns]
+        height = max(len(cell) for cell in group)
+        for row_index in range(height):
+            pieces = []
+            for cell in group:
+                piece = cell[row_index] if row_index < len(cell) else ""
+                pieces.append(piece.ljust(cell_width))
+            rows.append("  " + gap.join(pieces).rstrip())
+    return rows
 
 
 class TerminalPanelRenderer:
@@ -236,7 +326,9 @@ class TerminalPanelRenderer:
         for line in lines:
             parts = str(line).splitlines() or [""]
             expanded.extend(parts)
-        normalized = [truncate_line(line, width) for line in expanded]
+        normalized = []
+        for line in expanded:
+            normalized.extend(_wrap_plain_line(line, width - 1))
         if not sys.stdout.isatty():
             print("\n".join(normalized), flush=True)
             return

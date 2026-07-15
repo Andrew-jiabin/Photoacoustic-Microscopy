@@ -1,12 +1,11 @@
 import ctypes
 import os
-import shutil
 import sys
 import time
 from dataclasses import dataclass
 
 from Nanomax.scan_utils import NANOMAX_MANUAL_MIN_STEP_UM, scan_shape_from_range
-from Nanomax.terminal_panel import TerminalPanelRenderer, terminal_width
+from Nanomax.terminal_panel import TerminalPanelRenderer, format_section_lines, terminal_width
 
 
 VK_LEFT = 0x25
@@ -47,12 +46,6 @@ class SamplePrealignResult:
     next_action: str = "start"
     scan_ok: bool = True
     scan_error: str = ""
-
-
-def truncate_line(text):
-    width = max(80, shutil.get_terminal_size((120, 30)).columns - 1)
-    return text if len(text) <= width else text[: width - 3] + "..."
-
 
 def validate_positive(name, value):
     value = float(value)
@@ -477,19 +470,7 @@ def normalize_scan_variable(text):
 
 
 def section_lines(title, items):
-    rows = [f"[{title}]"]
-    width = max(80, shutil.get_terminal_size((120, 30)).columns - 1)
-    columns = 2 if width < 115 else 3
-    cell_width = max(28, min(42, (width - 4) // columns))
-    cells = []
-    for name, value, hint in items:
-        text = f"{name}={value}"
-        if hint:
-            text = f"{text} ({hint})"
-        cells.append(text[: cell_width - 1].ljust(cell_width))
-    for index in range(0, len(cells), columns):
-        rows.append("  " + " ".join(cells[index:index + columns]).rstrip())
-    return rows
+    return format_section_lines(title, items)
 
 
 HELP_TEXT = """
