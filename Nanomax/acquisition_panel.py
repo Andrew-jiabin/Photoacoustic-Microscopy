@@ -39,6 +39,7 @@ class AcquisitionDashboard:
         total: int,
         laser_manager,
         stop_key: str = "q",
+        stop_enabled: bool = True,
         scan_items=None,
         daq_items=None,
         runtime_items=None,
@@ -48,6 +49,7 @@ class AcquisitionDashboard:
         self.total = int(total)
         self.laser_manager = laser_manager
         self.stop_key = str(stop_key or "q").lower()
+        self.stop_enabled = bool(stop_enabled)
         self.scan_items = list(scan_items or [])
         self.daq_items = list(daq_items or [])
         self.runtime_items = list(runtime_items or [])
@@ -81,18 +83,23 @@ class AcquisitionDashboard:
     def poll_commands(self) -> bool:
         if self._msvcrt is None:
             return False
+        changed = False
         try:
             while self._msvcrt.kbhit():
                 ch = self._msvcrt.getwch()
+                changed = True
                 if ch in ("\x00", "\xe0"):
                     if self._msvcrt.kbhit():
                         self._msvcrt.getwch()
                     continue
                 if not self.state.command_mode:
                     if ch.lower() == self.stop_key:
-                        self.state.stop_requested = True
-                        self.state.message = f"Graceful stop requested by '{self.stop_key}'. Current point will finish first."
-                        self.log("ACQUISITION_PANEL_STOP_REQUESTED", stop_key=self.stop_key)
+                        if self.stop_enabled:
+                            self.state.stop_requested = True
+                            self.state.message = f"Graceful stop requested by '{self.stop_key}'. Current point will finish first."
+                            self.log("ACQUISITION_PANEL_STOP_REQUESTED", stop_key=self.stop_key)
+                        else:
+                            self.state.message = f"Stop key '{self.stop_key}' is disabled; use ':' laser commands only."
                     elif ch == ":":
                         self.state.command_mode = True
                         self.state.command_buffer = ""
@@ -113,7 +120,9 @@ class AcquisitionDashboard:
         except Exception as exc:
             self.state.message = f"Command input error: {exc}"
             self.log("ACQUISITION_PANEL_INPUT_ERROR", error=repr(exc))
-        self.render()
+            changed = True
+        if changed:
+            self.render()
         return self.state.stop_requested
 
     def _execute_command(self, line: str):
@@ -145,7 +154,8 @@ class AcquisitionDashboard:
     def _command_line(self):
         if self.state.command_mode:
             return f"Command: :{self.state.command_buffer}"
-        return "Command: press ':' for laser close-at-end commands; press q for graceful stop."
+        stop_hint = f"press {self.stop_key} for graceful stop" if self.stop_enabled else "graceful stop key disabled"
+        return f"Command: press ':' for laser close-at-end commands; {stop_hint}."
 
     def render(self):
         separator = "=" * min(terminal_width() - 1, 118)

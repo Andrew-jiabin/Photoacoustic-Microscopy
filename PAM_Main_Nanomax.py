@@ -716,6 +716,7 @@ def main():
             total=len(trajectory),
             laser_manager=laser_manager,
             stop_key=USER_STOP_KEY,
+            stop_enabled=USER_STOP_ENABLE,
             scan_items=scan_dashboard_items,
             daq_items=daq_dashboard_items,
             runtime_items=runtime_dashboard_items,
@@ -749,7 +750,7 @@ def main():
                         acquired_points,
                         current_position=f"X={tx:.4f} um, Y={ty:.4f} um",
                     )
-                if USER_STOP_ENABLE and acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
+                if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
@@ -785,7 +786,7 @@ def main():
                         acquired_points,
                         current_position=f"X={vx:.4f} V, Y={vy:.4f} V, Z={vz:.4f} V",
                     )
-                if USER_STOP_ENABLE and acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
+                if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
                     user_stop_requested = True
                     append_run_log(
                         "ACQUISITION_USER_STOP_AFTER_POINT",
