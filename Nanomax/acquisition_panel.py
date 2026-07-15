@@ -166,7 +166,9 @@ class AcquisitionDashboard:
             self._progress_line(),
             self._command_line(),
             f"Current point: {self.state.current_position}",
-            "Allowed during acquisition: :532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh, q",
+            "Allowed during acquisition: "
+            f":532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh"
+            f"{', ' + self.stop_key if self.stop_enabled else ''}",
         ]
         lines += format_section_lines("Lasers", self.laser_manager.panel_items(acquisition=True))
         lines += format_section_lines("Frozen Scan Parameters", self.scan_items)
