@@ -66,6 +66,15 @@ def env_str(name, default):
     return default if value is None else value
 
 
+# Operator-editable defaults. Environment variables with the same names still
+# override these values at runtime, but these are the script-level knobs to edit
+# when the lab wants a different default behavior.
+DEFAULT_532_CLOSE_AT_END = False
+DEFAULT_TOPTICA_CLOSE_AT_END = False
+# False returns to the prealignment-selected scan start; True returns X/Y to 0 um.
+DEFAULT_SAMPLE_RETURN_XY_TO_ZERO_AT_END = False
+
+
 def main():
     # These startup decisions must be available before writing RUN_START or
     # explaining whether a sample zero-datum rebuild will be attempted.
@@ -104,7 +113,7 @@ def main():
         append_run_log("START_ZERO_SKIPPED_FOR_TARGET", scan_target=SCAN_TARGET)
     elif SAMPLE_ZERO_XY_AT_START:
         print(
-            "\nPrevious PAM run did not leave a trusted normal-cleanup + low-end X/Y zero-datum marker; "
+            "\nPrevious PAM run did not leave a trusted normal-cleanup + X/Y return/datum marker; "
             f"status={previous_run['status']}, run_id={previous_run['run_id']}, reason={previous_run['zero_reason']}. "
             f"Startup X/Y zero will be rebuilt (policy={SAMPLE_START_ZERO_POLICY})."
         )
@@ -118,7 +127,7 @@ def main():
         append_run_log("START_ZERO_SKIPPED_BY_POLICY", previous_line=previous_run["line"])
     else:
         print(
-            "\nPrevious PAM run completed normal cleanup and left a trusted low-end X/Y datum marker; "
+            "\nPrevious PAM run completed normal cleanup and left a trusted X/Y return/datum marker; "
             f"status={previous_run['status']}, run_id={previous_run['run_id']}. "
             "Auto start-zero can be skipped."
         )
@@ -157,11 +166,11 @@ def main():
     LASER_OPTIONS = LaserRunOptions(
         cbox_enabled=env_bool("PAM_532_ENABLE", True),
         cbox_serial=env_str("PAM_532_FTDI_SERIAL", "BS7VJICA"),
-        cbox_close_at_end=env_bool("PAM_532_CLOSE_AT_END", False),
+        cbox_close_at_end=env_bool("PAM_532_CLOSE_AT_END", DEFAULT_532_CLOSE_AT_END),
         toptica_enabled=env_bool("PAM_TOPTICA_ENABLE", True),
         toptica_host=env_str("PAM_TOPTICA_HOST", "192.168.1.11"),
         toptica_port=env_int("PAM_TOPTICA_PORT", 1998),
-        toptica_close_at_end=env_bool("PAM_TOPTICA_CLOSE_AT_END", False),
+        toptica_close_at_end=env_bool("PAM_TOPTICA_CLOSE_AT_END", DEFAULT_TOPTICA_CLOSE_AT_END),
     )
     laser_manager = PamLaserManager(LASER_OPTIONS, log_callback=append_run_log)
     laser_manager.refresh_status()
@@ -184,7 +193,11 @@ def main():
     # Z is intentionally excluded by default to avoid changing focus/clearance.
     SAMPLE_ZERO_AXES = ("x", "y")
     SAMPLE_LOW_END_RESIDUAL_TOLERANCE_UM = 0.01
-    SAMPLE_RETURN_XY_TO_ZERO_AT_END = env_bool("PAM_SAMPLE_RETURN_XY_TO_ZERO_AT_END", True)
+    # False returns to the prealignment-selected start. Set True to return to 0,0.
+    SAMPLE_RETURN_XY_TO_ZERO_AT_END = env_bool(
+        "PAM_SAMPLE_RETURN_XY_TO_ZERO_AT_END",
+        DEFAULT_SAMPLE_RETURN_XY_TO_ZERO_AT_END,
+    )
     # False avoids a ~45-60 s BPC303 SetZero cycle at every normal end.
     # Set True only when you explicitly want the controller outputs forced to 0 V after each run.
     SAMPLE_ZERO_XY_AT_END = False
@@ -224,6 +237,7 @@ def main():
         scan_pattern=SCAN_PATTERN_LABEL,
         sample_start_zero_policy=SAMPLE_START_ZERO_POLICY,
         sample_zero_at_start=SAMPLE_ZERO_XY_AT_START,
+        sample_return_xy_to_zero_at_end=SAMPLE_RETURN_XY_TO_ZERO_AT_END,
         sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
         sample_zero_at_end=SAMPLE_ZERO_XY_AT_END,
         sample_low_end_residual_tolerance_um=SAMPLE_LOW_END_RESIDUAL_TOLERANCE_UM,
@@ -472,6 +486,7 @@ def main():
                 scan_pattern=SCAN_PATTERN_LABEL,
                 sample_start_zero_policy=SAMPLE_START_ZERO_POLICY,
                 sample_zero_at_start=SAMPLE_ZERO_XY_AT_START,
+                sample_return_xy_to_zero_at_end=SAMPLE_RETURN_XY_TO_ZERO_AT_END,
                 sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
                 sample_zero_at_end=SAMPLE_ZERO_XY_AT_END,
                 sample_prealign_enable=SAMPLE_PREALIGN_ENABLE,

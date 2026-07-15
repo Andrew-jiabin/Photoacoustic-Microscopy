@@ -223,6 +223,7 @@ def return_to_start(
     sample_zero_axes=("x", "y"),
 ):
     if scan_target == "sample_closed_loop" and stage is not None:
+        return_target = "low_end_zero" if sample_return_xy_to_zero else "prealign_start"
         if sample_return_xy_to_zero:
             target_x, target_y = 0.0, 0.0
         elif start_x is not None and start_y is not None:
@@ -233,14 +234,21 @@ def return_to_start(
         append_run_log(
             "RETURN_TO_START_BEGIN",
             scan_target=scan_target,
+            return_target=return_target,
             target_x_um=f"{target_x:.4f}",
             target_y_um=f"{target_y:.4f}",
             zero_after_return=sample_zero_xy_after_return,
         )
-        print(f"Returning sample X/Y to low-end target: X={target_x:.4f} um, Y={target_y:.4f} um.")
+        print(f"Returning sample X/Y to {return_target}: X={target_x:.4f} um, Y={target_y:.4f} um.")
         stage.set_position([target_x, target_y])
         stage.wait_until_settled(target_x, target_y, settle_time_ms=settle_ms)
-        append_run_log("RETURN_TO_START_DONE", scan_target=scan_target, target_x_um=f"{target_x:.4f}", target_y_um=f"{target_y:.4f}")
+        append_run_log(
+            "RETURN_TO_START_DONE",
+            scan_target=scan_target,
+            return_target=return_target,
+            target_x_um=f"{target_x:.4f}",
+            target_y_um=f"{target_y:.4f}",
+        )
         if sample_zero_xy_after_return:
             append_run_log("ZERO_DATUM_REBUILD_BEGIN", axes=",".join(sample_zero_axes), reason="return_to_start")
             print("Zeroing sample X/Y after return: output goes to 0 V and the datum is rebuilt.")
@@ -251,6 +259,12 @@ def return_to_start(
                 "ZERO_DATUM_TRUSTED_AFTER_LOW_END_RETURN",
                 axes=",".join(sample_zero_axes),
                 reason="return_to_start_without_rebuild",
+            )
+        else:
+            append_run_log(
+                "POSITION_TRUSTED_AFTER_START_RETURN",
+                axes=",".join(sample_zero_axes),
+                reason="return_to_prealign_start_without_zero_rebuild",
             )
     elif (
         scan_target == "probe_open_loop"

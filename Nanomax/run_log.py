@@ -83,6 +83,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         "terminal_line": "",
                         "zero_line": "",
                         "trusted_zero_line": "",
+                        "trusted_start_line": "",
                         "final_line": "",
                         "return_failed_line": "",
                         "final_error_line": "",
@@ -98,6 +99,8 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         current_run["zero_line"] = raw_line.strip()
                     elif event == "ZERO_DATUM_TRUSTED_AFTER_LOW_END_RETURN":
                         current_run["trusted_zero_line"] = raw_line.strip()
+                    elif event == "POSITION_TRUSTED_AFTER_START_RETURN":
+                        current_run["trusted_start_line"] = raw_line.strip()
                     elif event == "FINAL_CLEANUP_DONE":
                         current_run["final_line"] = raw_line.strip()
                     elif event == "RETURN_TO_START_FAILED":
@@ -140,7 +143,11 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "RUN_END_INTERRUPTED": "interrupted",
         "RUN_END_ERROR": "error",
     }.get(event, "unfinished_or_abnormal")
-    zero_datum_ready = bool(current_run["zero_line"] or current_run["trusted_zero_line"])
+    zero_datum_ready = bool(
+        current_run["zero_line"]
+        or current_run["trusted_zero_line"]
+        or current_run["trusted_start_line"]
+    )
     final_cleanup_done = bool(current_run["final_line"])
     if current_run["return_failed_line"]:
         need_start_zero = True
@@ -162,7 +169,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         zero_reason = f"{status}_requires_rebuild"
     elif not zero_datum_ready:
         need_start_zero = True
-        zero_reason = "normal_without_low_end_zero_rebuild"
+        zero_reason = "normal_without_trusted_xy_return"
     elif not final_cleanup_done:
         need_start_zero = True
         zero_reason = "normal_without_final_cleanup_done"
@@ -170,8 +177,15 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         need_start_zero = False
         if current_run["zero_line"]:
             zero_reason = "normal_low_end_zero_rebuilt"
-        else:
+        elif current_run["trusted_zero_line"]:
             zero_reason = "normal_low_end_returned_existing_datum_trusted"
+        else:
+            zero_reason = "normal_returned_to_prealign_start_trusted"
+    trusted_return_line = (
+        current_run["zero_line"]
+        or current_run["trusted_zero_line"]
+        or current_run["trusted_start_line"]
+    )
     return {
         "status": status,
         "run_id": current_run["run_id"],
@@ -181,7 +195,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "final_cleanup_done": final_cleanup_done,
         "need_start_zero": need_start_zero,
         "zero_reason": zero_reason,
-        "zero_line": current_run["zero_line"] or current_run["trusted_zero_line"],
+        "zero_line": trusted_return_line,
         "final_line": current_run["final_line"],
     }
 
