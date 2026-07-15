@@ -18,6 +18,20 @@ def _fmt(value, digits=4):
         return str(value)
 
 
+def _format_duration(seconds):
+    if seconds is None or math.isnan(seconds) or math.isinf(seconds):
+        return "--:--"
+    total_seconds = int(round(max(0.0, float(seconds))))
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 @dataclass
 class AcquisitionPanelState:
     acquired: int = 0
@@ -56,6 +70,9 @@ class AcquisitionDashboard:
         self.log = log_callback or (lambda *args, **kwargs: None)
         self.renderer = TerminalPanelRenderer()
         self.state = AcquisitionPanelState()
+        self._rate_ema = None
+        self._last_rate_time = None
+        self._last_rate_acquired = 0
         self._msvcrt = None
         if os.name == "nt":
             try:
@@ -66,19 +83,47 @@ class AcquisitionDashboard:
                 self._msvcrt = None
 
     def start(self):
-        self.state.start_time = time.time()
+        now = time.time()
+        self.state.start_time = now
+        self._rate_ema = None
+        self._last_rate_time = now
+        self._last_rate_acquired = 0
         self.render()
 
     def close(self):
         self.renderer.show_cursor()
 
     def update(self, acquired: int, current_position: str = None, message: str = None):
-        self.state.acquired = int(acquired)
+        acquired = int(acquired)
+        self._update_rate_estimate(acquired)
+        self.state.acquired = acquired
         if current_position is not None:
             self.state.current_position = str(current_position)
         if message:
             self.state.message = str(message)
         self.render()
+
+    def _update_rate_estimate(self, acquired: int):
+        now = time.time()
+        if self._last_rate_time is None or acquired < self._last_rate_acquired:
+            self._last_rate_time = now
+            self._last_rate_acquired = acquired
+            self._rate_ema = None
+            return
+        delta_points = acquired - self._last_rate_acquired
+        delta_time = now - self._last_rate_time
+        if delta_points <= 0 or delta_time <= 0.05:
+            return
+        instant_rate = delta_points / delta_time
+        if instant_rate > 0:
+            # Low alpha damps point-to-point jitter while still following slow drift.
+            alpha = 0.08
+            if self._rate_ema is None:
+                self._rate_ema = instant_rate
+            else:
+                self._rate_ema = alpha * instant_rate + (1.0 - alpha) * self._rate_ema
+        self._last_rate_time = now
+        self._last_rate_acquired = acquired
 
     def poll_commands(self) -> bool:
         if self._msvcrt is None:
@@ -146,10 +191,14 @@ class AcquisitionDashboard:
         filled = int(round(fraction * width))
         bar = "█" * filled + "░" * max(0, width - filled)
         elapsed = max(0.001, time.time() - self.state.start_time)
-        rate = acquired / elapsed if acquired else 0.0
-        remaining = (total - acquired) / rate if rate > 0 else math.nan
-        eta = "--:--" if math.isnan(remaining) else time.strftime("%M:%S", time.gmtime(max(0, remaining)))
-        return f"Progress: {100.0 * fraction:6.2f}%|{bar}| {acquired}/{total} [{elapsed:5.1f}s, {rate:5.2f} pixel/s, ETA {eta}]"
+        average_rate = acquired / elapsed if acquired else 0.0
+        # Use a smoothed point-to-point rate after the first few points. Before
+        # that, the whole-run average is less misleading than a one-point spike.
+        eta_rate = self._rate_ema if acquired >= 5 and self._rate_ema else average_rate
+        remaining = (total - acquired) / eta_rate if eta_rate > 0 else math.nan
+        eta = _format_duration(remaining)
+        elapsed_text = _format_duration(elapsed)
+        return f"Progress: {100.0 * fraction:6.2f}%|{bar}| {acquired}/{total} [{elapsed_text}, {eta_rate:5.2f} pixel/s, ETA {eta}]"
 
     def _command_line(self):
         if self.state.command_mode:
