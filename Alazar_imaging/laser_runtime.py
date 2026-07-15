@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _datetime
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -316,35 +317,90 @@ class PamLaserManager:
         self.refresh_status()
         return f"TOPTICA {key} set to {bool_text(enabled)}; response={response!r}."
 
-    def finalize_close_at_end(self) -> list[str]:
+    def finalize_close_at_end(
+        self,
+        *,
+        reason: str = "finalize",
+        max_attempts: int = 3,
+        retry_delay_s: float = 0.5,
+    ) -> list[str]:
         messages: list[str] = []
         if self.options.cbox_enabled and self.options.cbox_close_at_end:
+            last_error = None
             try:
-                response = CboxD2xxController(serial=self.options.cbox_serial).set_emission(False)
-                message = f"532 emission OFF sent; ok={response.ok}."
-                self._log("CBOX_CLOSE_AT_END_DONE", ok=response.ok)
-                messages.append(message)
-            except Exception as exc:
-                self._log("CBOX_CLOSE_AT_END_ERROR", error=repr(exc))
-                messages.append(f"532 close-at-end failed: {exc}")
+                attempts = max(1, int(max_attempts))
+            except Exception:
+                attempts = 3
+            for attempt in range(1, attempts + 1):
+                try:
+                    response = CboxD2xxController(serial=self.options.cbox_serial).set_emission(False)
+                    if not response.ok:
+                        raise RuntimeError(f"set_emission(False) returned ok={response.ok}")
+                    message = f"532 emission OFF sent; ok={response.ok}; attempt={attempt}."
+                    self._log("CBOX_CLOSE_AT_END_DONE", ok=response.ok, attempt=attempt, reason=reason)
+                    messages.append(message)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    self._log("CBOX_CLOSE_AT_END_ERROR", error=repr(exc), attempt=attempt, reason=reason)
+                    if attempt < attempts:
+                        time.sleep(max(0.0, float(retry_delay_s)))
+            else:
+                messages.append(f"532 close-at-end failed after {attempts} attempts: {last_error}")
         else:
             self._log("CBOX_CLOSE_AT_END_SKIPPED", enabled=self.options.cbox_enabled, close_at_end=self.options.cbox_close_at_end)
 
         if self.options.toptica_enabled and self.options.toptica_close_at_end:
+            last_error = None
             try:
-                with TopticaDlcProController(host=self.options.toptica_host, port=self.options.toptica_port) as toptica:
-                    results = toptica.safe_off_lifo()
-                compact = ", ".join(f"{key}->{state}" for key, _, state in results) or "already off"
-                self._log("TOPTICA_CLOSE_AT_END_DONE", order=",".join(SAFE_CLOSE_ORDER), results=compact)
-                messages.append(f"TOPTICA safe_off_lifo done: {compact}.")
-            except Exception as exc:
-                self._log("TOPTICA_CLOSE_AT_END_ERROR", error=repr(exc))
-                messages.append(f"TOPTICA close-at-end failed: {exc}")
+                attempts = max(1, int(max_attempts))
+            except Exception:
+                attempts = 3
+            for attempt in range(1, attempts + 1):
+                try:
+                    with TopticaDlcProController(host=self.options.toptica_host, port=self.options.toptica_port) as toptica:
+                        results = toptica.safe_off_lifo()
+                    compact = ", ".join(f"{key}->{state}" for key, _, state in results) or "already off"
+                    self._log("TOPTICA_CLOSE_AT_END_DONE", order=",".join(SAFE_CLOSE_ORDER), results=compact, attempt=attempt, reason=reason)
+                    messages.append(f"TOPTICA safe_off_lifo done: {compact}; attempt={attempt}.")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    self._log("TOPTICA_CLOSE_AT_END_ERROR", error=repr(exc), attempt=attempt, reason=reason)
+                    if attempt < attempts:
+                        time.sleep(max(0.0, float(retry_delay_s)))
+            else:
+                messages.append(f"TOPTICA close-at-end failed after {attempts} attempts: {last_error}")
         else:
             self._log("TOPTICA_CLOSE_AT_END_SKIPPED", enabled=self.options.toptica_enabled, close_at_end=self.options.toptica_close_at_end)
 
         try:
-            self.refresh_status()
-        except Exception:
-            pass
+            status = self.refresh_status()
+            values = status.values
+            if self.options.cbox_enabled and self.options.cbox_close_at_end:
+                cbox_emission = values.get("cbox_emission", "UNKNOWN")
+                if cbox_emission == "OFF":
+                    self._log("CBOX_CLOSE_AT_END_VERIFIED", emission=cbox_emission, reason=reason)
+                    messages.append("532 close-at-end verified OFF.")
+                else:
+                    self._log("CBOX_CLOSE_AT_END_VERIFY_WARNING", emission=cbox_emission, reason=reason)
+                    messages.append(f"532 close-at-end verification warning: emission={cbox_emission}.")
+            if self.options.toptica_enabled and self.options.toptica_close_at_end:
+                toptica_states = {
+                    "emission": values.get("toptica_emission", "UNKNOWN"),
+                    "cc": values.get("toptica_cc", "UNKNOWN"),
+                    "pc": values.get("toptica_pc", "UNKNOWN"),
+                    "pc_external": values.get("toptica_pc_external", "UNKNOWN"),
+                    "scan": values.get("toptica_scan", "UNKNOWN"),
+                }
+                not_off = {key: value for key, value in toptica_states.items() if value != "OFF"}
+                if not not_off:
+                    self._log("TOPTICA_CLOSE_AT_END_VERIFIED", states=toptica_states, reason=reason)
+                    messages.append("TOPTICA close-at-end verified OFF.")
+                else:
+                    self._log("TOPTICA_CLOSE_AT_END_VERIFY_WARNING", states=toptica_states, reason=reason)
+                    messages.append(f"TOPTICA close-at-end verification warning: {not_off}.")
+        except Exception as exc:
+            self._log("LASER_CLOSE_AT_END_VERIFY_ERROR", error=repr(exc), reason=reason)
+            messages.append(f"Laser close-at-end verification failed: {exc}")
         return messages

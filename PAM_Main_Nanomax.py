@@ -1,3 +1,4 @@
+import atexit
 import datetime
 import gc
 import os
@@ -174,6 +175,25 @@ def main():
     )
     laser_manager = PamLaserManager(LASER_OPTIONS, log_callback=append_run_log)
     laser_manager.refresh_status()
+    laser_cleanup_done = False
+
+    def finalize_lasers_once(reason):
+        nonlocal laser_cleanup_done
+        if laser_cleanup_done:
+            append_run_log("LASER_FINALIZE_SKIPPED_ALREADY_DONE", reason=reason)
+            return []
+        laser_cleanup_done = True
+        append_run_log(
+            "LASER_FINALIZE_BEGIN",
+            reason=reason,
+            laser_532_close_at_end=LASER_OPTIONS.cbox_close_at_end,
+            toptica_close_at_end=LASER_OPTIONS.toptica_close_at_end,
+        )
+        messages = laser_manager.finalize_close_at_end(reason=reason)
+        append_run_log("LASER_FINALIZE_DONE", reason=reason, messages="; ".join(messages))
+        return messages
+
+    atexit.register(finalize_lasers_once, "atexit")
 
     # User scan geometry. Ranges are the requested travel from first to last point.
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
@@ -888,6 +908,8 @@ def main():
         time.sleep(1)
         try:
             gc.enable()
+            for laser_message in finalize_lasers_once("finally"):
+                print(laser_message)
             if daq is None and daq_init is not None:
                 try:
                     daq = daq_init.result()
@@ -898,8 +920,6 @@ def main():
                 daq.stop_capture()
             if acquisition_dashboard is not None:
                 acquisition_dashboard.close()
-            for laser_message in laser_manager.finalize_close_at_end():
-                print(laser_message)
             if probe_stage is not None:
                 probe_stage.close()
             if stage is not None:
