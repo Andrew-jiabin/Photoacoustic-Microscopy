@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 from Nanomax.terminal_panel import TerminalPanelRenderer, format_section_lines, terminal_width
 
@@ -39,6 +40,8 @@ class AcquisitionPanelState:
     message: str = "Acquisition running. Use ':' commands for close-at-end toggles."
     command_mode: bool = False
     command_buffer: str = ""
+    stop_confirm_mode: bool = False
+    paused_since: Optional[float] = None
     stop_requested: bool = False
     start_time: float = field(default_factory=time.time)
 
@@ -140,9 +143,8 @@ class AcquisitionDashboard:
                 if not self.state.command_mode:
                     if ch.lower() == self.stop_key:
                         if self.stop_enabled:
-                            self.state.stop_requested = True
-                            self.state.message = f"Graceful stop requested by '{self.stop_key}'. Current point will finish first."
-                            self.log("ACQUISITION_PANEL_STOP_REQUESTED", stop_key=self.stop_key)
+                            if self._pause_for_stop_confirmation():
+                                return True
                         else:
                             self.state.message = f"Stop key '{self.stop_key}' is disabled; use ':' laser commands only."
                     elif ch == ":":
@@ -169,6 +171,47 @@ class AcquisitionDashboard:
         if changed:
             self.render()
         return self.state.stop_requested
+
+    def _pause_for_stop_confirmation(self) -> bool:
+        self.state.stop_confirm_mode = True
+        self.state.paused_since = time.time()
+        self.state.message = (
+            f"Acquisition paused after current point. Press 'y' to stop; press Esc to continue."
+        )
+        self.log("ACQUISITION_PANEL_STOP_CONFIRM_REQUESTED", stop_key=self.stop_key)
+        self.render()
+
+        while True:
+            if self._msvcrt is not None and self._msvcrt.kbhit():
+                ch = self._msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    if self._msvcrt.kbhit():
+                        self._msvcrt.getwch()
+                    continue
+                if ch.lower() == "y":
+                    paused_for = time.time() - (self.state.paused_since or time.time())
+                    self.state.stop_requested = True
+                    self.state.stop_confirm_mode = False
+                    self.state.paused_since = None
+                    self.state.message = "Stop confirmed with 'y'. Acquisition will stop cleanly."
+                    self.log("ACQUISITION_PANEL_STOP_CONFIRMED", paused_s=round(paused_for, 3))
+                    self.render()
+                    return True
+                if ch == "\x1b":
+                    paused_for = time.time() - (self.state.paused_since or time.time())
+                    self.state.stop_confirm_mode = False
+                    self.state.paused_since = None
+                    self.state.message = "Stop cancelled with Esc; acquisition continues."
+                    self.log("ACQUISITION_PANEL_STOP_CANCELLED", paused_s=round(paused_for, 3))
+                    self.render()
+                    return False
+                if ch.lower() == self.stop_key:
+                    self.state.message = "Acquisition is already paused. Press 'y' to stop; press Esc to continue."
+                    self.render()
+                elif ch not in ("\r", "\n"):
+                    self.state.message = "Paused. Press 'y' to stop; press Esc to continue."
+                    self.render()
+            time.sleep(0.05)
 
     def _execute_command(self, line: str):
         tokens = line.strip().split()
@@ -201,9 +244,12 @@ class AcquisitionDashboard:
         return f"Progress: {100.0 * fraction:6.2f}%|{bar}| {acquired}/{total} [{elapsed_text}, {eta_rate:5.2f} pixel/s, ETA {eta}]"
 
     def _command_line(self):
+        if self.state.stop_confirm_mode:
+            paused_for = time.time() - (self.state.paused_since or time.time())
+            return f"Command: PAUSED {_format_duration(paused_for)} - press y to stop, Esc to continue."
         if self.state.command_mode:
             return f"Command: :{self.state.command_buffer}"
-        stop_hint = f"press {self.stop_key} for graceful stop" if self.stop_enabled else "graceful stop key disabled"
+        stop_hint = f"press {self.stop_key} to pause/confirm stop" if self.stop_enabled else "graceful stop key disabled"
         return f"Command: press ':' for laser close-at-end commands; {stop_hint}."
 
     def render(self):
@@ -217,7 +263,7 @@ class AcquisitionDashboard:
             f"Current point: {self.state.current_position}",
             "Allowed during acquisition: "
             f":532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh"
-            f"{', ' + self.stop_key if self.stop_enabled else ''}",
+            f"{', ' + self.stop_key + ' pause; paused: y stop, Esc continue' if self.stop_enabled else ''}",
         ]
         lines += format_section_lines("Lasers", self.laser_manager.panel_items(acquisition=True))
         lines += format_section_lines("Frozen Scan Parameters", self.scan_items)
