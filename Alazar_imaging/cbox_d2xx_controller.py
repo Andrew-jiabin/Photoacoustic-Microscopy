@@ -17,14 +17,19 @@ import ctypes
 import time
 from dataclasses import dataclass
 from typing import Any, ClassVar
-from ctypes import byref, c_uint32, c_void_p, create_string_buffer
+from ctypes import byref, c_ubyte, c_uint32, c_ushort, c_void_p, create_string_buffer
 
 FT_OK = 0
 FT_OPEN_BY_SERIAL_NUMBER = 1
 FT_PURGE_RX = 1
 FT_PURGE_TX = 2
+FT_BITS_8 = 8
+FT_STOP_BITS_1 = 0
+FT_PARITY_NONE = 0
+FT_FLOW_NONE = 0
 
 DEFAULT_FTDI_SERIAL = "BS7VJICA"
+DEFAULT_BAUD_RATE = 9600
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,12 @@ class CboxD2xxController:
         dll.FT_GetQueueStatus.restype = c_uint32
         dll.FT_Purge.argtypes = [c_void_p, c_uint32]
         dll.FT_Purge.restype = c_uint32
+        dll.FT_SetBaudRate.argtypes = [c_void_p, c_uint32]
+        dll.FT_SetBaudRate.restype = c_uint32
+        dll.FT_SetDataCharacteristics.argtypes = [c_void_p, c_ubyte, c_ubyte, c_ubyte]
+        dll.FT_SetDataCharacteristics.restype = c_uint32
+        dll.FT_SetFlowControl.argtypes = [c_void_p, c_ushort, c_ubyte, c_ubyte]
+        dll.FT_SetFlowControl.restype = c_uint32
         dll.FT_SetTimeouts.argtypes = [c_void_p, c_uint32, c_uint32]
         dll.FT_SetTimeouts.restype = c_uint32
         return dll
@@ -163,8 +174,18 @@ class CboxD2xxController:
         self._check(dll.FT_OpenEx(serial_buf, FT_OPEN_BY_SERIAL_NUMBER, byref(handle)), f"FT_OpenEx({self.serial})")
         try:
             timeout_ms = int(self.timeout_s * 1000)
+            # D2XX can retain settings from the last VCP/COM user. The vendor
+            # application defaults to 9600 baud; restore the complete UART
+            # configuration on every open so a stale COM setting cannot make
+            # valid frames disappear without an FTDI error.
+            self._check(dll.FT_SetBaudRate(handle, DEFAULT_BAUD_RATE), "FT_SetBaudRate")
+            self._check(
+                dll.FT_SetDataCharacteristics(handle, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE),
+                "FT_SetDataCharacteristics",
+            )
+            self._check(dll.FT_SetFlowControl(handle, FT_FLOW_NONE, 0, 0), "FT_SetFlowControl")
             self._check(dll.FT_SetTimeouts(handle, timeout_ms, timeout_ms), "FT_SetTimeouts")
-            dll.FT_Purge(handle, FT_PURGE_RX | FT_PURGE_TX)
+            self._check(dll.FT_Purge(handle, FT_PURGE_RX | FT_PURGE_TX), "FT_Purge")
 
             written = c_uint32(0)
             tx_buf = create_string_buffer(frame)
@@ -316,4 +337,3 @@ class CboxD2xxController:
         if not response.ok or response.payload is None:
             raise RuntimeError(f"CBOX command failed: {response}")
         return response.payload
-

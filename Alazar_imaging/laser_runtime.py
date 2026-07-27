@@ -333,11 +333,27 @@ class PamLaserManager:
                 attempts = 3
             for attempt in range(1, attempts + 1):
                 try:
-                    response = CboxD2xxController(serial=self.options.cbox_serial).set_emission(False)
-                    if not response.ok:
-                        raise RuntimeError(f"set_emission(False) returned ok={response.ok}")
-                    message = f"532 emission OFF sent; ok={response.ok}; attempt={attempt}."
-                    self._log("CBOX_CLOSE_AT_END_DONE", ok=response.ok, attempt=attempt, reason=reason)
+                    cbox = CboxD2xxController(serial=self.options.cbox_serial)
+                    response = cbox.set_emission(False)
+                    flags = cbox.get_flags()
+                    emission_off = not flags["emission_on_inferred"]
+                    if not emission_off:
+                        raise RuntimeError(
+                            "532 emission remained ON after set_emission(False); "
+                            f"response_ok={response.ok}, flags={flags['hex']}"
+                        )
+                    message = (
+                        "532 emission OFF verified; "
+                        f"response_ok={response.ok}; flags={flags['hex']}; attempt={attempt}."
+                    )
+                    self._log(
+                        "CBOX_CLOSE_AT_END_DONE",
+                        ok=response.ok,
+                        emission_off=True,
+                        flags=flags["hex"],
+                        attempt=attempt,
+                        reason=reason,
+                    )
                     messages.append(message)
                     break
                 except Exception as exc:

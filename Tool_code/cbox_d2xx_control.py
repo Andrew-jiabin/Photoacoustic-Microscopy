@@ -20,15 +20,20 @@ import argparse
 import ctypes
 import json
 import time
-from ctypes import byref, c_uint32, c_void_p, create_string_buffer
+from ctypes import byref, c_ubyte, c_uint32, c_ushort, c_void_p, create_string_buffer
 from typing import Any
 
 FT_OK = 0
 FT_OPEN_BY_SERIAL_NUMBER = 1
 FT_PURGE_RX = 1
 FT_PURGE_TX = 2
+FT_BITS_8 = 8
+FT_STOP_BITS_1 = 0
+FT_PARITY_NONE = 0
+FT_FLOW_NONE = 0
 
 DEFAULT_SERIAL = "BS7VJICA"
+DEFAULT_BAUD_RATE = 9600
 
 QUERY_COMMANDS = {
     "flags": (0x90, 0x00, 0x00, 0x00),
@@ -113,6 +118,12 @@ def load_d2xx() -> Any:
     dll.FT_GetQueueStatus.restype = c_uint32
     dll.FT_Purge.argtypes = [c_void_p, c_uint32]
     dll.FT_Purge.restype = c_uint32
+    dll.FT_SetBaudRate.argtypes = [c_void_p, c_uint32]
+    dll.FT_SetBaudRate.restype = c_uint32
+    dll.FT_SetDataCharacteristics.argtypes = [c_void_p, c_ubyte, c_ubyte, c_ubyte]
+    dll.FT_SetDataCharacteristics.restype = c_uint32
+    dll.FT_SetFlowControl.argtypes = [c_void_p, c_ushort, c_ubyte, c_ubyte]
+    dll.FT_SetFlowControl.restype = c_uint32
     dll.FT_SetTimeouts.argtypes = [c_void_p, c_uint32, c_uint32]
     dll.FT_SetTimeouts.restype = c_uint32
     return dll
@@ -129,8 +140,14 @@ def transact(serial: str, frame: bytes, timeout_s: float) -> dict[str, Any]:
     serial_buf = create_string_buffer(serial.encode("ascii"))
     check(dll.FT_OpenEx(serial_buf, FT_OPEN_BY_SERIAL_NUMBER, byref(handle)), f"FT_OpenEx({serial})")
     try:
+        check(dll.FT_SetBaudRate(handle, DEFAULT_BAUD_RATE), "FT_SetBaudRate")
+        check(
+            dll.FT_SetDataCharacteristics(handle, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE),
+            "FT_SetDataCharacteristics",
+        )
+        check(dll.FT_SetFlowControl(handle, FT_FLOW_NONE, 0, 0), "FT_SetFlowControl")
         check(dll.FT_SetTimeouts(handle, int(timeout_s * 1000), int(timeout_s * 1000)), "FT_SetTimeouts")
-        dll.FT_Purge(handle, FT_PURGE_RX | FT_PURGE_TX)
+        check(dll.FT_Purge(handle, FT_PURGE_RX | FT_PURGE_TX), "FT_Purge")
 
         written = c_uint32(0)
         tx = create_string_buffer(frame)
