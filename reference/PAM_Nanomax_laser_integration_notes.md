@@ -36,8 +36,16 @@ This note records the operational decisions that are easy to lose when editing
 ## Laser Runtime
 
 - CBOX-Micro 532 nm control is through FTDI D2XX, not ordinary COM/VCP serial.
+- The D2XX handle must restore the UART settings on every open:
+  `9600 baud`, `8 data bits`, `1 stop bit`, `no parity`, and `no flow control`.
+  Without this, stale COM/VCP settings can let `FT_Write` report success while
+  the controller returns no response.
 - CBOX software can control emission on/off after the physical Laser OFF/Stand
-  By state is prepared. It should not be treated as a full physical power switch.
+  By state is prepared. It should not be treated as a full physical power
+  switch; the physical Laser OFF latch is still a front-panel action.
+- Treat the CBOX `flags` readback as the shutdown truth. For emission shutdown,
+  `set_emission(False)` is not enough by itself; success means the inferred
+  emission bit in `flags` is cleared. A known OFF flags example is `035F12`.
 - Toptica control is TCP on `192.168.1.11:1998`.
 - Toptica close-at-end must follow dependency/LIFO order:
   `scan -> pc_external -> pc -> cc`.
@@ -47,6 +55,40 @@ This note records the operational decisions that are easy to lose when editing
   `PAM_532_CLOSE_AT_END=1` and `PAM_TOPTICA_CLOSE_AT_END=1`.
 - During acquisition, only close-at-end toggles and laser status refresh should
   remain mutable; motion, scan, DAQ, and live laser state controls are frozen.
+- `PAM_Main_Nanomax.py` calls the same laser finalizer from error,
+  keyboard-interrupt, final cleanup, and `atexit` paths. The one-shot cleanup
+  marker is set only after readback confirms the requested laser shutdown, so a
+  failed first attempt can still be retried by later cleanup paths.
+
+Manual 532 emission-off diagnostic, when the operator explicitly wants only the
+software emission disabled:
+
+```powershell
+C:\Users\20211\.conda\envs\PAM\python.exe Tool_code\cbox_d2xx_control.py emission_off --write --confirm-write LASER_RISK_ACCEPTED
+```
+
+Expected success wording includes:
+
+```text
+532 emission OFF verified; response_ok=True; flags=035F12
+```
+
+## Closed-Loop Position Tolerance Policy
+
+- BPC303 position commands can stop outside tolerance after one command. The
+  controller wrapper therefore reissues the target at
+  `PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S` while readback remains outside
+  `PAM_SAMPLE_POSITION_TOLERANCE_UM`.
+- If a point still fails to settle before `PAM_SAMPLE_POSITION_TIMEOUT_S`, the
+  scan no longer aborts the whole dataset. It logs
+  `ACQUISITION_POSITION_TIMEOUT_CONTINUE`, stores target and actual positions in
+  the `.mat` metadata, acquires the current signal, and moves on.
+- Return-to-start is segmented along a straight line with
+  `PAM_SAMPLE_RETURN_STEP_UM` or `PAM_PROBE_RETURN_STEP_UM`, avoiding one large
+  step back to the start or low-end zero.
+- Save prompts default to preserving data. If the operator does not answer
+  within `PAM_DATA_SAVE_AUTO_TIMEOUT_S`, data are saved automatically with no
+  filename suffix.
 
 ## Verified Small-Scan Test
 
@@ -69,8 +111,10 @@ start
 Observed cleanup messages:
 
 ```text
-532 emission OFF sent; ok=True.
+532 emission OFF verified; response_ok=True; flags=035F12; attempt=1.
 TOPTICA safe_off_lifo done: pc_external->False, pc->False, cc->False.
+532 close-at-end verified OFF.
+TOPTICA close-at-end verified OFF.
 ```
 
 Read-only status after cleanup showed CBOX emission off and Toptica
@@ -82,7 +126,7 @@ Before committing control changes, run:
 
 ```powershell
 C:\Users\20211\.conda\envs\PAM\python.exe -m py_compile `
-  PAM_Main_Nanomax.py Nanomax\runtime.py Nanomax\run_log.py
+  PAM_Main_Nanomax.py Alazar_imaging\*.py Nanomax\*.py Tool_code\*.py
 
 C:\Users\20211\.conda\envs\PAM\python.exe Tool_code\validate_laser_panel_no_hardware.py
 ```

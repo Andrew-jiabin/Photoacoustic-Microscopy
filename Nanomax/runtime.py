@@ -1,3 +1,4 @@
+import math
 import os
 import subprocess
 import sys
@@ -209,6 +210,116 @@ def poll_user_stop_request(enabled=True, stop_key="q", notify=None):
     return requested
 
 
+def _linear_segment_points(start_values, target_values, max_step):
+    start = [float(value) for value in start_values]
+    target = [float(value) for value in target_values]
+    if len(start) != len(target):
+        raise ValueError("start_values and target_values must have the same length")
+    max_step = float(max_step)
+    if max_step <= 0:
+        raise ValueError(f"Return step must be positive, got {max_step:g}.")
+    distance = math.sqrt(sum((target[i] - start[i]) ** 2 for i in range(len(start))))
+    if distance <= 1e-12:
+        return [], distance
+    steps = max(1, int(math.ceil(distance / max_step)))
+    points = []
+    for step_index in range(1, steps + 1):
+        fraction = step_index / steps
+        points.append([start[i] + (target[i] - start[i]) * fraction for i in range(len(start))])
+    return points, distance
+
+
+def _return_sample_xy_segmented(
+    stage,
+    target_x,
+    target_y,
+    settle_ms,
+    return_target,
+    step_um=0.1,
+    tolerance_um=0.02,
+    timeout_s=1800.0,
+    reissue_interval_s=1.0,
+):
+    current = stage.get_position_values()
+    current_x, current_y = float(current[0]), float(current[1])
+    points, distance = _linear_segment_points((current_x, current_y), (target_x, target_y), step_um)
+    append_run_log(
+        "RETURN_TO_START_SEGMENTED_BEGIN",
+        scan_target="sample_closed_loop",
+        return_target=return_target,
+        current_x_um=f"{current_x:.6f}",
+        current_y_um=f"{current_y:.6f}",
+        target_x_um=f"{target_x:.6f}",
+        target_y_um=f"{target_y:.6f}",
+        distance_um=f"{distance:.6f}",
+        step_um=f"{float(step_um):g}",
+        segments=len(points),
+    )
+    if not points:
+        stage.wait_until_settled(
+            target_x,
+            target_y,
+            settle_time_ms=settle_ms,
+            tolerance_step=tolerance_um,
+            timeout_s=timeout_s,
+            correction_interval_s=reissue_interval_s,
+        )
+        return
+
+    for index, (next_x, next_y) in enumerate(points, start=1):
+        stage.set_position([next_x, next_y])
+        stage.wait_until_settled(
+            next_x,
+            next_y,
+            settle_time_ms=settle_ms if index == len(points) else 0,
+            tolerance_step=tolerance_um,
+            timeout_s=timeout_s,
+            correction_interval_s=reissue_interval_s,
+        )
+
+
+def _return_probe_xyz_segmented(probe_stage, target_x, target_y, target_z, settle_ms, step_um=0.1, um_per_v=None):
+    current = [float(value) for value in probe_stage.get_voltage_xyz()]
+    target = [float(target_x), float(target_y), float(target_z)]
+    if um_per_v is None or float(um_per_v) <= 0:
+        append_run_log(
+            "RETURN_TO_START_SEGMENTED_SKIPPED",
+            scan_target="probe_open_loop",
+            reason="missing_um_per_v_calibration",
+        )
+        probe_stage.set_voltage_xyz(x=target[0], y=target[1], z=target[2], wait=True, settle_time_ms=settle_ms)
+        return
+
+    step_v = float(step_um) / float(um_per_v)
+    points, distance_v = _linear_segment_points(current, target, step_v)
+    append_run_log(
+        "RETURN_TO_START_SEGMENTED_BEGIN",
+        scan_target="probe_open_loop",
+        current_x_v=f"{current[0]:.6f}",
+        current_y_v=f"{current[1]:.6f}",
+        current_z_v=f"{current[2]:.6f}",
+        target_x_v=f"{target[0]:.6f}",
+        target_y_v=f"{target[1]:.6f}",
+        target_z_v=f"{target[2]:.6f}",
+        distance_v=f"{distance_v:.6f}",
+        step_um=f"{float(step_um):g}",
+        step_v=f"{step_v:.6f}",
+        segments=len(points),
+    )
+    if not points:
+        probe_stage.wait_until_voltage_settled(target, settle_time_ms=settle_ms)
+        return
+
+    for index, (next_x, next_y, next_z) in enumerate(points, start=1):
+        probe_stage.set_voltage_xyz(
+            x=next_x,
+            y=next_y,
+            z=next_z,
+            wait=True,
+            settle_time_ms=settle_ms if index == len(points) else 0,
+        )
+
+
 def return_to_start(
     scan_target,
     stage,
@@ -221,6 +332,12 @@ def return_to_start(
     sample_return_xy_to_zero=False,
     sample_zero_xy_after_return=False,
     sample_zero_axes=("x", "y"),
+    sample_return_step_um=0.1,
+    sample_position_tolerance_um=0.02,
+    sample_position_timeout_s=1800.0,
+    sample_position_reissue_interval_s=1.0,
+    probe_um_per_v=None,
+    probe_return_step_um=0.1,
 ):
     if scan_target == "sample_closed_loop" and stage is not None:
         return_target = "low_end_zero" if sample_return_xy_to_zero else "prealign_start"
@@ -239,9 +356,21 @@ def return_to_start(
             target_y_um=f"{target_y:.4f}",
             zero_after_return=sample_zero_xy_after_return,
         )
-        print(f"Returning sample X/Y to {return_target}: X={target_x:.4f} um, Y={target_y:.4f} um.")
-        stage.set_position([target_x, target_y])
-        stage.wait_until_settled(target_x, target_y, settle_time_ms=settle_ms)
+        print(
+            f"Returning sample X/Y to {return_target}: X={target_x:.4f} um, Y={target_y:.4f} um "
+            f"in <= {float(sample_return_step_um):g} um line steps."
+        )
+        _return_sample_xy_segmented(
+            stage,
+            target_x,
+            target_y,
+            settle_ms,
+            return_target,
+            step_um=sample_return_step_um,
+            tolerance_um=sample_position_tolerance_um,
+            timeout_s=sample_position_timeout_s,
+            reissue_interval_s=sample_position_reissue_interval_s,
+        )
         append_run_log(
             "RETURN_TO_START_DONE",
             scan_target=scan_target,
@@ -281,7 +410,18 @@ def return_to_start(
             target_y_v=f"{start_y:.4f}",
             target_z_v=f"{start_z:.4f}",
         )
-        probe_stage.set_voltage_xyz(x=start_x, y=start_y, z=start_z, wait=True, settle_time_ms=settle_ms)
+        print(
+            f"Returning probe voltages to start in <= {float(probe_return_step_um):g} um-equivalent line steps."
+        )
+        _return_probe_xyz_segmented(
+            probe_stage,
+            start_x,
+            start_y,
+            start_z,
+            settle_ms,
+            step_um=probe_return_step_um,
+            um_per_v=probe_um_per_v,
+        )
         append_run_log("RETURN_TO_START_DONE", scan_target=scan_target)
     else:
         append_run_log("RETURN_TO_START_SKIPPED", scan_target=scan_target, reason="conditions_not_met")

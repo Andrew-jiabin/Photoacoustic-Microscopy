@@ -21,6 +21,7 @@ from Nanomax.prealignment_workflow import run_nanomax_prealignment
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
 from Nanomax.runtime import find_other_pam_processes, return_to_start, run_bpc303_preflight, safe_return_to_start
 from Nanomax.scan_utils import (
+    NANOMAX_MANUAL_MIN_STEP_UM,
     NANOMAX_PIEZO_SCAN_LIMIT_UM,
     build_probe_trajectory,
     build_sample_trajectory,
@@ -31,6 +32,7 @@ from Nanomax.scan_utils import (
     validate_probe_trajectory,
     validate_sample_trajectory,
 )
+from Nanomax.scan_speed_history import record_successful_scan_speed
 
 
 for _stream in (sys.stdout, sys.stderr):
@@ -70,10 +72,10 @@ def env_str(name, default):
 # Operator-editable defaults. Environment variables with the same names still
 # override these values at runtime, but these are the script-level knobs to edit
 # when the lab wants a different default behavior.
-DEFAULT_532_CLOSE_AT_END = False
-DEFAULT_TOPTICA_CLOSE_AT_END = False
+DEFAULT_532_CLOSE_AT_END = True
+DEFAULT_TOPTICA_CLOSE_AT_END = True
 # False returns to the prealignment-selected scan start; True returns X/Y to 0 um.
-DEFAULT_SAMPLE_RETURN_XY_TO_ZERO_AT_END = False
+DEFAULT_SAMPLE_RETURN_XY_TO_ZERO_AT_END = True
 
 
 def main():
@@ -182,7 +184,6 @@ def main():
         if laser_cleanup_done:
             append_run_log("LASER_FINALIZE_SKIPPED_ALREADY_DONE", reason=reason)
             return []
-        laser_cleanup_done = True
         append_run_log(
             "LASER_FINALIZE_BEGIN",
             reason=reason,
@@ -190,7 +191,26 @@ def main():
             toptica_close_at_end=LASER_OPTIONS.toptica_close_at_end,
         )
         messages = laser_manager.finalize_close_at_end(reason=reason)
-        append_run_log("LASER_FINALIZE_DONE", reason=reason, messages="; ".join(messages))
+        status_values = laser_manager.status.values
+        cbox_ok = (
+            (not LASER_OPTIONS.cbox_enabled)
+            or (not LASER_OPTIONS.cbox_close_at_end)
+            or status_values.get("cbox_emission") == "OFF"
+        )
+        toptica_ok = True
+        if LASER_OPTIONS.toptica_enabled and LASER_OPTIONS.toptica_close_at_end:
+            toptica_ok = all(
+                status_values.get(key) == "OFF"
+                for key in ("toptica_emission", "toptica_cc", "toptica_pc", "toptica_pc_external", "toptica_scan")
+            )
+        laser_cleanup_done = bool(cbox_ok and toptica_ok)
+        append_run_log(
+            "LASER_FINALIZE_DONE" if laser_cleanup_done else "LASER_FINALIZE_RETRY_NEEDED",
+            reason=reason,
+            messages="; ".join(messages),
+            cbox_ok=cbox_ok,
+            toptica_ok=toptica_ok,
+        )
         return messages
 
     atexit.register(finalize_lasers_once, "atexit")
@@ -199,9 +219,9 @@ def main():
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
     # The script also checks against the BPC303-reported maximum travel before acquisition.
     SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = (
-        env_float("PAM_SCAN_RANGE_X_UM", 2.5),
-        env_float("PAM_SCAN_RANGE_Y_UM", 2.5),
-        env_float("PAM_STEP_UM", 0.01),
+        env_float("PAM_SCAN_RANGE_X_UM", 9.75),
+        env_float("PAM_SCAN_RANGE_Y_UM", 18.75),
+        env_float("PAM_STEP_UM", 0.75),
     )  # X is actually up; Y is actually left.
     SAMPLE_X_DIRECTION, SAMPLE_Y_DIRECTION = 1.0, 1.0
     SAMPLE_PREALIGN_ENABLE, SAMPLE_PREALIGN_X_STEP_UM, SAMPLE_PREALIGN_Y_STEP_UM, SAMPLE_PREALIGN_Z_STEP_UM = env_bool("PAM_SAMPLE_PREALIGN_ENABLE", True), 0.1, 0.1, 0.1
@@ -225,9 +245,15 @@ def main():
     #   "serpentine" or "s": S-shaped scan; odd rows reverse X direction.
     #   "raster" or "z": Z-shaped one-way rows; each row starts from low X.
     SCAN_PATTERN, SETTLE_MS = "serpentine", 120
+    SAMPLE_POSITION_TOLERANCE_UM = env_float("PAM_SAMPLE_POSITION_TOLERANCE_UM", 0.02)
+    SAMPLE_POSITION_TIMEOUT_S = env_float("PAM_SAMPLE_POSITION_TIMEOUT_S", 300.0)
+    SAMPLE_POSITION_REISSUE_INTERVAL_S = env_float("PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S", 1.0)
+    SAMPLE_RETURN_STEP_UM = env_float("PAM_SAMPLE_RETURN_STEP_UM", 0.1)
+    PROBE_RETURN_STEP_UM = env_float("PAM_PROBE_RETURN_STEP_UM", 0.1)
+    DATA_SAVE_AUTO_TIMEOUT_S = env_float("PAM_DATA_SAVE_AUTO_TIMEOUT_S", 60.0)
 
     # DAQ parameters.
-    DELAY, SAMPLES_REC, SAMPLE_RATE = 1320, 4096, ats.SAMPLE_RATE_4000MSPS
+    DELAY, SAMPLES_REC, SAMPLE_RATE = int(405*4), 4096, ats.SAMPLE_RATE_4000MSPS
     AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 256, 4
     ACQ_TIMEOUT_MS = env_int("PAM_ACQ_TIMEOUT_MS", 1000)
     POINT_LOG_INTERVAL, USER_STOP_ENABLE, USER_STOP_KEY = 25, True, "q"
@@ -235,6 +261,56 @@ def main():
     if SCAN_TARGET not in ("sample_closed_loop", "probe_open_loop"):
         append_run_log("RUN_END_ERROR", error=f"invalid SCAN_TARGET {SCAN_TARGET}")
         raise ValueError("SCAN_TARGET must be 'sample_closed_loop' or 'probe_open_loop'.")
+    if SCAN_TARGET == "sample_closed_loop":
+        if SAMPLE_POSITION_TOLERANCE_UM < float(NANOMAX_MANUAL_MIN_STEP_UM):
+            append_run_log(
+                "RUN_END_ERROR",
+                error=(
+                    f"PAM_SAMPLE_POSITION_TOLERANCE_UM={SAMPLE_POSITION_TOLERANCE_UM:g} "
+                    f"is below NanoMax minimum step guard {float(NANOMAX_MANUAL_MIN_STEP_UM):g} um"
+                ),
+                phase="sample_position_tolerance_validation",
+            )
+            raise SystemExit(
+                "Sample position tolerance is below the NanoMax minimum step guard "
+                f"({float(NANOMAX_MANUAL_MIN_STEP_UM):g} um). "
+                "Use PAM_SAMPLE_POSITION_TOLERANCE_UM >= that value."
+            ) from None
+        if SAMPLE_POSITION_TIMEOUT_S <= 0:
+            append_run_log(
+                "RUN_END_ERROR",
+                error=f"PAM_SAMPLE_POSITION_TIMEOUT_S={SAMPLE_POSITION_TIMEOUT_S:g} must be positive",
+                phase="sample_position_timeout_validation",
+            )
+            raise SystemExit("PAM_SAMPLE_POSITION_TIMEOUT_S must be positive.") from None
+        if SAMPLE_POSITION_REISSUE_INTERVAL_S < 0:
+            append_run_log(
+                "RUN_END_ERROR",
+                error=f"PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S={SAMPLE_POSITION_REISSUE_INTERVAL_S:g} must be non-negative",
+                phase="sample_position_reissue_validation",
+            )
+            raise SystemExit("PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S must be non-negative.") from None
+        if SAMPLE_RETURN_STEP_UM <= 0:
+            append_run_log(
+                "RUN_END_ERROR",
+                error=f"PAM_SAMPLE_RETURN_STEP_UM={SAMPLE_RETURN_STEP_UM:g} must be positive",
+                phase="sample_return_step_validation",
+            )
+            raise SystemExit("PAM_SAMPLE_RETURN_STEP_UM must be positive.") from None
+    if PROBE_RETURN_STEP_UM <= 0:
+        append_run_log(
+            "RUN_END_ERROR",
+            error=f"PAM_PROBE_RETURN_STEP_UM={PROBE_RETURN_STEP_UM:g} must be positive",
+            phase="probe_return_step_validation",
+        )
+        raise SystemExit("PAM_PROBE_RETURN_STEP_UM must be positive.") from None
+    if DATA_SAVE_AUTO_TIMEOUT_S < 0:
+        append_run_log(
+            "RUN_END_ERROR",
+            error=f"PAM_DATA_SAVE_AUTO_TIMEOUT_S={DATA_SAVE_AUTO_TIMEOUT_S:g} must be non-negative",
+            phase="data_save_timeout_validation",
+        )
+        raise SystemExit("PAM_DATA_SAVE_AUTO_TIMEOUT_S must be non-negative.") from None
     try:
         SCAN_W, SCAN_H = scan_shape_from_range(
             SCAN_RANGE_X_UM,
@@ -261,6 +337,12 @@ def main():
         sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
         sample_zero_at_end=SAMPLE_ZERO_XY_AT_END,
         sample_low_end_residual_tolerance_um=SAMPLE_LOW_END_RESIDUAL_TOLERANCE_UM,
+        sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+        sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+        sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+        sample_return_step_um=SAMPLE_RETURN_STEP_UM,
+        probe_return_step_um=PROBE_RETURN_STEP_UM,
+        data_save_auto_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
         point_log_interval=POINT_LOG_INTERVAL,
         user_stop_enable=USER_STOP_ENABLE,
         user_stop_key=USER_STOP_KEY,
@@ -298,8 +380,58 @@ def main():
     stage = probe_stage = probe_step_v = daq = daq_init = acquisition_dashboard = None
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
+    position_timeout_points = 0
+    acquisition_loop_start_s = None
+    data_save_done = False
     prealignment_started_acquisition = False
     probe_connect_error = ""
+
+    def save_data_once(reason):
+        nonlocal data_save_done
+        if data_save_done:
+            append_run_log("DATA_SAVE_ONCE_SKIPPED_ALREADY_DONE", reason=reason)
+            return None
+        append_run_log("DATA_SAVE_ONCE_BEGIN", reason=reason, points=len(all_data))
+        result = save_scan_data(
+            all_data,
+            SCAN_W,
+            SCAN_H,
+            STEP_UM,
+            RECORDS_PER_POINT,
+            SAMPLES_REC,
+            AVERAGE_ENABLE,
+            SCAN_TARGET,
+            coordinate_unit,
+            probe_step_v,
+            PROBE_UM_PER_V,
+            START_X,
+            START_Y,
+            START_Z,
+            DELAY,
+            save_prompt_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
+        )
+        data_save_done = True
+        append_run_log("DATA_SAVE_ONCE_DONE", reason=reason, result=repr(result))
+        return result
+
+    def stop_daq_best_effort(reason):
+        if daq is None:
+            return
+        try:
+            daq.stop_capture()
+            append_run_log("DAQ_STOP_CAPTURE_DONE", reason=reason)
+        except Exception as exc:
+            append_run_log("DAQ_STOP_CAPTURE_FAILED", reason=reason, error=repr(exc))
+            print(f"DAQ stop_capture failed during {reason}: {exc}")
+
+    def attach_point_metadata(start_len, metadata):
+        if len(all_data) <= start_len:
+            append_run_log("ACQUISITION_POINT_METADATA_SKIPPED", reason="daq_did_not_append", metadata=repr(metadata))
+            return
+        point = all_data[-1]
+        if len(point) < 3 or not isinstance(point[2], dict):
+            point.append({})
+        point[2].update(metadata)
 
     try:
         def daq_factory(step, daq_obj):
@@ -411,6 +543,9 @@ def main():
                         sample_y_direction=SAMPLE_Y_DIRECTION,
                         scan_pattern=SCAN_PATTERN,
                         settle_ms=SETTLE_MS,
+                        position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+                        position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+                        position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
                         x_step_um=SAMPLE_PREALIGN_X_STEP_UM,
                         y_step_um=SAMPLE_PREALIGN_Y_STEP_UM,
                         z_step_um=SAMPLE_PREALIGN_Z_STEP_UM,
@@ -720,12 +855,17 @@ def main():
             ("START_Y", f"{float(START_Y):.4f}", f"{coordinate_unit}; frozen"),
             ("START_Z", f"{float(START_Z):.4f}", f"{coordinate_unit}; frozen"),
             ("SETTLE_MS", SETTLE_MS, "frozen"),
+            ("POS_TOL_UM", f"{SAMPLE_POSITION_TOLERANCE_UM:g}", "frozen"),
+            ("POS_TIMEOUT_S", f"{SAMPLE_POSITION_TIMEOUT_S:g}", "frozen"),
+            ("POS_REISSUE_S", f"{SAMPLE_POSITION_REISSUE_INTERVAL_S:g}", "frozen"),
+            ("RETURN_STEP_UM", f"{SAMPLE_RETURN_STEP_UM:g}", "frozen"),
         ]
         if SCAN_TARGET == "probe_open_loop":
             scan_dashboard_items.extend(
                 [
                     ("PROBE_STEP_V", f"{float(probe_step_v):.6f}", "frozen"),
                     ("PROBE_SCAN_AXES", f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}", "frozen"),
+                    ("PROBE_RETURN_STEP_UM", f"{PROBE_RETURN_STEP_UM:g}", "frozen"),
                 ]
             )
         daq_dashboard_items = [
@@ -744,6 +884,7 @@ def main():
             ("SAMPLE_START_ZERO_POLICY", SAMPLE_START_ZERO_POLICY, "frozen"),
             ("SAMPLE_RETURN_XY_TO_ZERO_AT_END", SAMPLE_RETURN_XY_TO_ZERO_AT_END, "frozen"),
             ("SAMPLE_ZERO_XY_AT_END", SAMPLE_ZERO_XY_AT_END, "frozen"),
+            ("DATA_SAVE_AUTO_TIMEOUT_S", f"{DATA_SAVE_AUTO_TIMEOUT_S:g}", "frozen"),
         ]
         refresh_terminal_for_acquisition()
         acquisition_dashboard = AcquisitionDashboard(
@@ -759,18 +900,85 @@ def main():
         )
         acquisition_dashboard.start()
         append_run_log("ACQUISITION_START", points=len(trajectory), desc=progress_desc)
+        acquisition_loop_start_s = time.monotonic()
 
         if SCAN_TARGET == "sample_closed_loop":
             for point_index, (tx, ty) in enumerate(trajectory, start=1):
                 stage.set_position([tx, ty])
-                stage.wait_until_settled(tx, ty, settle_time_ms=SETTLE_MS)
+                position_settle_ok = True
+                position_timeout = False
+                actual_x, actual_y, actual_z = float(tx), float(ty), 0.0
+                position_error_x, position_error_y, position_error_z = 0.0, 0.0, 0.0
+                try:
+                    stage.wait_until_settled(
+                        tx,
+                        ty,
+                        settle_time_ms=SETTLE_MS,
+                        tolerance_step=SAMPLE_POSITION_TOLERANCE_UM,
+                        timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+                        correction_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+                    )
+                except TimeoutError as exc:
+                    position_timeout_points += 1
+                    position_settle_ok = False
+                    position_timeout = True
+                    try:
+                        readback = stage.get_position_values()
+                        actual_x, actual_y = float(readback[0]), float(readback[1])
+                        actual_z = float(readback[2]) if len(readback) > 2 else 0.0
+                    except Exception as read_exc:
+                        append_run_log(
+                            "ACQUISITION_POSITION_TIMEOUT_READBACK_FAILED",
+                            index=point_index,
+                            total=len(trajectory),
+                            target_x_um=f"{tx:.6f}",
+                            target_y_um=f"{ty:.6f}",
+                            error=repr(read_exc),
+                        )
+                    position_error_x = abs(actual_x - float(tx))
+                    position_error_y = abs(actual_y - float(ty))
+                    position_error_z = abs(actual_z - 0.0)
+                    append_run_log(
+                        "ACQUISITION_POSITION_TIMEOUT_CONTINUE",
+                        index=point_index,
+                        total=len(trajectory),
+                        target_x_um=f"{tx:.6f}",
+                        target_y_um=f"{ty:.6f}",
+                        actual_x_um=f"{actual_x:.6f}",
+                        actual_y_um=f"{actual_y:.6f}",
+                        error_x_um=f"{position_error_x:.6f}",
+                        error_y_um=f"{position_error_y:.6f}",
+                        tolerance_um=f"{SAMPLE_POSITION_TOLERANCE_UM:g}",
+                        timeout_s=f"{SAMPLE_POSITION_TIMEOUT_S:g}",
+                        exception=str(exc),
+                    )
+                    if acquisition_dashboard is not None:
+                        acquisition_dashboard.update(
+                            acquired_points,
+                            current_position=(
+                                f"TARGET X={tx:.4f}, Y={ty:.4f}; "
+                                f"ACTUAL X={actual_x:.4f}, Y={actual_y:.4f}; collecting current signal"
+                            ),
+                            message="Position timeout; acquiring at current readback and continuing.",
+                        )
                 current_pos_str = f"{tx},{ty},0"
+                point_metadata = {
+                    "target_pos_str": current_pos_str,
+                    "actual_pos_str": f"{actual_x},{actual_y},{actual_z}",
+                    "position_settle_ok": position_settle_ok,
+                    "position_timeout": position_timeout,
+                    "position_error_x_um": position_error_x,
+                    "position_error_y_um": position_error_y,
+                    "position_error_z_um": position_error_z,
+                }
+                data_len_before = len(all_data)
                 daq.get_one_acquisition(
                     all_data=all_data,
                     curr_pos_str=current_pos_str,
                     timeout_ms=ACQ_TIMEOUT_MS,
                     Average_Enable=AVERAGE_ENABLE,
                 )
+                attach_point_metadata(data_len_before, point_metadata)
                 acquired_points += 1
                 if point_index == 1 or point_index == len(trajectory) or point_index % POINT_LOG_INTERVAL == 0:
                     append_run_log(
@@ -779,11 +987,18 @@ def main():
                         total=len(trajectory),
                         x_um=f"{tx:.4f}",
                         y_um=f"{ty:.4f}",
+                        actual_x_um=f"{actual_x:.4f}",
+                        actual_y_um=f"{actual_y:.4f}",
+                        position_settle_ok=position_settle_ok,
                     )
                 if acquisition_dashboard is not None:
                     acquisition_dashboard.update(
                         acquired_points,
-                        current_position=f"X={tx:.4f} um, Y={ty:.4f} um",
+                        current_position=(
+                            f"X={tx:.4f} um, Y={ty:.4f} um"
+                            if position_settle_ok
+                            else f"TARGET X={tx:.4f}, Y={ty:.4f}; ACTUAL X={actual_x:.4f}, Y={actual_y:.4f}"
+                        ),
                     )
                 if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
                     user_stop_requested = True
@@ -833,6 +1048,7 @@ def main():
                         z_v=f"{vz:.4f}",
                     )
                     break
+        acquisition_duration_s = time.monotonic() - acquisition_loop_start_s
         if acquisition_dashboard is not None:
             acquisition_dashboard.update(acquired_points, message="Acquisition loop finished; returning stages.")
             acquisition_dashboard.close()
@@ -842,7 +1058,39 @@ def main():
             acquired_points=acquired_points,
             expected_points=total_points,
             end_reason=end_reason,
+            position_timeout_points=position_timeout_points,
         )
+        if (
+            end_reason == "completed"
+            and acquired_points == total_points
+            and len(all_data) >= acquired_points
+            and position_timeout_points == 0
+        ):
+            record_successful_scan_speed(
+                scan_target=SCAN_TARGET,
+                step_um=STEP_UM,
+                scan_range_x_um=SCAN_RANGE_X_UM,
+                scan_range_y_um=SCAN_RANGE_Y_UM,
+                scan_w=SCAN_W,
+                scan_h=SCAN_H,
+                points=acquired_points,
+                acquisition_duration_s=acquisition_duration_s,
+                scan_pattern=SCAN_PATTERN_LABEL,
+                records_per_point=RECORDS_PER_POINT,
+                samples_per_record=SAMPLES_REC,
+                average_enable=AVERAGE_ENABLE,
+                acq_timeout_ms=ACQ_TIMEOUT_MS,
+            )
+        else:
+            append_run_log(
+                "SCAN_SPEED_RECORD_SKIPPED",
+                reason="not_full_success",
+                end_reason=end_reason,
+                acquired_points=acquired_points,
+                expected_points=total_points,
+                data_points=len(all_data),
+                position_timeout_points=position_timeout_points,
+            )
 
         return_to_start(
             SCAN_TARGET,
@@ -856,6 +1104,12 @@ def main():
             SAMPLE_RETURN_XY_TO_ZERO_AT_END,
             SAMPLE_ZERO_XY_AT_END,
             SAMPLE_ZERO_AXES,
+            sample_return_step_um=SAMPLE_RETURN_STEP_UM,
+            sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+            probe_um_per_v=PROBE_UM_PER_V,
+            probe_return_step_um=PROBE_RETURN_STEP_UM,
         )
         append_run_log(
             "RUN_END_NORMAL",
@@ -867,6 +1121,10 @@ def main():
     except KeyboardInterrupt:
         append_run_log("RUN_END_INTERRUPTED", acquired_points=acquired_points, expected_points=total_points)
         print("\nUser interrupted the scan.")
+        for laser_message in finalize_lasers_once("keyboard_interrupt"):
+            print(laser_message)
+        stop_daq_best_effort("keyboard_interrupt")
+        save_data_once("keyboard_interrupt")
         safe_return_to_start(
             SCAN_TARGET,
             stage,
@@ -879,6 +1137,12 @@ def main():
             SAMPLE_RETURN_XY_TO_ZERO_AT_END,
             SAMPLE_ZERO_XY_AT_END,
             SAMPLE_ZERO_AXES,
+            sample_return_step_um=SAMPLE_RETURN_STEP_UM,
+            sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+            probe_um_per_v=PROBE_UM_PER_V,
+            probe_return_step_um=PROBE_RETURN_STEP_UM,
         )
     except Exception as exc:
         append_run_log(
@@ -889,6 +1153,10 @@ def main():
             traceback=traceback.format_exc(limit=6),
         )
         print(f"\nExperiment error: {exc}")
+        for laser_message in finalize_lasers_once("exception"):
+            print(laser_message)
+        stop_daq_best_effort("exception")
+        save_data_once("exception")
         safe_return_to_start(
             SCAN_TARGET,
             stage,
@@ -901,8 +1169,14 @@ def main():
             SAMPLE_RETURN_XY_TO_ZERO_AT_END,
             SAMPLE_ZERO_XY_AT_END,
             SAMPLE_ZERO_AXES,
+            sample_return_step_um=SAMPLE_RETURN_STEP_UM,
+            sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+            probe_um_per_v=PROBE_UM_PER_V,
+            probe_return_step_um=PROBE_RETURN_STEP_UM,
         )
-        raise
+        append_run_log("RUN_END_ERROR_HANDLED", acquired_points=acquired_points, expected_points=total_points)
     finally:
         append_run_log("FINAL_CLEANUP_BEGIN")
         time.sleep(1)
@@ -916,8 +1190,7 @@ def main():
                     append_run_log("DAQ_INIT_JOINED_DURING_CLEANUP", status=daq_init.snapshot()["status"])
                 except Exception as exc:
                     append_run_log("DAQ_INIT_CLEANUP_JOIN_ERROR", error=repr(exc))
-            if daq is not None:
-                daq.stop_capture()
+            stop_daq_best_effort("finally")
             if acquisition_dashboard is not None:
                 acquisition_dashboard.close()
             if probe_stage is not None:
@@ -929,23 +1202,8 @@ def main():
             append_run_log("FINAL_CLEANUP_ERROR", error=repr(exc))
             print(f"Cleanup error: {exc}")
 
-        save_scan_data(
-            all_data,
-            SCAN_W,
-            SCAN_H,
-            STEP_UM,
-            RECORDS_PER_POINT,
-            SAMPLES_REC,
-            AVERAGE_ENABLE,
-            SCAN_TARGET,
-            coordinate_unit,
-            probe_step_v,
-            PROBE_UM_PER_V,
-            START_X,
-            START_Y,
-            START_Z,
-            DELAY,
-        )
+        if not data_save_done:
+            save_data_once("finally")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 from Nanomax.scan_utils import NANOMAX_MANUAL_MIN_STEP_UM, scan_shape_from_range
+from Nanomax.scan_speed_history import estimate_scan_time, format_duration
 from Nanomax.terminal_panel import TerminalPanelRenderer, format_section_lines, terminal_width
 
 
@@ -31,6 +32,9 @@ class SamplePrealignConfig:
     sample_interval_s: float = 0.25
     auto_refresh_s: float = DEFAULT_AUTO_REFRESH_S
     min_step_um: float = NANOMAX_MANUAL_MIN_STEP_UM
+    position_tolerance_um: float = 0.02
+    position_timeout_s: float = 300.0
+    position_reissue_interval_s: float = 1.0
     allow_probe_switch: bool = False
 
 
@@ -51,6 +55,13 @@ def validate_positive(name, value):
     value = float(value)
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value:g}.")
+    return value
+
+
+def validate_nonnegative(name, value):
+    value = float(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value:g}.")
     return value
 
 
@@ -107,6 +118,16 @@ class SamplePrealignPanel:
         self.z_step_um = validate_manual_step("zstep", config.z_step_um, config.min_step_um)
         self.sample_interval_s = validate_positive("sample_interval_s", config.sample_interval_s)
         self.auto_refresh_s = validate_positive("auto_refresh_s", config.auto_refresh_s)
+        self.config.position_tolerance_um = validate_manual_step(
+            "position_tolerance_um",
+            config.position_tolerance_um,
+            config.min_step_um,
+        )
+        self.config.position_timeout_s = validate_positive("position_timeout_s", config.position_timeout_s)
+        self.config.position_reissue_interval_s = validate_nonnegative(
+            "position_reissue_interval_s",
+            config.position_reissue_interval_s,
+        )
         self.message = "Use hotkeys to set the start position, then ':' and 'start' to begin imaging."
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
@@ -152,11 +173,22 @@ class SamplePrealignPanel:
                 clamped_axes.append(axis.upper())
 
         move_kwargs = {axis: target[axis] if abs(target[axis] - current[axis]) > 1e-9 else None for axis in ("x", "y", "z")}
+        moved_axes = [axis for axis, value in move_kwargs.items() if value is not None]
         if any(value is not None for value in move_kwargs.values()):
-            self.stage.move_xyz(x=move_kwargs["x"], y=move_kwargs["y"], z=move_kwargs["z"], wait=False, settle_time_ms=0)
-            if self.config.settle_ms > 0:
-                time.sleep(float(self.config.settle_ms) / 1000.0)
+            self.stage.move_xyz(
+                x=move_kwargs["x"],
+                y=move_kwargs["y"],
+                z=move_kwargs["z"],
+                wait=True,
+                settle_time_ms=self.config.settle_ms,
+                tolerance=self.config.position_tolerance_um,
+                timeout_s=self.config.position_timeout_s,
+                correction_interval_s=self.config.position_reissue_interval_s,
+            )
         read_x, read_y, read_z = self.refresh()
+        readback = {"x": read_x, "y": read_y, "z": read_z}
+        errors = {axis: abs(readback[axis] - target[axis]) for axis in ("x", "y", "z")}
+        max_moved_error = max((errors[axis] for axis in moved_axes), default=0.0)
         self.log(
             "PREALIGN_MOVE_XYZ",
             reason=reason,
@@ -166,10 +198,21 @@ class SamplePrealignPanel:
             read_x_um=f"{read_x:.6f}",
             read_y_um=f"{read_y:.6f}",
             read_z_um=f"{read_z:.6f}",
+            error_x_um=f"{errors['x']:.6f}",
+            error_y_um=f"{errors['y']:.6f}",
+            error_z_um=f"{errors['z']:.6f}",
+            max_moved_error_um=f"{max_moved_error:.6f}",
+            tolerance_um=f"{self.config.position_tolerance_um:.6f}",
+            timeout_s=f"{self.config.position_timeout_s:g}",
+            reissue_interval_s=f"{self.config.position_reissue_interval_s:g}",
             clamped=",".join(clamped_axes) if clamped_axes else "none",
         )
         suffix = f" (clamped {','.join(clamped_axes)})" if clamped_axes else ""
-        self.message = f"Moved to X={read_x:.4f} um, Y={read_y:.4f} um, Z={read_z:.4f} um{suffix}"
+        self.message = (
+            f"Moved to X={read_x:.4f} um, Y={read_y:.4f} um, Z={read_z:.4f} um; "
+            f"max moved-axis error={max_moved_error:.4f} um "
+            f"(tol={self.config.position_tolerance_um:g} um){suffix}"
+        )
 
     def move_delta(self, x_delta=0.0, y_delta=0.0, z_delta=0.0, reason="key"):
         x, y, z = self.last_xyz
@@ -190,12 +233,14 @@ class SamplePrealignPanel:
             errors.append(f"SCAN_RANGE_X_UM makes X {min_x:.4f}..{max_x:.4f} um exceed [0,{self.travel_um['x']:.4f}]")
         if min_y < -1e-9 or max_y > self.travel_um["y"] + 1e-9:
             errors.append(f"SCAN_RANGE_Y_UM makes Y {min_y:.4f}..{max_y:.4f} um exceed [0,{self.travel_um['y']:.4f}]")
+        estimate = estimate_scan_time("sample_closed_loop", self.config.step_um, scan_w * scan_h)
         return {
             "ok": not errors,
             "error": "; ".join(errors),
             "scan_w": scan_w,
             "scan_h": scan_h,
             "points": scan_w * scan_h,
+            "time_estimate": estimate,
             "x_min": min_x,
             "x_max": max_x,
             "y_min": min_y,
@@ -245,6 +290,9 @@ class SamplePrealignPanel:
             ("interval", f"{self.sample_interval_s:g}", "set interval n"),
             ("refresh", f"{self.auto_refresh_s:g}", "set refresh n"),
             ("SETTLE_MS", f"{self.config.settle_ms:g}", "set SETTLE_MS n"),
+            ("POS_TOL_UM", f"{self.config.position_tolerance_um:g}", "set tolerance n"),
+            ("POS_TIMEOUT_S", f"{self.config.position_timeout_s:g}", "set timeout n"),
+            ("POS_REISSUE_S", f"{self.config.position_reissue_interval_s:g}", "set reissue n"),
         ]
         daq_items = [
             ("DAQ_STATUS", daq_status.get("status", "-"), ""),
@@ -279,6 +327,17 @@ class SamplePrealignPanel:
         lines += section_lines("Scan Parameters", scan_items)
         if scan.get("ok"):
             lines.append(f"Trajectory: shape={scan['scan_w']} x {scan['scan_h']}, points={scan['points']}, X={scan['x_min']:.4f}..{scan['x_max']:.4f} um, Y={scan['y_min']:.4f}..{scan['y_max']:.4f} um")
+            estimate = scan.get("time_estimate")
+            if estimate:
+                lines.append(
+                    "Time estimate: "
+                    f"{format_duration(estimate['estimated_s'])} "
+                    f"at {estimate['speed_pps']:.3f} px/s "
+                    f"(STEP_UM={self.config.step_um:g}, records={estimate['records_used']}/{estimate['history_records']}, "
+                    f"last={estimate['last_timestamp']})"
+                )
+            else:
+                lines.append(f"Time estimate: unavailable until a complete successful STEP_UM={self.config.step_um:g} scan is recorded.")
             lines.append(f"Travel check: OK inside X[0,{self.travel_um['x']:.4f}], Y[0,{self.travel_um['y']:.4f}], Z[0,{self.travel_um['z']:.4f}] um")
         else:
             lines.append(f"Travel/step check: OUT OF RANGE - {scan.get('error')}")
@@ -433,6 +492,19 @@ class SamplePrealignPanel:
         elif target == "settle_ms" and len(tokens) == 2:
             self.config.settle_ms = int(validate_positive("SETTLE_MS", tokens[1]))
             self.message = f"SETTLE_MS set to {self.config.settle_ms:g}."
+        elif target in ("tolerance", "position_tolerance", "position_tolerance_um", "pos_tol", "pos_tol_um") and len(tokens) == 2:
+            self.config.position_tolerance_um = validate_manual_step(
+                "position_tolerance_um",
+                tokens[1],
+                self.config.min_step_um,
+            )
+            self.message = f"position_tolerance_um set to {self.config.position_tolerance_um:g} um."
+        elif target in ("timeout", "position_timeout", "position_timeout_s", "pos_timeout", "pos_timeout_s") and len(tokens) == 2:
+            self.config.position_timeout_s = validate_positive("position_timeout_s", tokens[1])
+            self.message = f"position_timeout_s set to {self.config.position_timeout_s:g} s."
+        elif target in ("reissue", "reissue_interval", "position_reissue", "position_reissue_interval_s", "pos_reissue", "pos_reissue_s") and len(tokens) == 2:
+            self.config.position_reissue_interval_s = validate_nonnegative("position_reissue_interval_s", tokens[1])
+            self.message = f"position_reissue_interval_s set to {self.config.position_reissue_interval_s:g} s."
         elif target == "x" and len(tokens) == 2:
             self.set_xyz(x=float(tokens[1]), reason="command_set_x")
         elif target == "y" and len(tokens) == 2:
@@ -444,7 +516,10 @@ class SamplePrealignPanel:
         elif target == "xyz" and len(tokens) == 4:
             self.set_xyz(x=float(tokens[1]), y=float(tokens[2]), z=float(tokens[3]), reason="command_set_xyz")
         else:
-            raise ValueError("Use set x <um>, set y <um>, set z <um>, set xy <X> <Y>, or set xyz <X> <Y> <Z>.")
+            raise ValueError(
+                "Use set x <um>, set y <um>, set z <um>, set xy <X> <Y>, set xyz <X> <Y> <Z>, "
+                "set tolerance <um>, set timeout <s>, or set reissue <s>."
+            )
 
     def sample_arrow_delta(self):
         x_delta, y_delta, reasons = 0.0, 0.0, []
@@ -511,6 +586,9 @@ Commands after ':' then Enter:
   set interval <sec>                 hotkey polling interval
   set refresh <sec>                  automatic screen redraw interval
   set SETTLE_MS <ms>
+  set tolerance <um>                 closed-loop readback tolerance before reporting move done
+  set timeout <sec>                  closed-loop move timeout
+  set reissue <sec>                  resend target position while outside tolerance; 0 disables resend
   laser refresh                      read 532/TOPTICA status only
   532 emission on/off                explicitly change CBOX emission
   532 trigger ext/int                explicitly change CBOX trigger source

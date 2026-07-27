@@ -404,7 +404,16 @@ class BPC303NativeController:
                 raise TimeoutError(f"BPC303 axis {axis} did not report zeroed status; status=0x{status:08X}")
             time.sleep(0.05)
 
-    def move_axis(self, axis, position, wait=False, settle_time_ms=0, tolerance=0.05, timeout_s=10.0):
+    def move_axis(
+        self,
+        axis,
+        position,
+        wait=False,
+        settle_time_ms=0,
+        tolerance=0.05,
+        timeout_s=10.0,
+        correction_interval_s=1.0,
+    ):
         channel_id = self._channel_id(axis)
         target_count = self._position_to_count(axis, position)
         self._check_result(
@@ -412,14 +421,32 @@ class BPC303NativeController:
             f"PBC_SetPosition(axis={axis}, count={target_count})",
         )
         if wait:
-            self.wait_until_axis_settled(axis, position, settle_time_ms, tolerance, timeout_s)
+            self.wait_until_axis_settled(axis, position, settle_time_ms, tolerance, timeout_s, correction_interval_s)
 
-    def move_xyz(self, x=None, y=None, z=None, wait=False, settle_time_ms=0, tolerance=0.05, timeout_s=10.0):
+    def move_xyz(
+        self,
+        x=None,
+        y=None,
+        z=None,
+        wait=False,
+        settle_time_ms=0,
+        tolerance=0.05,
+        timeout_s=10.0,
+        correction_interval_s=1.0,
+    ):
         for axis, value in {"x": x, "y": y, "z": z}.items():
             if value is not None:
                 self.move_axis(axis, value)
         if wait:
-            self.wait_until_settled(x, y, target_z=z, settle_time_ms=settle_time_ms, tolerance_step=tolerance, timeout_s=timeout_s)
+            self.wait_until_settled(
+                x,
+                y,
+                target_z=z,
+                settle_time_ms=settle_time_ms,
+                tolerance_step=tolerance,
+                timeout_s=timeout_s,
+                correction_interval_s=correction_interval_s,
+            )
 
     def set_position(self, position):
         if len(position) == 2:
@@ -429,11 +456,23 @@ class BPC303NativeController:
         else:
             raise ValueError("position must be [x, y] or [x, y, z]")
 
-    def wait_until_axis_settled(self, axis, target, settle_time_ms=0, tolerance=0.05, timeout_s=10.0):
+    def wait_until_axis_settled(
+        self,
+        axis,
+        target,
+        settle_time_ms=0,
+        tolerance=0.05,
+        timeout_s=10.0,
+        correction_interval_s=1.0,
+    ):
         start = time.time()
+        last_correction = start
+        correction_count = 0
+        correction_interval_s = max(0.0, float(correction_interval_s))
         stable_once = False
         target = float(target)
         while True:
+            now = time.time()
             current = self.get_axis_position(axis)
             if abs(current - target) <= tolerance:
                 if stable_once:
@@ -444,9 +483,28 @@ class BPC303NativeController:
                 time.sleep(0.02)
             else:
                 stable_once = False
+                if correction_interval_s > 0 and now - last_correction >= correction_interval_s:
+                    self.move_axis(axis, target)
+                    correction_count += 1
+                    last_correction = now
+                    self._log(
+                        "BPC303_POSITION_REISSUE",
+                        axis=axis,
+                        target_um=f"{target:.6f}",
+                        current_um=f"{current:.6f}",
+                        error_um=f"{abs(current - target):.6f}",
+                        tolerance_um=f"{float(tolerance):g}",
+                        correction_count=correction_count,
+                    )
                 time.sleep(0.02)
             if time.time() - start > timeout_s:
-                raise TimeoutError(f"BPC303 native axis {axis} did not settle at {target} um")
+                error = abs(current - target)
+                raise TimeoutError(
+                    f"BPC303 native axis {axis} did not settle at {target} um; "
+                    f"current={current:.6f} um, error={error:.6f} um, "
+                    f"tolerance={float(tolerance):g} um, timeout={float(timeout_s):g} s, "
+                    f"corrections={correction_count}"
+                )
 
     def wait_until_settled(
         self,
@@ -456,15 +514,25 @@ class BPC303NativeController:
         settle_time_ms=0,
         tolerance_step=0.05,
         timeout_s=10.0,
+        correction_interval_s=1.0,
     ):
         targets = {"x": target_x, "y": target_y}
         if target_z is not None:
             targets["z"] = target_z
         start = time.time()
+        last_correction = start
+        correction_count = 0
+        correction_interval_s = max(0.0, float(correction_interval_s))
         stable_once = False
         while True:
+            now = time.time()
             values = {axis: self.get_axis_position(axis) for axis in targets if targets[axis] is not None}
-            if all(abs(values[axis] - float(target)) <= tolerance_step for axis, target in targets.items() if target is not None):
+            errors = {
+                axis: abs(values[axis] - float(targets[axis]))
+                for axis in values
+                if targets[axis] is not None
+            }
+            if all(error <= tolerance_step for error in errors.values()):
                 if stable_once:
                     if settle_time_ms:
                         time.sleep(settle_time_ms / 1000.0)
@@ -473,9 +541,31 @@ class BPC303NativeController:
                 time.sleep(0.02)
             else:
                 stable_once = False
+                if correction_interval_s > 0 and now - last_correction >= correction_interval_s:
+                    reissued_axes = []
+                    for axis, error in errors.items():
+                        if error > tolerance_step:
+                            self.move_axis(axis, targets[axis])
+                            reissued_axes.append(axis)
+                    if reissued_axes:
+                        correction_count += 1
+                        last_correction = now
+                        self._log(
+                            "BPC303_POSITION_REISSUE",
+                            axes=",".join(reissued_axes),
+                            targets_um={axis: f"{float(targets[axis]):.6f}" for axis in reissued_axes},
+                            current_um={axis: f"{values[axis]:.6f}" for axis in reissued_axes},
+                            errors_um={axis: f"{errors[axis]:.6f}" for axis in reissued_axes},
+                            tolerance_um=f"{float(tolerance_step):g}",
+                            correction_count=correction_count,
+                        )
                 time.sleep(0.02)
             if time.time() - start > timeout_s:
-                raise TimeoutError(f"BPC303 native did not settle at {targets}; current={values}")
+                raise TimeoutError(
+                    f"BPC303 native did not settle at {targets}; current={values}, "
+                    f"errors={errors}, tolerance={float(tolerance_step):g} um, "
+                    f"timeout={float(timeout_s):g} s, corrections={correction_count}"
+                )
 
     def close(self):
         for channel_id in list(self._polling_channels):
