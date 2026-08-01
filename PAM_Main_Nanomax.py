@@ -72,8 +72,8 @@ def env_str(name, default):
 # Operator-editable defaults. Environment variables with the same names still
 # override these values at runtime, but these are the script-level knobs to edit
 # when the lab wants a different default behavior.
-DEFAULT_532_CLOSE_AT_END = True
-DEFAULT_TOPTICA_CLOSE_AT_END = True
+DEFAULT_532_CLOSE_AT_END = False
+DEFAULT_TOPTICA_CLOSE_AT_END = False
 # False returns to the prealignment-selected scan start; True returns X/Y to 0 um.
 DEFAULT_SAMPLE_RETURN_XY_TO_ZERO_AT_END = True
 
@@ -219,7 +219,7 @@ def main():
     # Example: 20 um range with 1 um step gives 21 points: 0, 1, ..., 20 um.
     # The script also checks against the BPC303-reported maximum travel before acquisition.
     SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM = (
-        env_float("PAM_SCAN_RANGE_X_UM", 9.75),
+        env_float("PAM_SCAN_RANGE_X_UM", 18.75),
         env_float("PAM_SCAN_RANGE_Y_UM", 18.75),
         env_float("PAM_STEP_UM", 0.75),
     )  # X is actually up; Y is actually left.
@@ -253,8 +253,8 @@ def main():
     DATA_SAVE_AUTO_TIMEOUT_S = env_float("PAM_DATA_SAVE_AUTO_TIMEOUT_S", 60.0)
 
     # DAQ parameters.
-    DELAY, SAMPLES_REC, SAMPLE_RATE = int(405*4), 4096, ats.SAMPLE_RATE_4000MSPS
-    AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 256, 4
+    DELAY, SAMPLES_REC, SAMPLE_RATE = int(251*4), 4096, ats.SAMPLE_RATE_4000MSPS
+    AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 512, 4
     ACQ_TIMEOUT_MS = env_int("PAM_ACQ_TIMEOUT_MS", 1000)
     POINT_LOG_INTERVAL, USER_STOP_ENABLE, USER_STOP_KEY = 25, True, "q"
 

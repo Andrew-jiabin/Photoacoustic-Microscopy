@@ -1,5 +1,5 @@
 %% 1. 全量加载数据（保持不变）
-mat_path = "./data/2026-07-13_14-38-12-D-1320-AVER-256-test1-fail-in-haif.mat";
+mat_path = "./data/2026-07-31_13-44-15-D-1004-AVER-512.mat";
 fprintf('正在将数据全量加载至内存...\n');
 tic;
 S = load(mat_path); 
