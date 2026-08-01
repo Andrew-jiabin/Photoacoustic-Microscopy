@@ -11,6 +11,7 @@ from typing import Any
 
 DEFAULT_PROCESSING_SKILL_PATH = r"D:\Phd_training\skills\data-processing-skill"
 DEFAULT_OUTPUT_ROOT = r".\results\cache\pam_preview"
+REPO_PROCESSING_SRC = r"Tool_code\pam_scan_processing_src"
 
 
 @dataclass
@@ -49,13 +50,27 @@ class PAMResultPreviewController:
             or os.environ.get("PAM_PROCESSING_SKILL_PATH")
             or DEFAULT_PROCESSING_SKILL_PATH
         ).resolve()
+        self._processing_src = self._resolve_processing_src()
         self.python_executable = str(python_executable or sys.executable)
         self.timeout_s = float(timeout_s)
         self.log = log_callback or (lambda *args, **kwargs: None)
 
     @property
     def processing_src(self) -> Path:
-        return self.processing_skill_path / "scripts" / "pam_scan_processing" / "src"
+        return self._processing_src
+
+    def _resolve_processing_src(self) -> Path:
+        candidates = []
+        configured = self.processing_skill_path
+        if (configured / "pam_scan_processing").exists():
+            candidates.append(configured)
+        candidates.append(configured / "scripts" / "pam_scan_processing" / "src")
+        candidates.append(self.project_root / REPO_PROCESSING_SRC)
+        candidates.append(self.project_root / "scripts" / "pam_scan_processing" / "src")
+        for candidate in candidates:
+            if (candidate / "pam_scan_processing").exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
 
     def available(self) -> tuple[bool, str]:
         package_dir = self.processing_src / "pam_scan_processing"
@@ -135,25 +150,31 @@ class PAMResultPreviewController:
         normalized_mode = str(mode).strip().lower()
         try:
             if normalized_mode in {"all", "axis", "axis-time", "time"}:
+                axis_code = (
+                    "import json, sys; "
+                    "from pathlib import Path; "
+                    "from pam_scan_processing.core import parse_slice; "
+                    "from pam_scan_processing.time_axis_map import write_axis_time_checker; "
+                    "result = write_axis_time_checker("
+                    "input_spec=sys.argv[1], output_dir=Path(sys.argv[2]), "
+                    "display_window=parse_slice(sys.argv[3], 0, -1), "
+                    "baseline=parse_slice(sys.argv[4], 0, 100), "
+                    "time_step=int(sys.argv[5]), initial_mode=sys.argv[6], "
+                    "use_hilbert=(sys.argv[7] == '1')); "
+                    "print(json.dumps(result, ensure_ascii=True))"
+                )
                 axis_args = [
                     self.python_executable,
-                    "-m",
-                    "pam_scan_processing.time_axis_map",
-                    "--input",
+                    "-c",
+                    axis_code,
                     input_path,
-                    "--output-dir",
                     str(output_dir),
-                    "--display-window",
                     display_window,
-                    "--baseline",
                     baseline,
-                    "--time-step",
                     str(int(time_step)),
-                    "--mode",
                     axis_mode,
+                    "1" if hilbert else "0",
                 ]
-                if hilbert:
-                    axis_args.append("--hilbert")
                 self._append_completed(result, "axis-time", self._run(axis_args))
 
             if normalized_mode in {"all", "3d", "interactive"}:

@@ -112,9 +112,11 @@ Expected success wording includes:
   It does not write preview artifacts into the raw `./data` directory.
 - The processing bridge uses the Python interpreter running the PAM program and
   adds `PAM_PROCESSING_SKILL_PATH/scripts/pam_scan_processing/src` to
-  `PYTHONPATH` for subprocess calls. Default processing parameters are
-  `display_window=0:4000`, `baseline=0:100`, `time_step=1`,
-  `mode=xy`, and Hilbert enabled for Axis-time.
+  `PYTHONPATH` for subprocess calls. If that external skill path is absent on
+  the experiment computer, it falls back to the vendored source under
+  `Tool_code/pam_scan_processing_src`. Default processing parameters are
+  `display_window=0:4000`, `baseline=0:100`, `time_step=1`, `mode=xy`, and
+  Hilbert enabled for Axis-time.
 
 ## Verified Small-Scan Test
 
