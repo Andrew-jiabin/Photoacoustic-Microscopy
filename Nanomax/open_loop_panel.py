@@ -142,9 +142,16 @@ class ProbePrealignPanel:
         target_z = current_z if z is None else float(z)
         target_y, y_clamped = clamp(target_y, 0.0, self.safe_max_voltage)
         target_z, z_clamped = clamp(target_z, 0.0, self.safe_max_voltage)
-        if abs(target_y - current_y) > 1e-9:
+        y_changed = abs(target_y - current_y) > 1e-9
+        z_changed = abs(target_z - current_z) > 1e-9
+        if not y_changed and not z_changed:
+            if not str(reason).startswith(("key", "hotkey")):
+                suffix = " at boundary" if y_clamped or z_clamped else ""
+                self.message = f"No probe voltage change needed: Y={current_y:.3f} V, Z={current_z:.3f} V{suffix}."
+            return False
+        if y_changed:
             self.stage.set_voltage_axis("y", target_y)
-        if abs(target_z - current_z) > 1e-9:
+        if z_changed:
             self.stage.set_voltage_axis("z", target_z)
         if self.config.settle_ms > 0:
             time.sleep(float(self.config.settle_ms) / 1000.0)
@@ -165,10 +172,11 @@ class ProbePrealignPanel:
             f"Moved probe: Y={read_y:.3f} V ~= {self.voltage_to_um(read_y):.2f} um, "
             f"Z={read_z:.3f} V ~= {self.voltage_to_um(read_z):.2f} um{suffix}"
         )
+        return True
 
     def move_delta(self, y_delta=0.0, z_delta=0.0, reason="key"):
         _, current_y, current_z = self.last_xyz
-        self.set_yz(y=current_y + float(y_delta), z=current_z + float(z_delta), reason=reason)
+        return self.set_yz(y=current_y + float(y_delta), z=current_z + float(z_delta), reason=reason)
 
     def sample_arrow_delta(self):
         y_delta, z_delta, reasons = 0.0, 0.0, []
@@ -457,9 +465,9 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
                 panel.message = "Status refreshed."
                 redraw(refresh=True)
             elif char in ("0", "r", "R"):
-                panel.set_yz(0.0, 0.0, reason="hotkey_zero_yz")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.set_yz(0.0, 0.0, reason="hotkey_zero_yz"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             elif char == "+":
                 panel.y_step_v *= 2.0
                 panel.z_step_v *= 2.0
@@ -481,9 +489,9 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
         if running:
             y_delta, z_delta, reason = panel.sample_arrow_delta()
             if y_delta or z_delta:
-                panel.move_delta(y_delta=y_delta, z_delta=z_delta, reason=f"key_state_{reason}")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.move_delta(y_delta=y_delta, z_delta=z_delta, reason=f"key_state_{reason}"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             else:
                 status_signature = panel.status_signature()
                 if status_signature != last_status_signature:

@@ -9,6 +9,9 @@ This note records the operational decisions that are easy to lose when editing
 - Put reusable hardware code under `Alazar_imaging/`, not inside the main script.
 - Keep prealignment and acquisition dashboards under `Nanomax/`.
 - Use `Tool_code/` for diagnostics and standalone tests only.
+- Keep data-processing bridge code in a small reusable class
+  (`Nanomax/result_preview.py`). The main script only passes a `.mat` path and
+  receives artifact paths; it should not embed plotting or processing logic.
 
 ## Closed-Loop Sample NanoMax
 
@@ -86,9 +89,32 @@ Expected success wording includes:
 - Return-to-start is segmented along a straight line with
   `PAM_SAMPLE_RETURN_STEP_UM` or `PAM_PROBE_RETURN_STEP_UM`, avoiding one large
   step back to the start or low-end zero.
-- Save prompts default to preserving data. If the operator does not answer
-  within `PAM_DATA_SAVE_AUTO_TIMEOUT_S`, data are saved automatically with no
-  filename suffix.
+- In prealignment panels, keyboard moves are clamped before any device command.
+  If the current position is already at the requested boundary, repeated key
+  events return immediately and do not issue a device command, read back, log a
+  move, or redraw the whole panel.
+
+## Data Save And Preview
+
+- End-of-run data saving is two-stage. First, the program always writes a
+  default `.mat` under `./data` before asking about suffixes. Then, if the
+  operator explicitly enters a suffix, it safely renames that saved file.
+- Suffix rename never overwrites an existing target. If the suffixed filename
+  exists, a unique numeric suffix is chosen; if rename fails, the default file
+  is kept and logged.
+- During acquisition, pressing `q` pauses at a point boundary. In the paused
+  state, `y` stops cleanly, `Esc` resumes, and result-preview shortcuts are:
+  `p` for all, `a` for Axis-time, `3` for 3D, and `i` for index-only.
+- Live preview uses `PAMResultPreviewController`. It snapshots the current
+  acquired points to `PAM_RESULT_PREVIEW_SNAPSHOT_DIR` (default
+  `./results/cache/pam_live_snapshots`) and writes generated HTML under
+  `PAM_RESULT_PREVIEW_OUTPUT_DIR` (default `./results/cache/pam_preview`).
+  It does not write preview artifacts into the raw `./data` directory.
+- The processing bridge uses the Python interpreter running the PAM program and
+  adds `PAM_PROCESSING_SKILL_PATH/scripts/pam_scan_processing/src` to
+  `PYTHONPATH` for subprocess calls. Default processing parameters are
+  `display_window=0:4000`, `baseline=0:100`, `time_step=1`,
+  `mode=xy`, and Hilbert enabled for Axis-time.
 
 ## Verified Small-Scan Test
 

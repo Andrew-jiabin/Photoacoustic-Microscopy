@@ -59,6 +59,7 @@ MDT 开环控制器只读枚举：
 - 启用探针扫描时必须显式设置 `PROBE_STEP_V`，或先完成标定后设置 `PROBE_UM_PER_V`。
 - 未经现场确认，不要运行任何会改变压电输入电压或位置的测试脚本。
 - 激光与 NanoMax 主程序集成细节见 `reference/PAM_Nanomax_laser_integration_notes.md`。532 nm CBOX 关闭以 D2XX `9600 8N1 no-flow` 通信和 `flags` 读回为准；软件只能关闭 emission，不能替代前面板物理 Laser OFF/Stand By 操作。
+- 采集结束数据先保存默认 `.mat`，再按需安全 rename 后缀；采集中按 `q` 暂停后可用 `p/a/3/i` 在 `results/cache` 生成当前数据预览。
 
 # 位移台性能测试
 ### 经验

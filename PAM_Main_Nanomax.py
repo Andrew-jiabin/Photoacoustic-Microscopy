@@ -14,10 +14,11 @@ from Alazar_imaging.laser_runtime import LaserRunOptions, PamLaserManager
 from Alazar_imaging.MDT693BController import MDT693BController
 from Nanomax.acquisition_panel import AcquisitionDashboard
 from Nanomax.daq_async import BackgroundDaqInit
-from Nanomax.data_io import save_scan_data
+from Nanomax.data_io import save_scan_data, save_scan_snapshot_data
 from Nanomax.open_loop_panel import ProbePrealignConfig
 from Nanomax.prealign_panel import SamplePrealignConfig
 from Nanomax.prealignment_workflow import run_nanomax_prealignment
+from Nanomax.result_preview import PAMResultPreviewController
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log, inspect_previous_run, resolve_start_zero_policy, set_current_run_id
 from Nanomax.runtime import find_other_pam_processes, return_to_start, run_bpc303_preflight, safe_return_to_start
 from Nanomax.scan_utils import (
@@ -251,6 +252,11 @@ def main():
     SAMPLE_RETURN_STEP_UM = env_float("PAM_SAMPLE_RETURN_STEP_UM", 0.1)
     PROBE_RETURN_STEP_UM = env_float("PAM_PROBE_RETURN_STEP_UM", 0.1)
     DATA_SAVE_AUTO_TIMEOUT_S = env_float("PAM_DATA_SAVE_AUTO_TIMEOUT_S", 60.0)
+    RESULT_PREVIEW_ENABLE = env_bool("PAM_RESULT_PREVIEW_ENABLE", True)
+    RESULT_PREVIEW_OUTPUT_DIR = env_str("PAM_RESULT_PREVIEW_OUTPUT_DIR", r".\results\cache\pam_preview")
+    RESULT_PREVIEW_SNAPSHOT_DIR = env_str("PAM_RESULT_PREVIEW_SNAPSHOT_DIR", r".\results\cache\pam_live_snapshots")
+    RESULT_PREVIEW_TIMEOUT_S = env_float("PAM_RESULT_PREVIEW_TIMEOUT_S", 900.0)
+    PROCESSING_SKILL_PATH = env_str("PAM_PROCESSING_SKILL_PATH", r"D:\Phd_training\skills\data-processing-skill")
 
     # DAQ parameters.
     DELAY, SAMPLES_REC, SAMPLE_RATE = int(251*4), 4096, ats.SAMPLE_RATE_4000MSPS
@@ -343,6 +349,11 @@ def main():
         sample_return_step_um=SAMPLE_RETURN_STEP_UM,
         probe_return_step_um=PROBE_RETURN_STEP_UM,
         data_save_auto_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
+        result_preview_enable=RESULT_PREVIEW_ENABLE,
+        result_preview_output_dir=RESULT_PREVIEW_OUTPUT_DIR,
+        result_preview_snapshot_dir=RESULT_PREVIEW_SNAPSHOT_DIR,
+        result_preview_timeout_s=RESULT_PREVIEW_TIMEOUT_S,
+        processing_skill_path=PROCESSING_SKILL_PATH,
         point_log_interval=POINT_LOG_INTERVAL,
         user_stop_enable=USER_STOP_ENABLE,
         user_stop_key=USER_STOP_KEY,
@@ -383,11 +394,25 @@ def main():
     position_timeout_points = 0
     acquisition_loop_start_s = None
     data_save_done = False
+    last_saved_mat_path = None
+    preview_snapshot_serial = 0
     prealignment_started_acquisition = False
     probe_connect_error = ""
+    result_preview_controller = (
+        PAMResultPreviewController(
+            project_root=os.getcwd(),
+            output_root=RESULT_PREVIEW_OUTPUT_DIR,
+            processing_skill_path=PROCESSING_SKILL_PATH,
+            python_executable=sys.executable,
+            log_callback=append_run_log,
+            timeout_s=RESULT_PREVIEW_TIMEOUT_S,
+        )
+        if RESULT_PREVIEW_ENABLE
+        else None
+    )
 
     def save_data_once(reason):
-        nonlocal data_save_done
+        nonlocal data_save_done, last_saved_mat_path
         if data_save_done:
             append_run_log("DATA_SAVE_ONCE_SKIPPED_ALREADY_DONE", reason=reason)
             return None
@@ -410,9 +435,40 @@ def main():
             DELAY,
             save_prompt_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
         )
+        if isinstance(result, dict) and result.get("status") == "saved" and result.get("path"):
+            last_saved_mat_path = result["path"]
+            append_run_log("DATA_SAVE_CURRENT_FILE", reason=reason, path=last_saved_mat_path)
         data_save_done = True
         append_run_log("DATA_SAVE_ONCE_DONE", reason=reason, result=repr(result))
         return result
+
+    def current_preview_mat_path():
+        nonlocal preview_snapshot_serial, last_saved_mat_path
+        if all_data:
+            preview_snapshot_serial += 1
+            snapshot = save_scan_snapshot_data(
+                all_data,
+                SCAN_W,
+                SCAN_H,
+                STEP_UM,
+                RECORDS_PER_POINT,
+                SAMPLES_REC,
+                AVERAGE_ENABLE,
+                SCAN_TARGET,
+                coordinate_unit,
+                probe_step_v,
+                PROBE_UM_PER_V,
+                START_X,
+                START_Y,
+                START_Z,
+                output_dir=RESULT_PREVIEW_SNAPSHOT_DIR,
+                label=f"{CURRENT_RUN_ID}-points-{len(all_data):06d}-{preview_snapshot_serial:03d}",
+            )
+            if isinstance(snapshot, dict) and snapshot.get("status") == "saved" and snapshot.get("path"):
+                last_saved_mat_path = snapshot["path"]
+                return snapshot["path"]
+            append_run_log("DATA_PREVIEW_SNAPSHOT_UNAVAILABLE", result=repr(snapshot))
+        return last_saved_mat_path
 
     def stop_daq_best_effort(reason):
         if daq is None:
@@ -885,6 +941,8 @@ def main():
             ("SAMPLE_RETURN_XY_TO_ZERO_AT_END", SAMPLE_RETURN_XY_TO_ZERO_AT_END, "frozen"),
             ("SAMPLE_ZERO_XY_AT_END", SAMPLE_ZERO_XY_AT_END, "frozen"),
             ("DATA_SAVE_AUTO_TIMEOUT_S", f"{DATA_SAVE_AUTO_TIMEOUT_S:g}", "frozen"),
+            ("RESULT_PREVIEW_ENABLE", RESULT_PREVIEW_ENABLE, "frozen"),
+            ("RESULT_PREVIEW_OUTPUT", RESULT_PREVIEW_OUTPUT_DIR, "frozen"),
         ]
         refresh_terminal_for_acquisition()
         acquisition_dashboard = AcquisitionDashboard(
@@ -896,6 +954,8 @@ def main():
             scan_items=scan_dashboard_items,
             daq_items=daq_dashboard_items,
             runtime_items=runtime_dashboard_items,
+            result_preview_controller=result_preview_controller,
+            mat_path_provider=current_preview_mat_path,
             log_callback=append_run_log,
         )
         acquisition_dashboard.start()
@@ -904,6 +964,15 @@ def main():
 
         if SCAN_TARGET == "sample_closed_loop":
             for point_index, (tx, ty) in enumerate(trajectory, start=1):
+                if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
+                    user_stop_requested = True
+                    append_run_log(
+                        "ACQUISITION_USER_STOP_BEFORE_POINT",
+                        index=point_index,
+                        total=len(trajectory),
+                        acquired_points=acquired_points,
+                    )
+                    break
                 stage.set_position([tx, ty])
                 position_settle_ok = True
                 position_timeout = False
@@ -1013,6 +1082,15 @@ def main():
                     break
         else:
             for point_index, (vx, vy, vz) in enumerate(trajectory, start=1):
+                if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
+                    user_stop_requested = True
+                    append_run_log(
+                        "ACQUISITION_USER_STOP_BEFORE_POINT",
+                        index=point_index,
+                        total=len(trajectory),
+                        acquired_points=acquired_points,
+                    )
+                    break
                 probe_stage.set_voltage_xyz(x=vx, y=vy, z=vz, wait=True, settle_time_ms=SETTLE_MS)
                 current_pos_str = f"{vx},{vy},{vz}"
                 daq.get_one_acquisition(

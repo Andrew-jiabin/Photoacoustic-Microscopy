@@ -1,6 +1,7 @@
 import datetime
 import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -10,6 +11,9 @@ import scipy.io as sio
 
 from Nanomax.run_log import append_run_log
 from Tool_code.position_trans import sanitize_pos_to_key
+
+
+SAFE_SUFFIX_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _timed_console_line(prompt, timeout_s=60.0, default_text=""):
@@ -98,6 +102,33 @@ def timed_choice(prompt, choices, default, timeout_s=60.0):
         print(f"Please enter one of: {', '.join(normalized_choices)}")
 
 
+def sanitize_filename_suffix(suffix, max_length=80):
+    text = SAFE_SUFFIX_RE.sub("-", str(suffix).strip().lower())
+    text = text.strip(".-_")
+    return text[:max_length].strip(".-_")
+
+
+def _unique_path(path):
+    base, ext = os.path.splitext(path)
+    if not os.path.exists(path):
+        return path
+    for index in range(2, 10000):
+        candidate = f"{base}-{index}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    raise FileExistsError(f"Could not find a unique filename for {path}")
+
+
+def _rename_with_suffix_no_overwrite(default_path, suffix):
+    safe_suffix = sanitize_filename_suffix(suffix)
+    if not safe_suffix:
+        return default_path, False, "empty_suffix"
+    base, ext = os.path.splitext(default_path)
+    target_path = _unique_path(f"{base}-{safe_suffix}{ext}")
+    os.rename(default_path, target_path)
+    return target_path, True, "renamed"
+
+
 def package_point_data_for_save(raw_data_content, average_enable, records_per_point, samples_per_record):
     """Normalize one acquired point into the waveform array saved in the .mat file."""
     if average_enable:
@@ -131,7 +162,7 @@ def package_point_data_for_save(raw_data_content, average_enable, records_per_po
     return raw_array.astype(np.uint16), "raw_from_array"
 
 
-def save_scan_data(
+def build_scan_mat_dict(
     all_data,
     scan_w,
     scan_h,
@@ -146,31 +177,10 @@ def save_scan_data(
     start_x,
     start_y,
     start_z,
-    delay,
-    save_prompt_timeout_s=60.0,
 ):
     if len(all_data) == 0:
-        append_run_log("DATA_SAVE_SKIPPED", reason="no_valid_data")
-        print("No valid data acquired; skipping save.")
-        return {"status": "skipped", "reason": "no_valid_data"}
+        return None, [], [], 0
 
-    append_run_log("DATA_SAVE_PROMPT", points=len(all_data), timeout_s=save_prompt_timeout_s, default="y")
-    save_confirm, save_auto = timed_choice(
-        f"\nExperiment stopped with {len(all_data)} acquired points. Save data? (y/n)",
-        ("y", "n"),
-        default="y",
-        timeout_s=save_prompt_timeout_s,
-    )
-    if save_auto:
-        append_run_log("DATA_SAVE_AUTO_CONFIRMED", points=len(all_data), timeout_s=save_prompt_timeout_s)
-        print("No save response before timeout; automatically saving without a filename suffix.")
-    if save_confirm == "n":
-        append_run_log("DATA_DISCARDED_BY_USER", points=len(all_data))
-        print("User chose not to save data; acquired data was discarded.")
-        return {"status": "discarded", "points": len(all_data)}
-
-    append_run_log("DATA_PACKAGING_BEGIN", points=len(all_data))
-    print("Packaging and saving data...")
     mat_dict = {}
     index_to_pos = []
     skipped_pos = []
@@ -208,9 +218,7 @@ def save_scan_data(
             position_error_z_um.append(float(point_meta.get("position_error_z_um", 0.0)))
 
         if not index_to_pos:
-            append_run_log("DATA_SAVE_SKIPPED", reason="no_packageable_data", skipped_points=len(skipped_pos))
-            print("No packageable acquisition data was available. This usually means the DAQ did not receive valid trigger buffers.")
-            return {"status": "skipped", "reason": "no_packageable_data", "skipped_points": len(skipped_pos)}
+            return mat_dict, index_to_pos, skipped_pos, 0
 
         mat_dict["metadata"] = {
             "scan_shape": [scan_w, scan_h],
@@ -238,37 +246,214 @@ def save_scan_data(
             "probe_stage": "MAX312D",
             "probe_controller": "MDT693B",
         }
+        position_timeout_count = int(sum(position_timeout_list))
+        return mat_dict, index_to_pos, skipped_pos, position_timeout_count
+    except Exception:
+        raise
 
-        if save_auto:
-            suffix = ""
-        else:
-            suffix_confirm = input("\nAdd an English filename suffix? (y/n): ").strip().lower()
-            while suffix_confirm not in ("y", "n"):
-                suffix_confirm = input("\nAdd an English filename suffix? (y/n): ").strip().lower()
-            suffix = input("\nSuffix: ").strip().lower() if suffix_confirm == "y" else ""
 
-        os.makedirs("./data", exist_ok=True)
-        suffix_part = f"-{suffix}" if suffix else ""
-        save_path = (
-            f"./data/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-            f"-D-{delay}-AVER-{records_per_point}{suffix_part}.mat"
+def _default_data_save_path(delay, records_per_point, output_dir="./data"):
+    os.makedirs(output_dir, exist_ok=True)
+    return _unique_path(
+        os.path.join(
+            output_dir,
+            f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-D-{delay}-AVER-{records_per_point}.mat",
         )
+    )
+
+
+def _default_snapshot_save_path(output_dir, label):
+    os.makedirs(output_dir, exist_ok=True)
+    safe_label = sanitize_filename_suffix(label) or "snapshot"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return _unique_path(os.path.join(output_dir, f"{timestamp}-{safe_label}.mat"))
+
+
+def save_scan_snapshot_data(
+    all_data,
+    scan_w,
+    scan_h,
+    step_um,
+    records_per_point,
+    samples_per_record,
+    average_enable,
+    scan_target,
+    coordinate_unit,
+    probe_step_v,
+    probe_um_per_v,
+    start_x,
+    start_y,
+    start_z,
+    output_dir,
+    label="live-preview",
+):
+    if len(all_data) == 0:
+        append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_valid_data")
+        return {"status": "skipped", "reason": "no_valid_data"}
+    append_run_log("DATA_PREVIEW_SNAPSHOT_PACKAGING_BEGIN", points=len(all_data), output_dir=output_dir)
+    try:
+        mat_dict, index_to_pos, skipped_pos, position_timeout_count = build_scan_mat_dict(
+            all_data,
+            scan_w,
+            scan_h,
+            step_um,
+            records_per_point,
+            samples_per_record,
+            average_enable,
+            scan_target,
+            coordinate_unit,
+            probe_step_v,
+            probe_um_per_v,
+            start_x,
+            start_y,
+            start_z,
+        )
+        if not index_to_pos:
+            append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_packageable_data", skipped_points=len(skipped_pos))
+            return {"status": "skipped", "reason": "no_packageable_data", "skipped_points": len(skipped_pos)}
+        save_path = _default_snapshot_save_path(output_dir, label)
         sio.savemat(save_path, mat_dict)
         append_run_log(
-            "DATA_SAVED",
+            "DATA_PREVIEW_SNAPSHOT_SAVED",
             path=save_path,
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
-            position_timeout_count=int(sum(position_timeout_list)),
+            position_timeout_count=position_timeout_count,
+        )
+        return {"status": "saved", "path": save_path, "points": len(index_to_pos), "skipped_points": len(skipped_pos)}
+    except Exception as exc:
+        append_run_log("DATA_PREVIEW_SNAPSHOT_FAILED", error=repr(exc))
+        return {"status": "failed", "error": repr(exc)}
+
+
+def save_scan_data(
+    all_data,
+    scan_w,
+    scan_h,
+    step_um,
+    records_per_point,
+    samples_per_record,
+    average_enable,
+    scan_target,
+    coordinate_unit,
+    probe_step_v,
+    probe_um_per_v,
+    start_x,
+    start_y,
+    start_z,
+    delay,
+    save_prompt_timeout_s=60.0,
+):
+    if len(all_data) == 0:
+        append_run_log("DATA_SAVE_SKIPPED", reason="no_valid_data")
+        print("No valid data acquired; skipping save.")
+        return {"status": "skipped", "reason": "no_valid_data"}
+
+    append_run_log("DATA_PACKAGING_BEGIN", points=len(all_data))
+    print("Packaging and saving data before any suffix prompt...")
+
+    try:
+        mat_dict, index_to_pos, skipped_pos, position_timeout_count = build_scan_mat_dict(
+            all_data,
+            scan_w,
+            scan_h,
+            step_um,
+            records_per_point,
+            samples_per_record,
+            average_enable,
+            scan_target,
+            coordinate_unit,
+            probe_step_v,
+            probe_um_per_v,
+            start_x,
+            start_y,
+            start_z,
+        )
+
+        if not index_to_pos:
+            append_run_log("DATA_SAVE_SKIPPED", reason="no_packageable_data", skipped_points=len(skipped_pos))
+            print("No packageable acquisition data was available. This usually means the DAQ did not receive valid trigger buffers.")
+            return {"status": "skipped", "reason": "no_packageable_data", "skipped_points": len(skipped_pos)}
+
+        default_save_path = _default_data_save_path(delay, records_per_point)
+        sio.savemat(default_save_path, mat_dict)
+        append_run_log(
+            "DATA_SAVED_DEFAULT",
+            path=default_save_path,
+            points=len(index_to_pos),
+            skipped_points=len(skipped_pos),
+            position_timeout_count=position_timeout_count,
         )
         print(
-            f"\nSaved {len(index_to_pos)} position points to {save_path}; skipped {len(skipped_pos)} invalid points. "
+            f"\nSaved default data file: {default_save_path}\n"
+            f"Saved {len(index_to_pos)} position points; skipped {len(skipped_pos)} invalid points. "
             f"Start position was {[start_x, start_y, start_z]} in {coordinate_unit}; stage return status is logged separately."
         )
-        position_timeout_count = int(sum(position_timeout_list))
         if position_timeout_count:
             print(f"Position-timeout points saved with actual_pos metadata: {position_timeout_count}.")
-        return {"status": "saved", "path": save_path, "points": len(index_to_pos), "skipped_points": len(skipped_pos)}
+
+        final_save_path = default_save_path
+        suffix_confirm, suffix_auto = timed_choice(
+            "\nAdd an English filename suffix by renaming the saved file? (y/n)",
+            ("y", "n"),
+            default="n",
+            timeout_s=save_prompt_timeout_s,
+        )
+        if suffix_auto:
+            append_run_log("DATA_SUFFIX_PROMPT_AUTO_SKIPPED", path=default_save_path, timeout_s=save_prompt_timeout_s)
+            print(f"No suffix response before timeout; keeping default filename: {default_save_path}")
+        elif suffix_confirm == "y":
+            suffix_text, suffix_input_auto = _timed_console_line(
+                "\nSuffix",
+                save_prompt_timeout_s,
+                default_text="",
+            )
+            safe_suffix = sanitize_filename_suffix(suffix_text)
+            if suffix_input_auto or not safe_suffix:
+                append_run_log("DATA_SUFFIX_RENAME_SKIPPED", path=default_save_path, reason="empty_or_timeout_suffix")
+                print(f"No valid suffix was entered; keeping default filename: {default_save_path}")
+            else:
+                try:
+                    renamed_path, renamed, reason = _rename_with_suffix_no_overwrite(default_save_path, safe_suffix)
+                    final_save_path = renamed_path
+                    append_run_log(
+                        "DATA_RENAMED_WITH_SUFFIX",
+                        old_path=default_save_path,
+                        new_path=renamed_path,
+                        suffix=safe_suffix,
+                        renamed=renamed,
+                        reason=reason,
+                    )
+                    print(f"Final data filename after safe rename: {final_save_path}")
+                except Exception as rename_exc:
+                    append_run_log(
+                        "DATA_SUFFIX_RENAME_FAILED",
+                        original_path=default_save_path,
+                        suffix=safe_suffix,
+                        error=repr(rename_exc),
+                    )
+                    print(f"Suffix rename failed: {rename_exc}")
+                    print(f"Original default file is preserved: {default_save_path}")
+                    final_save_path = default_save_path
+        else:
+            append_run_log("DATA_SUFFIX_RENAME_SKIPPED", path=default_save_path, reason="user_declined")
+            print(f"Final data filename: {default_save_path}")
+
+        append_run_log(
+            "DATA_SAVED",
+            path=final_save_path,
+            default_path=default_save_path,
+            points=len(index_to_pos),
+            skipped_points=len(skipped_pos),
+            position_timeout_count=position_timeout_count,
+        )
+        return {
+            "status": "saved",
+            "path": final_save_path,
+            "default_path": default_save_path,
+            "points": len(index_to_pos),
+            "skipped_points": len(skipped_pos),
+        }
     except Exception as exc:
         append_run_log("DATA_PACKAGING_FAILED", error=repr(exc))
         print(f"Data packaging failed: {exc}")

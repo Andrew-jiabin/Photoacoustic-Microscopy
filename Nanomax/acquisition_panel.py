@@ -60,6 +60,8 @@ class AcquisitionDashboard:
         scan_items=None,
         daq_items=None,
         runtime_items=None,
+        result_preview_controller=None,
+        mat_path_provider=None,
         log_callback=None,
     ):
         self.desc = str(desc)
@@ -70,6 +72,8 @@ class AcquisitionDashboard:
         self.scan_items = list(scan_items or [])
         self.daq_items = list(daq_items or [])
         self.runtime_items = list(runtime_items or [])
+        self.result_preview_controller = result_preview_controller
+        self.mat_path_provider = mat_path_provider
         self.log = log_callback or (lambda *args, **kwargs: None)
         self.renderer = TerminalPanelRenderer()
         self.state = AcquisitionPanelState()
@@ -176,7 +180,8 @@ class AcquisitionDashboard:
         self.state.stop_confirm_mode = True
         self.state.paused_since = time.time()
         self.state.message = (
-            f"Acquisition paused after current point. Press 'y' to stop; press Esc to continue."
+            "Acquisition paused after current point. Press 'y' to stop; Esc to continue; "
+            "'p' preview all, 'a' axis-time, '3' 3D, 'i' index."
         )
         self.log("ACQUISITION_PANEL_STOP_CONFIRM_REQUESTED", stop_key=self.stop_key)
         self.render()
@@ -197,6 +202,11 @@ class AcquisitionDashboard:
                     self.log("ACQUISITION_PANEL_STOP_CONFIRMED", paused_s=round(paused_for, 3))
                     self.render()
                     return True
+                if ch.lower() in {"p", "a", "i"} or ch == "3":
+                    preview_mode = {"p": "all", "a": "axis", "3": "3d", "i": "index"}.get(ch.lower(), "all")
+                    self._run_preview(preview_mode)
+                    self.render()
+                    continue
                 if ch == "\x1b":
                     paused_for = time.time() - (self.state.paused_since or time.time())
                     self.state.stop_confirm_mode = False
@@ -206,12 +216,41 @@ class AcquisitionDashboard:
                     self.render()
                     return False
                 if ch.lower() == self.stop_key:
-                    self.state.message = "Acquisition is already paused. Press 'y' to stop; press Esc to continue."
+                    self.state.message = "Already paused. Press 'y' to stop; Esc to continue; p/a/3/i for preview."
                     self.render()
                 elif ch not in ("\r", "\n"):
-                    self.state.message = "Paused. Press 'y' to stop; press Esc to continue."
+                    self.state.message = "Paused. Press 'y' to stop; Esc to continue; p/a/3/i for preview."
                     self.render()
             time.sleep(0.05)
+
+    def _run_preview(self, mode: str) -> None:
+        if self.result_preview_controller is None:
+            self.state.message = "Result preview is not configured for this run."
+            self.log("ACQUISITION_PANEL_PREVIEW_SKIPPED", reason="not_configured", mode=mode)
+            return
+        if not callable(self.mat_path_provider):
+            self.state.message = "Result preview has no .mat path provider."
+            self.log("ACQUISITION_PANEL_PREVIEW_SKIPPED", reason="missing_path_provider", mode=mode)
+            return
+        try:
+            self.state.message = f"Generating {mode} preview from current saved/cache .mat..."
+            self.render()
+            mat_path = self.mat_path_provider()
+            if not mat_path:
+                self.state.message = "No saved or cache .mat is available yet for preview."
+                self.log("ACQUISITION_PANEL_PREVIEW_SKIPPED", reason="no_mat_path", mode=mode)
+                return
+            result = self.result_preview_controller.generate(mat_path, mode=mode)
+            if result.status == "ok":
+                first_artifact = result.artifacts[0] if result.artifacts else result.output_dir
+                self.state.message = f"Preview ready: {first_artifact}"
+                self.log("ACQUISITION_PANEL_PREVIEW_DONE", mode=mode, input_path=mat_path, output_dir=result.output_dir)
+            else:
+                self.state.message = f"Preview failed/skipped: {result.error or result.status}"
+                self.log("ACQUISITION_PANEL_PREVIEW_FAILED", mode=mode, input_path=mat_path, error=result.error)
+        except Exception as exc:
+            self.state.message = f"Preview error: {exc}"
+            self.log("ACQUISITION_PANEL_PREVIEW_ERROR", mode=mode, error=repr(exc))
 
     def _execute_command(self, line: str):
         tokens = line.strip().split()
@@ -246,7 +285,7 @@ class AcquisitionDashboard:
     def _command_line(self):
         if self.state.stop_confirm_mode:
             paused_for = time.time() - (self.state.paused_since or time.time())
-            return f"Command: PAUSED {_format_duration(paused_for)} - press y to stop, Esc to continue."
+            return f"Command: PAUSED {_format_duration(paused_for)} - y stop, Esc continue, p/a/3/i preview."
         if self.state.command_mode:
             return f"Command: :{self.state.command_buffer}"
         stop_hint = f"press {self.stop_key} to pause/confirm stop" if self.stop_enabled else "graceful stop key disabled"
@@ -263,7 +302,7 @@ class AcquisitionDashboard:
             f"Current point: {self.state.current_position}",
             "Allowed during acquisition: "
             f":532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh"
-            f"{', ' + self.stop_key + ' pause; paused: y stop, Esc continue' if self.stop_enabled else ''}",
+            f"{', ' + self.stop_key + ' pause; paused: y stop, Esc continue, p/a/3/i preview' if self.stop_enabled else ''}",
         ]
         lines += format_section_lines("Lasers", self.laser_manager.panel_items(acquisition=True))
         lines += format_section_lines("Frozen Scan Parameters", self.scan_items)

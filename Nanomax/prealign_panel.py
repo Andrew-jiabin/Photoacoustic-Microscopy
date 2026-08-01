@@ -174,17 +174,25 @@ class SamplePrealignPanel:
 
         move_kwargs = {axis: target[axis] if abs(target[axis] - current[axis]) > 1e-9 else None for axis in ("x", "y", "z")}
         moved_axes = [axis for axis, value in move_kwargs.items() if value is not None]
-        if any(value is not None for value in move_kwargs.values()):
-            self.stage.move_xyz(
-                x=move_kwargs["x"],
-                y=move_kwargs["y"],
-                z=move_kwargs["z"],
-                wait=True,
-                settle_time_ms=self.config.settle_ms,
-                tolerance=self.config.position_tolerance_um,
-                timeout_s=self.config.position_timeout_s,
-                correction_interval_s=self.config.position_reissue_interval_s,
-            )
+        if not moved_axes:
+            if not str(reason).startswith(("key", "hotkey")):
+                suffix = f"; already at {','.join(clamped_axes)} boundary" if clamped_axes else ""
+                self.message = (
+                    f"No closed-loop move needed: X={current['x']:.4f} um, "
+                    f"Y={current['y']:.4f} um, Z={current['z']:.4f} um{suffix}."
+                )
+            return False
+
+        self.stage.move_xyz(
+            x=move_kwargs["x"],
+            y=move_kwargs["y"],
+            z=move_kwargs["z"],
+            wait=True,
+            settle_time_ms=self.config.settle_ms,
+            tolerance=self.config.position_tolerance_um,
+            timeout_s=self.config.position_timeout_s,
+            correction_interval_s=self.config.position_reissue_interval_s,
+        )
         read_x, read_y, read_z = self.refresh()
         readback = {"x": read_x, "y": read_y, "z": read_z}
         errors = {axis: abs(readback[axis] - target[axis]) for axis in ("x", "y", "z")}
@@ -213,10 +221,11 @@ class SamplePrealignPanel:
             f"max moved-axis error={max_moved_error:.4f} um "
             f"(tol={self.config.position_tolerance_um:g} um){suffix}"
         )
+        return True
 
     def move_delta(self, x_delta=0.0, y_delta=0.0, z_delta=0.0, reason="key"):
         x, y, z = self.last_xyz
-        self.set_xyz(x=x + float(x_delta), y=y + float(y_delta), z=z + float(z_delta), reason=reason)
+        return self.set_xyz(x=x + float(x_delta), y=y + float(y_delta), z=z + float(z_delta), reason=reason)
 
     def evaluate_scan(self, refresh=False):
         x, y, _ = self.refresh() if refresh else self.last_xyz
@@ -641,17 +650,17 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
                 panel.message = "Status refreshed."
                 redraw(refresh=True)
             elif char in ("0", "r", "R"):
-                panel.set_xyz(x=0.0, y=0.0, reason="hotkey_move_xy_to_zero")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.set_xyz(x=0.0, y=0.0, reason="hotkey_move_xy_to_zero"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             elif char == "+":
-                panel.move_delta(z_delta=panel.z_step_um, reason="hotkey_z_plus")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.move_delta(z_delta=panel.z_step_um, reason="hotkey_z_plus"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             elif char == "-":
-                panel.move_delta(z_delta=-panel.z_step_um, reason="hotkey_z_minus")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.move_delta(z_delta=-panel.z_step_um, reason="hotkey_z_minus"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             elif char == ":":
                 panel.renderer.show_cursor()
                 sys.stdout.write("\ncmd> ")
@@ -663,9 +672,9 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
         if running:
             x_delta, y_delta, reason = panel.sample_arrow_delta()
             if x_delta or y_delta:
-                panel.move_delta(x_delta=x_delta, y_delta=y_delta, reason=f"key_state_{reason}")
-                drain_keyboard_buffer(msvcrt)
-                redraw(refresh=True)
+                if panel.move_delta(x_delta=x_delta, y_delta=y_delta, reason=f"key_state_{reason}"):
+                    drain_keyboard_buffer(msvcrt)
+                    redraw(refresh=True)
             else:
                 status_signature = panel.status_signature()
                 if status_signature != last_status_signature:
