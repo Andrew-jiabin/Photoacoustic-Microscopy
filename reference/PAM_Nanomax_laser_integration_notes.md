@@ -89,6 +89,11 @@ Expected success wording includes:
 - Return-to-start is segmented along a straight line with
   `PAM_SAMPLE_RETURN_STEP_UM` or `PAM_PROBE_RETURN_STEP_UM`, avoiding one large
   step back to the start or low-end zero.
+- Closed-loop return-to-start uses its own timeout
+  `PAM_SAMPLE_RETURN_POSITION_TIMEOUT_S` (default `min(PAM_SAMPLE_POSITION_TIMEOUT_S, 10)`)
+  for each small return segment. This prevents cleanup from inheriting a long
+  acquisition point timeout and blocking laser shutdown/data-save follow-up when
+  the stage is already stuck.
 - In prealignment panels, keyboard moves are clamped before any device command.
   If the current position is already at the requested boundary, repeated key
   events return immediately and do not issue a device command, read back, log a
@@ -102,6 +107,15 @@ Expected success wording includes:
 - Suffix rename never overwrites an existing target. If the suffixed filename
   exists, a unique numeric suffix is chosen; if rename fails, the default file
   is kept and logged.
+- Pressing Ctrl+C during the suffix prompt or suffix entry does not invalidate
+  the already saved default file; the program keeps the default filename and
+  returns a normal saved result.
+- If packaging fails, `PAM_Main_Nanomax.py` does not mark data saving as
+  complete. Later cleanup paths can therefore retry instead of losing the only
+  save chance after one transient exception.
+- Timed save/suffix prompts auto-select the configured default when countdown
+  input is unavailable, instead of falling back to a permanent blocking
+  `input()` in non-interactive shells.
 - During acquisition, pressing `q` pauses at a point boundary. In the paused
   state, `y` stops cleanly, `Esc` resumes, and result-preview shortcuts are:
   `p` for all, `a` for Axis-time, `3` for 3D, and `i` for index-only.
@@ -117,6 +131,10 @@ Expected success wording includes:
   `Tool_code/pam_scan_processing_src`. Default processing parameters are
   `display_window=0:4000`, `baseline=0:100`, `time_step=1`, `mode=xy`, and
   Hilbert enabled for Axis-time.
+- Preview mode names are validated explicitly. Supported modes are `all`,
+  `axis`, `axis-time`, `time`, `3d`, `interactive`, and `index`; invalid panel
+  commands fail visibly and are logged rather than silently writing only an
+  index page.
 
 ## Verified Small-Scan Test
 

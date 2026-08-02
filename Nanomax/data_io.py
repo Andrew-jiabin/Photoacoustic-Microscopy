@@ -17,14 +17,18 @@ SAFE_SUFFIX_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _timed_console_line(prompt, timeout_s=60.0, default_text=""):
-    """Read a console line with a countdown on Windows; fall back to blocking input elsewhere."""
-    if timeout_s is None or float(timeout_s) <= 0 or os.name != "nt" or not sys.stdin.isatty():
+    """Read a console line with a countdown, using defaults when countdown input is unavailable."""
+    if timeout_s is None or float(timeout_s) <= 0:
         return input(prompt), False
+    if os.name != "nt" or not sys.stdin.isatty():
+        print(f"{prompt} [non-interactive; auto {default_text!r}]")
+        return str(default_text), True
 
     try:
         import msvcrt
     except ImportError:
-        return input(prompt), False
+        print(f"{prompt} [timed input unavailable; auto {default_text!r}]")
+        return str(default_text), True
 
     prompt_text = str(prompt)
     prefix = ""
@@ -393,21 +397,31 @@ def save_scan_data(
             print(f"Position-timeout points saved with actual_pos metadata: {position_timeout_count}.")
 
         final_save_path = default_save_path
-        suffix_confirm, suffix_auto = timed_choice(
-            "\nAdd an English filename suffix by renaming the saved file? (y/n)",
-            ("y", "n"),
-            default="n",
-            timeout_s=save_prompt_timeout_s,
-        )
+        try:
+            suffix_confirm, suffix_auto = timed_choice(
+                "\nAdd an English filename suffix by renaming the saved file? (y/n)",
+                ("y", "n"),
+                default="n",
+                timeout_s=save_prompt_timeout_s,
+            )
+        except KeyboardInterrupt:
+            suffix_confirm, suffix_auto = "n", False
+            append_run_log("DATA_SUFFIX_PROMPT_INTERRUPTED", path=default_save_path)
+            print(f"\nSuffix prompt interrupted; keeping default filename: {default_save_path}")
         if suffix_auto:
             append_run_log("DATA_SUFFIX_PROMPT_AUTO_SKIPPED", path=default_save_path, timeout_s=save_prompt_timeout_s)
             print(f"No suffix response before timeout; keeping default filename: {default_save_path}")
         elif suffix_confirm == "y":
-            suffix_text, suffix_input_auto = _timed_console_line(
-                "\nSuffix",
-                save_prompt_timeout_s,
-                default_text="",
-            )
+            try:
+                suffix_text, suffix_input_auto = _timed_console_line(
+                    "\nSuffix",
+                    save_prompt_timeout_s,
+                    default_text="",
+                )
+            except KeyboardInterrupt:
+                suffix_text, suffix_input_auto = "", False
+                append_run_log("DATA_SUFFIX_INPUT_INTERRUPTED", path=default_save_path)
+                print(f"\nSuffix entry interrupted; keeping default filename: {default_save_path}")
             safe_suffix = sanitize_filename_suffix(suffix_text)
             if suffix_input_auto or not safe_suffix:
                 append_run_log("DATA_SUFFIX_RENAME_SKIPPED", path=default_save_path, reason="empty_or_timeout_suffix")

@@ -12,6 +12,7 @@ from typing import Any
 DEFAULT_PROCESSING_SKILL_PATH = r"D:\Phd_training\skills\data-processing-skill"
 DEFAULT_OUTPUT_ROOT = r".\results\cache\pam_preview"
 REPO_PROCESSING_SRC = r"Tool_code\pam_scan_processing_src"
+SUPPORTED_PREVIEW_MODES = {"all", "axis", "axis-time", "time", "3d", "interactive", "index"}
 
 
 @dataclass
@@ -148,6 +149,11 @@ class PAMResultPreviewController:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in SUPPORTED_PREVIEW_MODES:
+            result.status = "failed"
+            result.error = f"Unsupported preview mode {mode!r}; use one of {sorted(SUPPORTED_PREVIEW_MODES)}."
+            self.log("PAM_RESULT_PREVIEW_FAILED", mode=normalized_mode, input_path=input_path, error=result.error)
+            return result
         try:
             if normalized_mode in {"all", "axis", "axis-time", "time"}:
                 axis_code = (

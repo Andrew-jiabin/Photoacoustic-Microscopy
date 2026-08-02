@@ -1,5 +1,6 @@
 # Generated experiment outputs
 data/
+results/cache/
 run_logs/
 cbox_payload_discovery_log.jsonl
 *_discovery_log.jsonl

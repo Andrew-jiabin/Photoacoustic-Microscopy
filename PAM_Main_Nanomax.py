@@ -250,6 +250,10 @@ def main():
     SAMPLE_POSITION_TIMEOUT_S = env_float("PAM_SAMPLE_POSITION_TIMEOUT_S", 300.0)
     SAMPLE_POSITION_REISSUE_INTERVAL_S = env_float("PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S", 1.0)
     SAMPLE_RETURN_STEP_UM = env_float("PAM_SAMPLE_RETURN_STEP_UM", 0.1)
+    SAMPLE_RETURN_POSITION_TIMEOUT_S = env_float(
+        "PAM_SAMPLE_RETURN_POSITION_TIMEOUT_S",
+        min(float(SAMPLE_POSITION_TIMEOUT_S), 10.0),
+    )
     PROBE_RETURN_STEP_UM = env_float("PAM_PROBE_RETURN_STEP_UM", 0.1)
     DATA_SAVE_AUTO_TIMEOUT_S = env_float("PAM_DATA_SAVE_AUTO_TIMEOUT_S", 60.0)
     RESULT_PREVIEW_ENABLE = env_bool("PAM_RESULT_PREVIEW_ENABLE", True)
@@ -303,6 +307,13 @@ def main():
                 phase="sample_return_step_validation",
             )
             raise SystemExit("PAM_SAMPLE_RETURN_STEP_UM must be positive.") from None
+        if SAMPLE_RETURN_POSITION_TIMEOUT_S <= 0:
+            append_run_log(
+                "RUN_END_ERROR",
+                error=f"PAM_SAMPLE_RETURN_POSITION_TIMEOUT_S={SAMPLE_RETURN_POSITION_TIMEOUT_S:g} must be positive",
+                phase="sample_return_position_timeout_validation",
+            )
+            raise SystemExit("PAM_SAMPLE_RETURN_POSITION_TIMEOUT_S must be positive.") from None
     if PROBE_RETURN_STEP_UM <= 0:
         append_run_log(
             "RUN_END_ERROR",
@@ -347,6 +358,7 @@ def main():
         sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
         sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
         sample_return_step_um=SAMPLE_RETURN_STEP_UM,
+        sample_return_position_timeout_s=SAMPLE_RETURN_POSITION_TIMEOUT_S,
         probe_return_step_um=PROBE_RETURN_STEP_UM,
         data_save_auto_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
         result_preview_enable=RESULT_PREVIEW_ENABLE,
@@ -435,10 +447,18 @@ def main():
             DELAY,
             save_prompt_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
         )
-        if isinstance(result, dict) and result.get("status") == "saved" and result.get("path"):
+        status = result.get("status") if isinstance(result, dict) else None
+        if status == "saved" and result.get("path"):
             last_saved_mat_path = result["path"]
             append_run_log("DATA_SAVE_CURRENT_FILE", reason=reason, path=last_saved_mat_path)
-        data_save_done = True
+            data_save_done = True
+        elif status in {"skipped", "discarded"}:
+            data_save_done = True
+        elif status == "failed":
+            data_save_done = False
+            append_run_log("DATA_SAVE_ONCE_RETRY_NEEDED", reason=reason, result=repr(result))
+        else:
+            data_save_done = bool(result)
         append_run_log("DATA_SAVE_ONCE_DONE", reason=reason, result=repr(result))
         return result
 
@@ -915,6 +935,7 @@ def main():
             ("POS_TIMEOUT_S", f"{SAMPLE_POSITION_TIMEOUT_S:g}", "frozen"),
             ("POS_REISSUE_S", f"{SAMPLE_POSITION_REISSUE_INTERVAL_S:g}", "frozen"),
             ("RETURN_STEP_UM", f"{SAMPLE_RETURN_STEP_UM:g}", "frozen"),
+            ("RETURN_POS_TIMEOUT_S", f"{SAMPLE_RETURN_POSITION_TIMEOUT_S:g}", "frozen"),
         ]
         if SCAN_TARGET == "probe_open_loop":
             scan_dashboard_items.extend(
@@ -1184,7 +1205,7 @@ def main():
             SAMPLE_ZERO_AXES,
             sample_return_step_um=SAMPLE_RETURN_STEP_UM,
             sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
-            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_timeout_s=SAMPLE_RETURN_POSITION_TIMEOUT_S,
             sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
             probe_um_per_v=PROBE_UM_PER_V,
             probe_return_step_um=PROBE_RETURN_STEP_UM,
@@ -1217,7 +1238,7 @@ def main():
             SAMPLE_ZERO_AXES,
             sample_return_step_um=SAMPLE_RETURN_STEP_UM,
             sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
-            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_timeout_s=SAMPLE_RETURN_POSITION_TIMEOUT_S,
             sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
             probe_um_per_v=PROBE_UM_PER_V,
             probe_return_step_um=PROBE_RETURN_STEP_UM,
@@ -1249,7 +1270,7 @@ def main():
             SAMPLE_ZERO_AXES,
             sample_return_step_um=SAMPLE_RETURN_STEP_UM,
             sample_position_tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
-            sample_position_timeout_s=SAMPLE_POSITION_TIMEOUT_S,
+            sample_position_timeout_s=SAMPLE_RETURN_POSITION_TIMEOUT_S,
             sample_position_reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
             probe_um_per_v=PROBE_UM_PER_V,
             probe_return_step_um=PROBE_RETURN_STEP_UM,
