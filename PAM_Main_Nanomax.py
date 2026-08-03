@@ -14,7 +14,7 @@ from Alazar_imaging.laser_runtime import LaserRunOptions, PamLaserManager
 from Alazar_imaging.MDT693BController import MDT693BController
 from Nanomax.acquisition_panel import AcquisitionDashboard
 from Nanomax.daq_async import BackgroundDaqInit
-from Nanomax.data_io import save_scan_data, save_scan_snapshot_data
+from Nanomax.data_io import package_point_data_for_save, save_scan_data, save_scan_snapshot_data
 from Nanomax.open_loop_panel import ProbePrealignConfig
 from Nanomax.prealign_panel import SamplePrealignConfig
 from Nanomax.prealignment_workflow import run_nanomax_prealignment
@@ -261,6 +261,7 @@ def main():
     RESULT_PREVIEW_SNAPSHOT_DIR = env_str("PAM_RESULT_PREVIEW_SNAPSHOT_DIR", r".\results\cache\pam_live_snapshots")
     RESULT_PREVIEW_TIMEOUT_S = env_float("PAM_RESULT_PREVIEW_TIMEOUT_S", 900.0)
     PROCESSING_SKILL_PATH = env_str("PAM_PROCESSING_SKILL_PATH", r"D:\Phd_training\skills\data-processing-skill")
+    COLLECT_532_NOISE_PROMPT_ENABLE = env_bool("PAM_532_NOISE_PROMPT_ENABLE", True)
 
     # DAQ parameters.
     DELAY, SAMPLES_REC, SAMPLE_RATE = int(251*4), 4096, ats.SAMPLE_RATE_4000MSPS
@@ -366,6 +367,7 @@ def main():
         result_preview_snapshot_dir=RESULT_PREVIEW_SNAPSHOT_DIR,
         result_preview_timeout_s=RESULT_PREVIEW_TIMEOUT_S,
         processing_skill_path=PROCESSING_SKILL_PATH,
+        collect_532_noise_prompt_enable=COLLECT_532_NOISE_PROMPT_ENABLE,
         point_log_interval=POINT_LOG_INTERVAL,
         user_stop_enable=USER_STOP_ENABLE,
         user_stop_key=USER_STOP_KEY,
@@ -408,6 +410,9 @@ def main():
     data_save_done = False
     last_saved_mat_path = None
     preview_snapshot_serial = 0
+    noise_532_reference = None
+    noise_532_reference_metadata = {}
+    noise_532_status = "prompt_pending" if COLLECT_532_NOISE_PROMPT_ENABLE else "disabled"
     prealignment_started_acquisition = False
     probe_connect_error = ""
     result_preview_controller = (
@@ -446,6 +451,8 @@ def main():
             START_Z,
             DELAY,
             save_prompt_timeout_s=DATA_SAVE_AUTO_TIMEOUT_S,
+            noise_532_reference=noise_532_reference,
+            noise_532_metadata=noise_532_reference_metadata,
         )
         status = result.get("status") if isinstance(result, dict) else None
         if status == "saved" and result.get("path"):
@@ -483,6 +490,8 @@ def main():
                 START_Z,
                 output_dir=RESULT_PREVIEW_SNAPSHOT_DIR,
                 label=f"{CURRENT_RUN_ID}-points-{len(all_data):06d}-{preview_snapshot_serial:03d}",
+                noise_532_reference=noise_532_reference,
+                noise_532_metadata=noise_532_reference_metadata,
             )
             if isinstance(snapshot, dict) and snapshot.get("status") == "saved" and snapshot.get("path"):
                 last_saved_mat_path = snapshot["path"]
@@ -508,6 +517,102 @@ def main():
         if len(point) < 3 or not isinstance(point[2], dict):
             point.append({})
         point[2].update(metadata)
+
+    def prompt_yes_no(prompt, *, allow_no=True):
+        while True:
+            text = input(prompt).strip().lower()
+            if text in ("y", "yes"):
+                return True
+            if allow_no and text in ("n", "no"):
+                return False
+            if allow_no:
+                print("Please enter y/yes or n/no.")
+            else:
+                print("Please enter y/yes after the physical block has been removed. Press Ctrl+C to abort.")
+
+    def collect_532_noise_reference_if_requested():
+        nonlocal noise_532_reference, noise_532_reference_metadata, noise_532_status
+        if not COLLECT_532_NOISE_PROMPT_ENABLE:
+            noise_532_status = "disabled"
+            append_run_log("CBOX_532_NOISE_PROMPT_DISABLED")
+            return
+
+        collect_noise = prompt_yes_no(
+            "\nCollect 532 nm standard-noise reference now?\n"
+            "Have you physically blocked the 532 nm output? "
+            "Enter y to acquire the blocked-beam noise reference, or n to skip noise subtraction: "
+        )
+        if not collect_noise:
+            noise_532_status = "skipped_by_operator"
+            append_run_log("CBOX_532_NOISE_SKIPPED", reason="operator_declined")
+            print("532 nm standard-noise reference skipped; no 532 noise subtraction will be applied.")
+            return
+
+        append_run_log(
+            "CBOX_532_NOISE_ACQUISITION_BEGIN",
+            records_per_point=RECORDS_PER_POINT,
+            samples_per_record=SAMPLES_REC,
+            average_enable=AVERAGE_ENABLE,
+            timeout_ms=ACQ_TIMEOUT_MS,
+        )
+        print(
+            "Acquiring one 532 nm blocked-beam standard-noise reference "
+            f"with RECORDS_PER_POINT={RECORDS_PER_POINT}, SAMPLES_REC={SAMPLES_REC}, "
+            f"AVERAGE_ENABLE={AVERAGE_ENABLE}..."
+        )
+        noise_data = []
+        try:
+            daq.get_one_acquisition(
+                all_data=noise_data,
+                curr_pos_str="532_noise_reference",
+                timeout_ms=ACQ_TIMEOUT_MS,
+                Average_Enable=AVERAGE_ENABLE,
+            )
+            if not noise_data:
+                noise_532_status = "failed_no_data"
+                append_run_log("CBOX_532_NOISE_ACQUISITION_FAILED", reason="daq_did_not_append")
+                print("No 532 noise reference was appended; continuing without 532 noise subtraction.")
+                return
+
+            candidate_reference = noise_data[-1][0]
+            processed_reference, package_reason = package_point_data_for_save(
+                candidate_reference,
+                AVERAGE_ENABLE,
+                RECORDS_PER_POINT,
+                SAMPLES_REC,
+            )
+            if processed_reference is None:
+                noise_532_status = f"failed_{package_reason}"
+                append_run_log("CBOX_532_NOISE_ACQUISITION_FAILED", reason=package_reason)
+                print(f"532 noise reference was not packageable ({package_reason}); continuing without subtraction.")
+                return
+
+            noise_532_reference = candidate_reference
+            noise_532_status = "collected"
+            noise_532_reference_metadata = {
+                "acquired_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "curr_pos_str": str(noise_data[-1][1]),
+                "package_reason": package_reason,
+                "processed_shape": list(processed_reference.shape),
+                "processed_dtype": str(processed_reference.dtype),
+                "records_per_point": int(RECORDS_PER_POINT),
+                "samples_per_record": int(SAMPLES_REC),
+                "average_enable": int(bool(AVERAGE_ENABLE)),
+            }
+            append_run_log(
+                "CBOX_532_NOISE_ACQUIRED",
+                package_reason=package_reason,
+                processed_shape="x".join(str(dim) for dim in processed_reference.shape),
+                processed_dtype=str(processed_reference.dtype),
+            )
+            print("532 nm standard noise has been acquired.")
+        finally:
+            prompt_yes_no(
+                "532 nm standard-noise acquisition step is complete. "
+                "Please remove the physical block from the 532 nm laser, then enter y to continue: ",
+                allow_no=False,
+            )
+            append_run_log("CBOX_532_NOISE_UNBLOCK_CONFIRMED", status=noise_532_status)
 
     try:
         def daq_factory(step, daq_obj):
@@ -916,6 +1021,7 @@ def main():
             append_run_log("USER_START_CONFIRMED", source="enter_prompt")
         progress_desc = "PAM sample closed-loop scan" if SCAN_TARGET == "sample_closed_loop" else "PAM probe open-loop scan"
         laser_manager.refresh_status()
+        collect_532_noise_reference_if_requested()
         if USER_STOP_ENABLE:
             append_run_log("USER_STOP_POLLING_ENABLED", stop_key=USER_STOP_KEY)
         scan_dashboard_items = [
@@ -962,6 +1068,8 @@ def main():
             ("SAMPLE_RETURN_XY_TO_ZERO_AT_END", SAMPLE_RETURN_XY_TO_ZERO_AT_END, "frozen"),
             ("SAMPLE_ZERO_XY_AT_END", SAMPLE_ZERO_XY_AT_END, "frozen"),
             ("DATA_SAVE_AUTO_TIMEOUT_S", f"{DATA_SAVE_AUTO_TIMEOUT_S:g}", "frozen"),
+            ("532_NOISE_STATUS", noise_532_status, "frozen"),
+            ("532_NOISE_PROMPT_ENABLE", COLLECT_532_NOISE_PROMPT_ENABLE, "frozen"),
             ("RESULT_PREVIEW_ENABLE", RESULT_PREVIEW_ENABLE, "frozen"),
             ("RESULT_PREVIEW_OUTPUT", RESULT_PREVIEW_OUTPUT_DIR, "frozen"),
         ]

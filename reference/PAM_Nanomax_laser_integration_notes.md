@@ -136,6 +136,29 @@ Expected success wording includes:
   commands fail visibly and are logged rather than silently writing only an
   index page.
 
+## 532 nm Blocked-Beam Noise Subtraction
+
+- Before formal acquisition starts, `PAM_Main_Nanomax.py` prompts:
+  `Have you physically blocked the 532 nm output?` Entering `y` acquires one
+  DAQ point using the same `RECORDS_PER_POINT`, `SAMPLES_REC`,
+  `AVERAGE_ENABLE`, and timeout settings as normal image points. Entering `n`
+  skips 532 noise subtraction for that run. Set `PAM_532_NOISE_PROMPT_ENABLE=0`
+  to disable the prompt completely.
+- After the blocked-beam reference is acquired, the program prompts the
+  operator to remove the physical 532 nm block before the scan dashboard starts.
+- The reference point is not appended to the formal scan `all_data`, `pos_list`,
+  or point count. It is passed separately to the save/preview packaging layer.
+- `Nanomax/data_io.py` subtracts the 532 reference only after both the reference
+  and each signal point have gone through the same `package_point_data_for_save`
+  path. In averaged mode this means both are summed first, divided by
+  `records_per_point`, then subtracted.
+- When subtraction is applied, saved waveform arrays are signed `int32`
+  (`signal_avg - noise_avg`) so negative residuals are preserved instead of
+  wrapping as `uint16`. The averaged reference itself is saved as
+  `noise_532_reference`, and metadata records `noise_532_reference_available`,
+  `noise_532_subtracted`, `noise_532_subtracted_count`, and acquisition details
+  under `noise_532_metadata`.
+
 ## Verified Small-Scan Test
 
 On 2026-07-15, a real remote hardware test used:

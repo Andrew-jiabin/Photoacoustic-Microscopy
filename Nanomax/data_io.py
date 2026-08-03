@@ -166,6 +166,21 @@ def package_point_data_for_save(raw_data_content, average_enable, records_per_po
     return raw_array.astype(np.uint16), "raw_from_array"
 
 
+def _prepare_532_noise_reference(noise_532_reference, average_enable, records_per_point, samples_per_record):
+    if noise_532_reference is None:
+        return None, "not_collected"
+    noise_data, package_reason = package_point_data_for_save(
+        noise_532_reference,
+        average_enable,
+        records_per_point,
+        samples_per_record,
+    )
+    if noise_data is None:
+        append_run_log("DATA_532_NOISE_REFERENCE_SKIPPED", reason=package_reason)
+        return None, package_reason
+    return np.asarray(noise_data), package_reason
+
+
 def build_scan_mat_dict(
     all_data,
     scan_w,
@@ -181,6 +196,8 @@ def build_scan_mat_dict(
     start_x,
     start_y,
     start_z,
+    noise_532_reference=None,
+    noise_532_metadata=None,
 ):
     if len(all_data) == 0:
         return None, [], [], 0
@@ -194,8 +211,25 @@ def build_scan_mat_dict(
     position_error_x_um = []
     position_error_y_um = []
     position_error_z_um = []
+    noise_532_subtracted = []
+    noise_532_subtraction_skipped_pos = []
 
     try:
+        noise_532_processed, noise_532_reason = _prepare_532_noise_reference(
+            noise_532_reference,
+            average_enable,
+            records_per_point,
+            samples_per_record,
+        )
+        if noise_532_processed is not None:
+            mat_dict["noise_532_reference"] = noise_532_processed
+            append_run_log(
+                "DATA_532_NOISE_REFERENCE_READY",
+                reason=noise_532_reason,
+                shape="x".join(str(dim) for dim in noise_532_processed.shape),
+                dtype=str(noise_532_processed.dtype),
+            )
+
         for item in all_data:
             raw_data_content = item[0]
             original_pos_str = item[1]
@@ -211,6 +245,24 @@ def build_scan_mat_dict(
                 skipped_pos.append(original_pos_str)
                 append_run_log("DATA_POINT_SKIPPED", pos=original_pos_str, reason=package_reason)
                 continue
+
+            if noise_532_processed is not None:
+                processed_array = np.asarray(processed_data)
+                if processed_array.shape == noise_532_processed.shape:
+                    processed_data = processed_array.astype(np.int32) - noise_532_processed.astype(np.int32)
+                    noise_532_subtracted.append(1)
+                else:
+                    noise_532_subtracted.append(0)
+                    noise_532_subtraction_skipped_pos.append(original_pos_str)
+                    append_run_log(
+                        "DATA_532_NOISE_SUBTRACTION_SKIPPED",
+                        pos=original_pos_str,
+                        reason="shape_mismatch",
+                        signal_shape="x".join(str(dim) for dim in processed_array.shape),
+                        noise_shape="x".join(str(dim) for dim in noise_532_processed.shape),
+                    )
+            else:
+                noise_532_subtracted.append(0)
 
             mat_dict[safe_key] = processed_data
             index_to_pos.append(original_pos_str)
@@ -235,6 +287,13 @@ def build_scan_mat_dict(
             "position_error_y_um": position_error_y_um,
             "position_error_z_um": position_error_z_um,
             "position_timeout_count": int(sum(position_timeout_list)),
+            "noise_532_reference_available": int(noise_532_processed is not None),
+            "noise_532_reference_package_reason": noise_532_reason,
+            "noise_532_reference_shape": [] if noise_532_processed is None else list(noise_532_processed.shape),
+            "noise_532_subtracted": noise_532_subtracted,
+            "noise_532_subtracted_count": int(sum(noise_532_subtracted)),
+            "noise_532_subtraction_skipped_pos_list": noise_532_subtraction_skipped_pos,
+            "noise_532_metadata": dict(noise_532_metadata or {}),
             "skipped_pos_list": skipped_pos,
             "is_averaged": int(average_enable),
             "records_per_point": records_per_point,
@@ -290,6 +349,8 @@ def save_scan_snapshot_data(
     start_z,
     output_dir,
     label="live-preview",
+    noise_532_reference=None,
+    noise_532_metadata=None,
 ):
     if len(all_data) == 0:
         append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_valid_data")
@@ -311,6 +372,8 @@ def save_scan_snapshot_data(
             start_x,
             start_y,
             start_z,
+            noise_532_reference=noise_532_reference,
+            noise_532_metadata=noise_532_metadata,
         )
         if not index_to_pos:
             append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_packageable_data", skipped_points=len(skipped_pos))
@@ -323,6 +386,8 @@ def save_scan_snapshot_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
+            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         return {"status": "saved", "path": save_path, "points": len(index_to_pos), "skipped_points": len(skipped_pos)}
     except Exception as exc:
@@ -347,6 +412,8 @@ def save_scan_data(
     start_z,
     delay,
     save_prompt_timeout_s=60.0,
+    noise_532_reference=None,
+    noise_532_metadata=None,
 ):
     if len(all_data) == 0:
         append_run_log("DATA_SAVE_SKIPPED", reason="no_valid_data")
@@ -372,6 +439,8 @@ def save_scan_data(
             start_x,
             start_y,
             start_z,
+            noise_532_reference=noise_532_reference,
+            noise_532_metadata=noise_532_metadata,
         )
 
         if not index_to_pos:
@@ -387,6 +456,8 @@ def save_scan_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
+            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         print(
             f"\nSaved default data file: {default_save_path}\n"
@@ -460,6 +531,8 @@ def save_scan_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
+            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         return {
             "status": "saved",
