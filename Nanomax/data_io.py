@@ -221,8 +221,12 @@ def build_scan_mat_dict(
             records_per_point,
             samples_per_record,
         )
+        noise_532_restore_waveform = (
+            noise_532_processed.astype(np.int32)
+            if noise_532_processed is not None
+            else np.asarray([], dtype=np.int32)
+        )
         if noise_532_processed is not None:
-            mat_dict["noise_532_reference"] = noise_532_processed
             append_run_log(
                 "DATA_532_NOISE_REFERENCE_READY",
                 reason=noise_532_reason,
@@ -287,13 +291,24 @@ def build_scan_mat_dict(
             "position_error_y_um": position_error_y_um,
             "position_error_z_um": position_error_z_um,
             "position_timeout_count": int(sum(position_timeout_list)),
-            "noise_532_reference_available": int(noise_532_processed is not None),
-            "noise_532_reference_package_reason": noise_532_reason,
-            "noise_532_reference_shape": [] if noise_532_processed is None else list(noise_532_processed.shape),
+            "noise_532_available": int(noise_532_processed is not None),
+            "noise_532_package_reason": noise_532_reason,
+            "noise_532_shape": [] if noise_532_processed is None else list(noise_532_processed.shape),
             "noise_532_subtracted": noise_532_subtracted,
             "noise_532_subtracted_count": int(sum(noise_532_subtracted)),
-            "noise_532_subtraction_skipped_pos_list": noise_532_subtraction_skipped_pos,
-            "noise_532_metadata": dict(noise_532_metadata or {}),
+            "noise_532_skip_pos_list": noise_532_subtraction_skipped_pos,
+            "noise_532_waveform_field": "metadata.noise_532.average_waveform",
+            "noise_532_restore_formula": "raw_average_signal = saved_position_waveform + metadata.noise_532.average_waveform",
+            "noise_532": {
+                "available": int(noise_532_processed is not None),
+                "average_waveform": noise_532_restore_waveform,
+                "average_waveform_dtype": str(noise_532_restore_waveform.dtype),
+                "average_waveform_shape": list(noise_532_restore_waveform.shape),
+                "package_reason": noise_532_reason,
+                "subtraction_formula": "saved_position_waveform = signal_average - average_waveform",
+                "restore_formula": "raw_average_signal = saved_position_waveform + average_waveform",
+                "source_metadata": dict(noise_532_metadata or {}),
+            },
             "skipped_pos_list": skipped_pos,
             "is_averaged": int(average_enable),
             "records_per_point": records_per_point,
@@ -386,7 +401,7 @@ def save_scan_snapshot_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
-            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_available=int(mat_dict.get("metadata", {}).get("noise_532_available", 0)),
             noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         return {"status": "saved", "path": save_path, "points": len(index_to_pos), "skipped_points": len(skipped_pos)}
@@ -456,7 +471,7 @@ def save_scan_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
-            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_available=int(mat_dict.get("metadata", {}).get("noise_532_available", 0)),
             noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         print(
@@ -531,7 +546,7 @@ def save_scan_data(
             points=len(index_to_pos),
             skipped_points=len(skipped_pos),
             position_timeout_count=position_timeout_count,
-            noise_532_reference_available=int(mat_dict.get("metadata", {}).get("noise_532_reference_available", 0)),
+            noise_532_available=int(mat_dict.get("metadata", {}).get("noise_532_available", 0)),
             noise_532_subtracted_count=int(mat_dict.get("metadata", {}).get("noise_532_subtracted_count", 0)),
         )
         return {

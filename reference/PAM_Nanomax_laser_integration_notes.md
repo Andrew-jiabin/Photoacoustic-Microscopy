@@ -154,10 +154,19 @@ Expected success wording includes:
   `records_per_point`, then subtracted.
 - When subtraction is applied, saved waveform arrays are signed `int32`
   (`signal_avg - noise_avg`) so negative residuals are preserved instead of
-  wrapping as `uint16`. The averaged reference itself is saved as
-  `noise_532_reference`, and metadata records `noise_532_reference_available`,
-  `noise_532_subtracted`, `noise_532_subtracted_count`, and acquisition details
-  under `noise_532_metadata`.
+  wrapping as `uint16`.
+- The averaged reference is intentionally not saved as a top-level `.mat` key,
+  because older downstream scripts may treat top-level non-`metadata` variables
+  as scan points. Instead, it is stored inside the existing metadata struct as
+  `metadata.noise_532.average_waveform`.
+- To restore the original averaged DAQ waveform for any saved point:
+  `raw_average_signal = saved_position_waveform + metadata.noise_532.average_waveform`.
+  Both arrays are saved as `int32` when subtraction is active.
+- Metadata also records short field names compatible with SciPy/MATLAB struct
+  limits: `noise_532_available`, `noise_532_subtracted`,
+  `noise_532_subtracted_count`, `noise_532_waveform_field`,
+  `noise_532_restore_formula`, and the detailed acquisition record under
+  `metadata.noise_532.source_metadata`.
 
 ## Verified Small-Scan Test
 
