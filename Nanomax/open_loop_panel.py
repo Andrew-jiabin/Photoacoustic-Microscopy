@@ -87,6 +87,7 @@ class ProbePrealignPanel:
         self.log = log_callback or (lambda *args, **kwargs: None)
         self.status_provider = status_provider
         self.display_params = display_params or {}
+        self.debug_mode = self.display_params.get("SCAN_TARGET") == "nanomax_motion_debug"
         self.safe_max_voltage = validate_positive("safe_max_voltage", config.safe_max_voltage)
         self.piezo_travel_um = validate_positive("piezo_travel_um", config.piezo_travel_um)
         self.piezo_travel_voltage = validate_positive("piezo_travel_voltage", config.piezo_travel_voltage)
@@ -95,7 +96,10 @@ class ProbePrealignPanel:
         self.sample_interval_s = validate_positive("sample_interval_s", config.sample_interval_s)
         self.auto_refresh_s = validate_positive("auto_refresh_s", config.auto_refresh_s)
         self.last_xyz = [float(value) for value in self.stage.get_voltage_xyz()]
-        self.message = "Use hotkeys to set probe Y/Z, then ':' and 'start' to begin imaging."
+        if self.debug_mode:
+            self.message = "NanoMax motion debug only: use hotkeys/commands to move probe Y/Z; q exits without imaging."
+        else:
+            self.message = "Use hotkeys to set probe Y/Z, then ':' and 'start' to begin imaging."
         self.next_action = "start"
         self.renderer = TerminalPanelRenderer()
         self.laser_manager = self.display_params.get("LASER_MANAGER")
@@ -208,8 +212,16 @@ class ProbePrealignPanel:
                     self.message = laser_message
                     return True
             if cmd in ("q", "quit", "exit", "cancel"):
-                raise KeyboardInterrupt("Probe prealignment cancelled by user.")
+                self.next_action = "quit"
+                self.message = "Leaving probe prealignment before acquisition; no scan will be started."
+                self.log("PROBE_PREALIGN_QUIT_REQUESTED", command=line)
+                return False
             if cmd in ("start", "run", "pam", "image", "scan"):
+                if self.debug_mode:
+                    self.next_action = "quit"
+                    self.message = "Closing NanoMax motion debug panel without imaging."
+                    self.log("PROBE_PREALIGN_DEBUG_EXIT_REQUESTED", command=line)
+                    return False
                 start_allowed, reason = self.start_gate()
                 if not start_allowed:
                     self.message = f"Cannot start: {reason}"
@@ -305,7 +317,9 @@ class ProbePrealignPanel:
         daq_state = str(daq_status.get("status", "not_started"))
         daq_ready = daq_state == "ready"
         start_allowed, start_reason = self.start_gate()
-        if not start_allowed:
+        if self.debug_mode:
+            start_hint = "DEBUG - type ':' then start/run to close this motion panel without imaging."
+        elif not start_allowed:
             start_hint = f"NO - {start_reason}"
         elif daq_ready:
             start_hint = "YES - type ':' then start/run/pam to begin acquisition."
@@ -341,7 +355,7 @@ class ProbePrealignPanel:
             ("PROBE_SCAN_AXES", self.display_params.get("PROBE_SCAN_AXES", "-"), "read-only"),
         ]
         start_items = [
-            ("START_ALLOWED", "YES" if start_allowed else "NO", "command=:start/:run/:pam"),
+            ("START_ALLOWED", "DEBUG_EXIT" if self.debug_mode else ("YES" if start_allowed else "NO"), "command=:start/:run/:pam"),
             ("DAQ_CHECK", "READY" if daq_ready else f"WAIT:{daq_state}", daq_status.get("step", "")),
             ("SAMPLE_SCAN", self.display_params.get("SAMPLE_SCAN_READY", "n/a"), self.display_params.get("SAMPLE_SCAN_ERROR", "")),
             ("POSITION_CHECK", "OK", "current Y/Z clamped by panel"),
@@ -349,7 +363,10 @@ class ProbePrealignPanel:
         laser_items = []
         if self.laser_manager is not None:
             laser_items = self.laser_manager.panel_items(acquisition=False)
-        lines = ["Open-loop MAX312D/MDT693B probe prealignment phase - same PAM_Main_Nanomax.py process"]
+        if self.debug_mode:
+            lines = ["Open-loop MAX312D/MDT693B NanoMax motion debug - DAQ and lasers are not initialized"]
+        else:
+            lines = ["Open-loop MAX312D/MDT693B probe prealignment phase - same PAM_Main_Nanomax.py process"]
         lines += section_lines("Connections", connection_items)
         lines += section_lines("Probe Position", position_items)
         lines += section_lines("Motion / Hotkey Parameters", motion_items)
@@ -456,8 +473,12 @@ def run_probe_prealignment(stage, config, log_callback=None, status_provider=Non
         char = read_last_command_key(msvcrt)
         if char:
             if char in ("q", "Q"):
-                panel.renderer.show_cursor()
-                raise KeyboardInterrupt("Probe prealignment cancelled by user.")
+                panel.next_action = "quit"
+                panel.message = "Leaving probe prealignment before acquisition; no scan will be started."
+                panel.log("PROBE_PREALIGN_QUIT_REQUESTED", source="hotkey_q")
+                running = False
+                redraw(refresh=True)
+                continue
             if char in ("h", "H", "?"):
                 redraw(refresh=True)
             elif char in ("s", "S"):

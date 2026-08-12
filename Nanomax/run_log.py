@@ -84,6 +84,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         "zero_line": "",
                         "trusted_zero_line": "",
                         "trusted_start_line": "",
+                        "prealign_quit_line": "",
                         "final_line": "",
                         "return_failed_line": "",
                         "final_error_line": "",
@@ -92,7 +93,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                 elif current_run is not None:
                     current_run["last_line"] = raw_line.strip()
                     current_run["last_event"] = event or "-"
-                    if event in ("RUN_END_NORMAL", "RUN_END_INTERRUPTED", "RUN_END_ERROR"):
+                    if event in ("RUN_END_NORMAL", "RUN_END_INTERRUPTED", "RUN_END_ERROR", "RUN_END_PREACQUISITION_QUIT"):
                         current_run["terminal_event"] = event
                         current_run["terminal_line"] = raw_line.strip()
                     elif event == "ZERO_DATUM_REBUILT" and fields.get("reason") == "return_to_start":
@@ -101,6 +102,8 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         current_run["trusted_zero_line"] = raw_line.strip()
                     elif event == "POSITION_TRUSTED_AFTER_START_RETURN":
                         current_run["trusted_start_line"] = raw_line.strip()
+                    elif event == "PREALIGN_QUIT_WITH_VALID_DATUM":
+                        current_run["prealign_quit_line"] = raw_line.strip()
                     elif event == "FINAL_CLEANUP_DONE":
                         current_run["final_line"] = raw_line.strip()
                     elif event == "RETURN_TO_START_FAILED":
@@ -142,11 +145,13 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "RUN_END_NORMAL": "normal",
         "RUN_END_INTERRUPTED": "interrupted",
         "RUN_END_ERROR": "error",
+        "RUN_END_PREACQUISITION_QUIT": "preacquisition_quit",
     }.get(event, "unfinished_or_abnormal")
     zero_datum_ready = bool(
         current_run["zero_line"]
         or current_run["trusted_zero_line"]
         or current_run["trusted_start_line"]
+        or current_run["prealign_quit_line"]
     )
     final_cleanup_done = bool(current_run["final_line"])
     if current_run["return_failed_line"]:
@@ -164,6 +169,12 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
     elif status == "error" and zero_datum_ready and final_cleanup_done:
         need_start_zero = False
         zero_reason = "pre_acquisition_error_low_end_zero_rebuilt"
+    elif status == "preacquisition_quit" and zero_datum_ready and final_cleanup_done:
+        need_start_zero = False
+        zero_reason = "preacquisition_quit_valid_datum"
+    elif status == "preacquisition_quit":
+        need_start_zero = True
+        zero_reason = "preacquisition_quit_without_trusted_cleanup"
     elif status != "normal":
         need_start_zero = True
         zero_reason = f"{status}_requires_rebuild"
@@ -185,6 +196,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         current_run["zero_line"]
         or current_run["trusted_zero_line"]
         or current_run["trusted_start_line"]
+        or current_run["prealign_quit_line"]
     )
     return {
         "status": status,

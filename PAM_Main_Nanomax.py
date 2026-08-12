@@ -414,6 +414,7 @@ def main():
     noise_532_reference_metadata = {}
     noise_532_status = "prompt_pending" if COLLECT_532_NOISE_PROMPT_ENABLE else "disabled"
     prealignment_started_acquisition = False
+    preacquisition_quit_requested = False
     probe_connect_error = ""
     result_preview_controller = (
         PAMResultPreviewController(
@@ -781,6 +782,24 @@ def main():
                         "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )
+                if getattr(prealign_result, "next_action", "start") == "quit":
+                    preacquisition_quit_requested = True
+                    append_run_log(
+                        "RUN_END_PREACQUISITION_QUIT",
+                        phase="prealignment",
+                        start_panel=prealign_result.start_panel,
+                        acquired_points=0,
+                        expected_points=0,
+                    )
+                    if SCAN_TARGET == "sample_closed_loop":
+                        append_run_log(
+                            "PREALIGN_QUIT_WITH_VALID_DATUM",
+                            reason="operator_quit_before_acquisition",
+                            sample_zero_at_start=SAMPLE_ZERO_XY_AT_START,
+                            sample_start_zero_reason=SAMPLE_START_ZERO_REASON,
+                        )
+                    print("Prealignment quit requested before acquisition; closing controllers without starting DAQ acquisition.")
+                    return
                 prealignment_started_acquisition = True
                 if prealign_result.sample_result is not None:
                     sample_result = prealign_result.sample_result
@@ -932,6 +951,17 @@ def main():
                         "PROBE_SCAN_AXES": f"{PROBE_SCAN_FAST_AXIS}/{PROBE_SCAN_SLOW_AXIS}",
                     },
                 )
+                if getattr(prealign_result, "next_action", "start") == "quit":
+                    preacquisition_quit_requested = True
+                    append_run_log(
+                        "RUN_END_PREACQUISITION_QUIT",
+                        phase="probe_prealignment",
+                        start_panel=prealign_result.start_panel,
+                        acquired_points=0,
+                        expected_points=0,
+                    )
+                    print("Probe prealignment quit requested before acquisition; closing controllers without starting DAQ acquisition.")
+                    return
                 if prealign_result.probe_result is not None:
                     prealignment_started_acquisition = True
                     probe_result = prealign_result.probe_result
@@ -1391,12 +1421,21 @@ def main():
             gc.enable()
             for laser_message in finalize_lasers_once("finally"):
                 print(laser_message)
-            if daq is None and daq_init is not None:
+            if daq is None and daq_init is not None and not preacquisition_quit_requested:
                 try:
                     daq = daq_init.result()
                     append_run_log("DAQ_INIT_JOINED_DURING_CLEANUP", status=daq_init.snapshot()["status"])
                 except Exception as exc:
                     append_run_log("DAQ_INIT_CLEANUP_JOIN_ERROR", error=repr(exc))
+            elif daq is None and daq_init is not None and preacquisition_quit_requested:
+                snapshot = daq_init.snapshot()
+                append_run_log(
+                    "DAQ_INIT_CLEANUP_JOIN_SKIPPED",
+                    reason="preacquisition_quit",
+                    status=snapshot.get("status", "-"),
+                    step=snapshot.get("step", "-"),
+                    elapsed_s=f"{float(snapshot.get('elapsed_s', 0.0)):.3f}",
+                )
             stop_daq_best_effort("finally")
             if acquisition_dashboard is not None:
                 acquisition_dashboard.close()
@@ -1409,8 +1448,10 @@ def main():
             append_run_log("FINAL_CLEANUP_ERROR", error=repr(exc))
             print(f"Cleanup error: {exc}")
 
-        if not data_save_done:
+        if not data_save_done and not preacquisition_quit_requested:
             save_data_once("finally")
+        elif preacquisition_quit_requested:
+            append_run_log("DATA_SAVE_SKIPPED", reason="preacquisition_quit_no_acquisition")
 
 
 if __name__ == "__main__":

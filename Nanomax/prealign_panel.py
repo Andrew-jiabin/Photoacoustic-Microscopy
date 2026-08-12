@@ -113,6 +113,7 @@ class SamplePrealignPanel:
         self.log = log_callback or (lambda *args, **kwargs: None)
         self.status_provider = status_provider
         self.display_params = display_params or {}
+        self.debug_mode = self.display_params.get("SCAN_TARGET") == "nanomax_motion_debug"
         self.x_step_um = validate_manual_step("xstep", config.x_step_um, config.min_step_um)
         self.y_step_um = validate_manual_step("ystep", config.y_step_um, config.min_step_um)
         self.z_step_um = validate_manual_step("zstep", config.z_step_um, config.min_step_um)
@@ -128,7 +129,10 @@ class SamplePrealignPanel:
             "position_reissue_interval_s",
             config.position_reissue_interval_s,
         )
-        self.message = "Use hotkeys to set the start position, then ':' and 'start' to begin imaging."
+        if self.debug_mode:
+            self.message = "NanoMax motion debug only: use hotkeys/commands to move stages; q exits without imaging."
+        else:
+            self.message = "Use hotkeys to set the start position, then ':' and 'start' to begin imaging."
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
         self.ready_to_start = False
@@ -264,7 +268,10 @@ class SamplePrealignPanel:
         daq_ready = daq_state == "ready"
         scan_ok = bool(scan.get("ok"))
         start_allowed = scan_ok
-        if not scan_ok:
+        if self.debug_mode:
+            start_allowed = True
+            start_hint = "DEBUG - type ':' then start/run to close this motion panel without imaging."
+        elif not scan_ok:
             start_hint = f"NO - fix scan range/step first: {scan.get('error')}"
         elif daq_ready:
             start_hint = "YES - type ':' then start/run/pam to begin acquisition."
@@ -326,11 +333,14 @@ class SamplePrealignPanel:
         if self.laser_manager is not None:
             laser_items = self.laser_manager.panel_items(acquisition=False)
         start_items = [
-            ("START_ALLOWED", "YES" if start_allowed else "NO", "command=:start/:run/:pam"),
-            ("SCAN_CHECK", "OK" if scan_ok else "BLOCKED", scan.get("error", "")),
+            ("START_ALLOWED", "DEBUG_EXIT" if self.debug_mode else ("YES" if start_allowed else "NO"), "command=:start/:run/:pam"),
+            ("SCAN_CHECK", "DEBUG_ONLY" if self.debug_mode else ("OK" if scan_ok else "BLOCKED"), "" if self.debug_mode else scan.get("error", "")),
             ("DAQ_CHECK", "READY" if daq_ready else f"WAIT:{daq_state}", daq_status.get("step", "")),
         ]
-        lines = ["Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"]
+        if self.debug_mode:
+            lines = ["Closed-loop MAX311D/BPC303 NanoMax motion debug - DAQ and lasers are not initialized"]
+        else:
+            lines = ["Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"]
         lines += section_lines("Connections", connection_items)
         lines += section_lines("Position", position_items)
         lines += section_lines("Scan Parameters", scan_items)
@@ -414,8 +424,18 @@ class SamplePrealignPanel:
                     self.message = laser_message
                     return True
             if cmd in ("q", "quit", "exit", "cancel"):
-                raise KeyboardInterrupt("Prealignment cancelled by user.")
+                self.ready_to_start = False
+                self.next_action = "quit"
+                self.message = "Leaving prealignment before acquisition; no scan will be started."
+                self.log("PREALIGN_QUIT_REQUESTED", command=line)
+                return False
             if cmd in ("start", "run", "pam", "image", "scan"):
+                if self.debug_mode:
+                    self.ready_to_start = False
+                    self.next_action = "quit"
+                    self.message = "Closing NanoMax motion debug panel without imaging."
+                    self.log("PREALIGN_DEBUG_EXIT_REQUESTED", command=line)
+                    return False
                 scan = self.evaluate_scan(refresh=True)
                 if not scan.get("ok"):
                     self.message = f"Cannot start: {scan.get('error')}"
@@ -641,8 +661,13 @@ def run_sample_prealignment(stage, config, log_callback=None, status_provider=No
         char = read_last_command_key(msvcrt)
         if char:
             if char in ("q", "Q"):
-                panel.renderer.show_cursor()
-                raise KeyboardInterrupt("Prealignment cancelled by user.")
+                panel.ready_to_start = False
+                panel.next_action = "quit"
+                panel.message = "Leaving prealignment before acquisition; no scan will be started."
+                panel.log("PREALIGN_QUIT_REQUESTED", source="hotkey_q")
+                running = False
+                redraw(refresh=True)
+                continue
             if char in ("h", "H", "?"):
                 redraw(refresh=True)
             elif char in ("s", "S"):

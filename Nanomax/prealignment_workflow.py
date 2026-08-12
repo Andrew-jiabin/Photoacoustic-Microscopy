@@ -9,6 +9,7 @@ class NanoMaxPrealignmentResult:
     sample_result: object = None
     probe_result: object = None
     start_panel: str = None
+    next_action: str = "start"
 
 
 def run_nanomax_prealignment(
@@ -61,7 +62,13 @@ def run_nanomax_prealignment(
                 display_params["SAMPLE_SCAN_ERROR"] = getattr(sample_result, "scan_error", "")
                 active = "probe"
                 continue
-            return NanoMaxPrealignmentResult(sample_result=sample_result, probe_result=probe_result, start_panel="sample")
+            next_action = getattr(sample_result, "next_action", "start")
+            return NanoMaxPrealignmentResult(
+                sample_result=sample_result,
+                probe_result=probe_result,
+                start_panel="sample",
+                next_action=next_action,
+            )
 
         config = replace(probe_config, allow_sample_switch=has_sample)
         probe_result = run_probe_prealignment(
@@ -74,4 +81,10 @@ def run_nanomax_prealignment(
         if getattr(probe_result, "next_action", "start") == "sample" and has_sample:
             active = "sample"
             continue
-        return NanoMaxPrealignmentResult(sample_result=sample_result, probe_result=probe_result, start_panel="probe")
+        next_action = getattr(probe_result, "next_action", "start")
+        return NanoMaxPrealignmentResult(
+            sample_result=sample_result,
+            probe_result=probe_result,
+            start_panel="probe",
+            next_action=next_action,
+        )
