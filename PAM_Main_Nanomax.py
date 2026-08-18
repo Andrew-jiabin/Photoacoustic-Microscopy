@@ -12,7 +12,7 @@ from Alazar_imaging.AlazarNPTSystem import AlazarNPTSystem
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
 from Alazar_imaging.laser_runtime import LaserRunOptions, PamLaserManager
 from Alazar_imaging.MDT693BController import MDT693BController
-from Nanomax.acquisition_panel import AcquisitionDashboard
+from Nanomax.acquisition_panel import AcquisitionDashboard, PauseZMotionController
 from Nanomax.daq_async import BackgroundDaqInit
 from Nanomax.data_io import package_point_data_for_save, save_scan_data, save_scan_snapshot_data
 from Nanomax.open_loop_panel import ProbePrealignConfig
@@ -1115,6 +1115,20 @@ def main():
             runtime_items=runtime_dashboard_items,
             result_preview_controller=result_preview_controller,
             mat_path_provider=current_preview_mat_path,
+            pause_z_controller=(
+                PauseZMotionController(
+                    stage,
+                    step_um=SAMPLE_PREALIGN_Z_STEP_UM,
+                    settle_ms=SETTLE_MS,
+                    tolerance_um=SAMPLE_POSITION_TOLERANCE_UM,
+                    timeout_s=SAMPLE_RETURN_POSITION_TIMEOUT_S,
+                    reissue_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
+                    min_step_um=NANOMAX_MANUAL_MIN_STEP_UM,
+                    log_callback=append_run_log,
+                )
+                if SCAN_TARGET == "sample_closed_loop" and stage is not None
+                else None
+            ),
             log_callback=append_run_log,
         )
         acquisition_dashboard.start()
@@ -1146,6 +1160,21 @@ def main():
                         timeout_s=SAMPLE_POSITION_TIMEOUT_S,
                         correction_interval_s=SAMPLE_POSITION_REISSUE_INTERVAL_S,
                     )
+                    try:
+                        readback = stage.get_position_values()
+                        actual_x, actual_y = float(readback[0]), float(readback[1])
+                        actual_z = float(readback[2]) if len(readback) > 2 else actual_z
+                        position_error_x = abs(actual_x - float(tx))
+                        position_error_y = abs(actual_y - float(ty))
+                    except Exception as read_exc:
+                        append_run_log(
+                            "ACQUISITION_POSITION_READBACK_FAILED",
+                            index=point_index,
+                            total=len(trajectory),
+                            target_x_um=f"{tx:.6f}",
+                            target_y_um=f"{ty:.6f}",
+                            error=repr(read_exc),
+                        )
                 except TimeoutError as exc:
                     position_timeout_points += 1
                     position_settle_ok = False
@@ -1223,9 +1252,9 @@ def main():
                     acquisition_dashboard.update(
                         acquired_points,
                         current_position=(
-                            f"X={tx:.4f} um, Y={ty:.4f} um"
+                            f"X={tx:.4f} um, Y={ty:.4f} um, Z={actual_z:.4f} um"
                             if position_settle_ok
-                            else f"TARGET X={tx:.4f}, Y={ty:.4f}; ACTUAL X={actual_x:.4f}, Y={actual_y:.4f}"
+                            else f"TARGET X={tx:.4f}, Y={ty:.4f}; ACTUAL X={actual_x:.4f}, Y={actual_y:.4f}, Z={actual_z:.4f}"
                         ),
                     )
                 if acquisition_dashboard is not None and acquisition_dashboard.poll_commands():
