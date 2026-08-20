@@ -1,6 +1,13 @@
 # Photoacoustic-Microscopy
 ## By Jiabin Lin
 
+# 文档索引
+
+| 文档 | 内容 |
+| :--- | :--- |
+| `LBTEK_1D_STAGE_NOTES.md` | **麓邦一维位移台（EM-LSS65-13C1）使用与调试笔记**：连接序列、轴 ID=1、9024 错误与断电恢复、加速度标定 0.5、settle 2s、脚本清单（`PAM_Main_LBTEK.py` 等） |
+| `reference/PAM_Nanomax_laser_integration_notes.md` | NanoMax 压电台 + 激光（CBOX 532 / Toptica）集成决策记录 |
+
 # NanoMax 压电平台配置记录
 
 更新时间：2026-07-01

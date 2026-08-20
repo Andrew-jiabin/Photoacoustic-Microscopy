@@ -18,3 +18,21 @@ __pycache__/
 # Local backup files
 *.bak
 *.bak_*
+
+# 调试诊断脚本与临时产物（保留交付脚本，忽略中间诊断）
+Tool_code/_diag_*.py
+Tool_code/emcvx_example/
+Tool_code/lbtek_restore_and_verify.py
+Tool_code/_*.txt
+git_*_tmp.txt
+
+# 驱动 / SDK 二进制（已用 git rm --cached 移除跟踪，本地文件保留）
+LBTEK_SDK/
+PriorSDK/
+PriorSDK*/
+*.dll
+*.exe
+*.a
+*.exp
+*.lib
+*.so
