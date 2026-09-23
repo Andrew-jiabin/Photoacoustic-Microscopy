@@ -55,10 +55,10 @@ AXIS_ID = 1              # 官方 SDK 示例：轴 ID 从 1 开始（用 0 会�
 # --- 运动参数（单位 mm） ---
 # 中点对称扫描：运行前请把探针手动移到成像轨迹的中点 M。
 # 程序先向左移动 SCAN_HALF_RANGE_MM 到左端点，再向右扫描总宽度 2*SCAN_HALF_RANGE_MM（覆盖 M±d）。
-SCAN_HALF_RANGE_MM = 0.5   # 给定距离 d：从中点向左移动 d 到左端；扫描总宽 = 2d
-STEP_UM = 10               # 步长 [µm]；10µm = 0.01mm
+SCAN_HALF_RANGE_MM = 2   # 给定距离 d：从中点向左移动 d 到左端；扫描总宽 = 2d
+STEP_UM = 8               # 步长 [µm]；10µm = 0.01mm
 SCAN_N_POINTS = int(2 * SCAN_HALF_RANGE_MM * 1000 / STEP_UM) + 1   # 101 点（含两端）
-MAX_MOVE_MM = 1.5          # 安全护栏：任意单次移动距离上限 [mm]（>= 第一跳 d + 余量）
+MAX_MOVE_MM = 2.5          # 安全护栏：任意单次移动距离上限 [mm]（>= 第一跳 d + 余量）
 MAX_POS_ABS_MM = 14.0      # 行程软检查：|端点坐标| 超过此值拒绝（行程 <30mm 留余量）
 
 # 交互开关：SSH/自动化运行时可跳过 input 等待（--auto-start 或环境变量 PAM_AUTO_START=1）
@@ -69,7 +69,7 @@ AUTO_START = False
 # （0.1 时加速距离 5mm >> 行程，无法到位）；±0.5mm 内一次到位，±1mm 需重试。
 SPEED_MM_S = 2.0         # 扫描速度：实测到位精度 0.0000mm
 ACCEL_MM_S2 = 0.5        # 尽可能低的可用加速度
-FIRST_JUMP_SPEED_MM_S = 0.5  # 第一跳（中点->左端）低速，避免长距离快速移动产生震动
+FIRST_JUMP_TIMEOUT_S = 8.0  # 第一跳（中点->左端）到位超时：距离 d，需比微步进更长
 
 SETTLE_TIME_S = 2.0      # 兜底超时：自适应稳定检测最大等待（10um 步进实测 ~0.35s 到位）
 SETTLE_STABLE_S = 0.15   # 稳定判据：位置连续 ~0.15s 无变化即视为静止
@@ -199,7 +199,7 @@ def main():
                             records_per_point=RECORDS_PER_POINT)
 
     gc.disable()
-    # 启动确认：--auto-start / PAM_AUTO_START=1 时跳过交互等待（SSH 自动化用）
+    # 启动确认解析：--auto-start / PAM_AUTO_START=1 时跳过交互等待（SSH 自动化用）
     import argparse
     _ap = argparse.ArgumentParser()
     _ap.add_argument("--auto-start", action="store_true",
@@ -207,10 +207,6 @@ def main():
     _args, _ = _ap.parse_known_args()
     auto_start = _args.auto_start or AUTO_START or \
         os.environ.get("PAM_AUTO_START", "0").strip().lower() in ("1", "true", "yes")
-    if not auto_start:
-        input("Press Enter to START Experiment... (确保激光器已开)")
-    else:
-        print("⚡ AUTO-START 模式：跳过启动确认（请确认激光器已开）")
 
     # === 4. 生成一维扫描轨迹（中点对称：当前位置 = 用户放置的中点 M） ===
     if SCAN_N_POINTS < 2:
@@ -228,19 +224,22 @@ def main():
     if SCAN_HALF_RANGE_MM > MAX_MOVE_MM:
         raise RuntimeError(f"第一跳距离 {SCAN_HALF_RANGE_MM:.3f} mm 超过安全上限 {MAX_MOVE_MM} mm")
 
-    # 先从中点向左移动 d 到左端点（低速，防震动）
-    print(f"[轨迹] 中点 M={mid_pos:.4f} mm，低速 {FIRST_JUMP_SPEED_MM_S} mm/s 向左移动 "
-          f"{SCAN_HALF_RANGE_MM:.3f} mm 到左端 L={left_pos:.4f}")
-    stage.setSpeed(stage.handle, AXIS_ID, FIRST_JUMP_SPEED_MM_S)
+    # 先从中点向左移动 d 到左端点（用扫描速度；到位超时按第一跳距离放宽到 FIRST_JUMP_TIMEOUT_S）
+    print(f"[轨迹] 中点 M={mid_pos:.4f} mm，向左移动 {SCAN_HALF_RANGE_MM:.3f} mm 到左端 L={left_pos:.4f}")
     stage.setAbsoluteDisp(stage.handle, AXIS_ID, left_pos)
     stage.moveEmcvx(stage.handle, AXIS_ID, 0x06)
-    if not wait_settled_adaptive(stage, left_pos):
+    if not wait_settled_adaptive(stage, left_pos, timeout_s=FIRST_JUMP_TIMEOUT_S):
         print("⚠️ 第一跳未稳定，重试一次...")
         stage.setAbsoluteDisp(stage.handle, AXIS_ID, left_pos)
         stage.moveEmcvx(stage.handle, AXIS_ID, 0x06)
-        wait_settled_adaptive(stage, left_pos)
-    # 恢复扫描速度
-    stage.setSpeed(stage.handle, AXIS_ID, SPEED_MM_S)
+        wait_settled_adaptive(stage, left_pos, timeout_s=FIRST_JUMP_TIMEOUT_S)
+    print(f"✅ 已到达扫描起点（左端）{left_pos:.4f} mm")
+
+    # 启动确认（激光）：放在第一跳到位之后，用户可先调整设备再确认开扫
+    if not auto_start:
+        input("已移动到扫描起点。确认激光已开启后按 Enter 开始扫描...")
+    else:
+        print("⚡ AUTO-START 模式：跳过启动确认（请确认激光器已开）")
 
     # 从左端点向右扫描，总宽 2d（L -> M -> R）
     trajectory = [left_pos + i * step_mm for i in range(SCAN_N_POINTS)]
@@ -278,15 +277,24 @@ def main():
         print(f"✅ 已回到中点 {start_pos:.4f} mm (实际 {actual if actual is not None else 'N/A'})")
 
     except KeyboardInterrupt:
-        print("\n🛑 用户终止")
+        print("\n🛑 用户终止，正在回到中点...")
         stage.moveEmcvx(stage.handle, AXIS_ID, 0x01)  # STOP
+        try:
+            stage.setAbsoluteDisp(stage.handle, AXIS_ID, start_pos)
+            stage.moveEmcvx(stage.handle, AXIS_ID, 0x06)
+            wait_settled_adaptive(stage, start_pos)
+            actual, _ = stage.get_pos(AXIS_ID)
+            print(f"✅ 已回到中点 {start_pos:.4f} mm "
+                  f"(实际 {actual if actual is not None else 'N/A'})")
+        except Exception as e:
+            print(f"⚠️ 回中点失败: {e}")
     except Exception as e:
         print(f"\n❌ 发生错误: {e}")
         stage.moveEmcvx(stage.handle, AXIS_ID, 0x01)  # STOP
         try:
             stage.setAbsoluteDisp(stage.handle, AXIS_ID, start_pos)
             stage.moveEmcvx(stage.handle, AXIS_ID, 0x06)
-            lbtek_wait_settled(stage, stage.handle, AXIS_ID)
+            wait_settled_adaptive(stage, start_pos)
         except Exception:
             pass
     finally:
