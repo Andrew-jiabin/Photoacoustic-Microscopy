@@ -713,7 +713,8 @@ routine:
 ```text
 [1]  Backup and push    - stage all, commit with a timestamp, push origin/main
 [2]  Pull from GitHub   - fast-forward only, never creates a merge
-[3]  Show status        - working tree plus the last three commits
+[3]  Show status        - working tree, the last three commits, and anything
+                          not yet pushed to origin/main
 [4]  Exit
 ```
 
@@ -739,6 +740,12 @@ Implementation notes, all of which are load-bearing:
   anything launched from the desktop.
 - The commit timestamp comes from PowerShell `Get-Date -Format`, not `%DATE%`,
   which on a Chinese Windows is `2026/09/23 周三` and parses unpredictably.
+- `backup` is safe to run on a hunch: when the working tree is already clean it
+  prints `nothing staged - skipping commit`, skips the commit, and still pushes,
+  so it never fails just because there was nothing to do.
+- A failed `git commit` aborts **before** the push instead of reporting a bogus
+  success. Exit codes: `0` success, `1` git or the repository was not found,
+  `2` unknown action.
 
 ### Manual equivalent
 
