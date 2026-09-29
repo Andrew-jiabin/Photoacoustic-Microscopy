@@ -6,17 +6,25 @@ import sys
 from Nanomax.run_log import RUN_LOG_PATH, append_run_log
 
 
-def find_other_pam_processes():
-    """Return other running PAM/BPC helper processes that may hold the controller."""
+def find_other_pam_processes(extra_patterns=()):
+    """Return other running PAM/BPC helper processes that may hold the controller.
+
+    ``extra_patterns`` lets an entry point that shares hardware widen the search.
+    PAM_Main_Nanomax_ClosedLoop.py and PAM_Main_Prior.py pass their sibling entry
+    points, so two programs can never fight over the same BPC303 controller or the
+    same Alazar board. The default reproduces the original single-program search.
+    """
     if os.name != "nt":
         return []
     current_pid = os.getpid()
+    patterns = ["*PAM_Main_Nanomax.py*", "*_bpc303_preflight_child.py*"]
+    patterns.extend(str(pattern) for pattern in extra_patterns)
+    clause = " -or ".join(f"$_.CommandLine -like '{pattern}'" for pattern in patterns)
     command = (
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.Name -like 'python*' -and "
         f"$_.ProcessId -ne {current_pid} -and "
-        "($_.CommandLine -like '*PAM_Main_Nanomax.py*' -or "
-        "$_.CommandLine -like '*_bpc303_preflight_child.py*') } | "
+        f"({clause}) }} | "
         "ForEach-Object { "
         "'pid=' + $_.ProcessId + ' creation=' + $_.CreationDate + "
         "' command=' + ($_.CommandLine -replace '\\r|\\n', ' ') }"

@@ -135,10 +135,30 @@ class SamplePrealignPanel:
             self.message = "Use hotkeys to set the start position, then ':' and 'start' to begin imaging."
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
         self.travel_um = {axis: float(self.stage.get_max_travel(axis)) for axis in ("x", "y", "z")}
+        # A piezo with a zero datum can only go up from 0; a controller with absolute
+        # coordinates can sit at a negative one. Ask only if the stage offers the lower
+        # bound, so the BPC303 panel keeps its historical [0, travel] clamp exactly.
+        min_travel = getattr(self.stage, "get_min_travel", None)
+        self.travel_min_um = {
+            axis: (float(min_travel(axis)) if callable(min_travel) else 0.0)
+            for axis in ("x", "y", "z")
+        }
         self.ready_to_start = False
         self.next_action = "start"
         self.renderer = TerminalPanelRenderer()
         self.laser_manager = self.display_params.get("LASER_MANAGER")
+        # Presentation overrides so a non-NanoMax stage (for example the Prior
+        # adapter) can reuse this panel without showing NanoMax-specific labels.
+        # Every default reproduces the historical strings exactly.
+        self.help_text = str(self.display_params.get("HELP_TEXT") or HELP_TEXT)
+        self.panel_title = str(
+            self.display_params.get("PANEL_TITLE") or "PAM closed-loop sample prealignment"
+        )
+        self.status_header = str(
+            self.display_params.get("STATUS_HEADER")
+            or "Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"
+        )
+        self.show_probe_rows = bool(self.display_params.get("SHOW_PROBE_ROWS", True))
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -157,8 +177,18 @@ class SamplePrealignPanel:
             return
         self.laser_manager.refresh_status()
 
+    def axis_window(self, axis):
+        """Return ``(low, high)`` for one axis, in microns.
+
+        A piezo with a zero datum reports ``(0, travel)``; a controller with absolute
+        coordinates reports a signed window. Everything that validates or displays a
+        limit goes through here, so the BPC303 path keeps its historical
+        ``0..travel`` wording and behaviour exactly.
+        """
+        return float(self.travel_min_um[axis]), float(self.travel_um[axis])
+
     def clamp_axis(self, axis, value):
-        low, high = 0.0, self.travel_um[axis]
+        low, high = self.axis_window(axis)
         clamped = max(low, min(high, float(value)))
         return clamped, abs(clamped - float(value)) > 1e-9
 
@@ -242,10 +272,18 @@ class SamplePrealignPanel:
         min_x, max_x = sorted((float(x), end_x))
         min_y, max_y = sorted((float(y), end_y))
         errors = []
-        if min_x < -1e-9 or max_x > self.travel_um["x"] + 1e-9:
-            errors.append(f"SCAN_RANGE_X_UM makes X {min_x:.4f}..{max_x:.4f} um exceed [0,{self.travel_um['x']:.4f}]")
-        if min_y < -1e-9 or max_y > self.travel_um["y"] + 1e-9:
-            errors.append(f"SCAN_RANGE_Y_UM makes Y {min_y:.4f}..{max_y:.4f} um exceed [0,{self.travel_um['y']:.4f}]")
+        low_x, high_x = self.axis_window("x")
+        low_y, high_y = self.axis_window("y")
+        if min_x < low_x - 1e-9 or max_x > high_x + 1e-9:
+            errors.append(
+                f"SCAN_RANGE_X_UM makes X {min_x:.4f}..{max_x:.4f} um exceed "
+                f"[{low_x:g},{high_x:.4f}]"
+            )
+        if min_y < low_y - 1e-9 or max_y > high_y + 1e-9:
+            errors.append(
+                f"SCAN_RANGE_Y_UM makes Y {min_y:.4f}..{max_y:.4f} um exceed "
+                f"[{low_y:g},{high_y:.4f}]"
+            )
         estimate = estimate_scan_time("sample_closed_loop", self.config.step_um, scan_w * scan_h)
         return {
             "ok": not errors,
@@ -281,17 +319,23 @@ class SamplePrealignPanel:
             ("SAMPLE_CTRL", self.display_params.get("SAMPLE_CONTROLLER", "BPC303"), self.display_params.get("SAMPLE_CONNECTION", "connected")),
             ("SAMPLE_SERIAL", self.display_params.get("SAMPLE_SERIAL", "-"), self.display_params.get("SAMPLE_STAGE_MODEL", "MAX311D")),
             ("SAMPLE_AXES", self.display_params.get("SAMPLE_AXIS_MAP", "1/2/3=X/Y/Z"), "closed-loop um"),
-            ("PROBE_CTRL", self.display_params.get("PROBE_CONTROLLER", "MDT693B"), self.display_params.get("PROBE_CONNECTION", "unknown")),
-            ("PROBE_SERIAL", self.display_params.get("PROBE_SERIAL", "-"), f"port={self.display_params.get('PROBE_PORT', '-')}, backend={self.display_params.get('PROBE_BACKEND', '-')}"),
-            ("PROBE_PANEL", "available" if self.config.allow_probe_switch else "unavailable", "use :probe" if self.config.allow_probe_switch else self.display_params.get("PROBE_CONNECT_ERROR", "-")),
         ]
+        if self.show_probe_rows:
+            connection_items += [
+                ("PROBE_CTRL", self.display_params.get("PROBE_CONTROLLER", "MDT693B"), self.display_params.get("PROBE_CONNECTION", "unknown")),
+                ("PROBE_SERIAL", self.display_params.get("PROBE_SERIAL", "-"), f"port={self.display_params.get('PROBE_PORT', '-')}, backend={self.display_params.get('PROBE_BACKEND', '-')}"),
+                ("PROBE_PANEL", "available" if self.config.allow_probe_switch else "unavailable", "use :probe" if self.config.allow_probe_switch else self.display_params.get("PROBE_CONNECT_ERROR", "-")),
+            ]
+        low_x, high_x = self.axis_window("x")
+        low_y, high_y = self.axis_window("y")
+        low_z, high_z = self.axis_window("z")
         position_items = [
             ("X_um", f"{x:.4f}", "Up/Down"),
             ("Y_um", f"{y:.4f}", "Left/Right"),
             ("Z_um", f"{z:.4f}", "+/-"),
-            ("X_LIMIT", f"0..{self.travel_um['x']:.2f}", "um"),
-            ("Y_LIMIT", f"0..{self.travel_um['y']:.2f}", "um"),
-            ("Z_LIMIT", f"0..{self.travel_um['z']:.2f}", "um"),
+            ("X_LIMIT", f"{low_x:g}..{high_x:.2f}", "um"),
+            ("Y_LIMIT", f"{low_y:g}..{high_y:.2f}", "um"),
+            ("Z_LIMIT", f"{low_z:g}..{high_z:.2f}", "um"),
         ]
         scan_items = [
             ("SCAN_RANGE_X_UM", f"{self.config.scan_range_x_um:g}", "set SCAN_RANGE_X_UM n"),
@@ -340,7 +384,7 @@ class SamplePrealignPanel:
         if self.debug_mode:
             lines = ["Closed-loop MAX311D/BPC303 NanoMax motion debug - DAQ and lasers are not initialized"]
         else:
-            lines = ["Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"]
+            lines = [self.status_header]
         lines += section_lines("Connections", connection_items)
         lines += section_lines("Position", position_items)
         lines += section_lines("Scan Parameters", scan_items)
@@ -357,7 +401,10 @@ class SamplePrealignPanel:
                 )
             else:
                 lines.append(f"Time estimate: unavailable until a complete successful STEP_UM={self.config.step_um:g} scan is recorded.")
-            lines.append(f"Travel check: OK inside X[0,{self.travel_um['x']:.4f}], Y[0,{self.travel_um['y']:.4f}], Z[0,{self.travel_um['z']:.4f}] um")
+            lines.append(
+                f"Travel check: OK inside X[{low_x:g},{high_x:.4f}], "
+                f"Y[{low_y:g},{high_y:.4f}], Z[{low_z:g},{high_z:.4f}] um"
+            )
         else:
             lines.append(f"Travel/step check: OUT OF RANGE - {scan.get('error')}")
             lines.append("Use ':' commands to change SCAN_RANGE_X_UM, SCAN_RANGE_Y_UM, STEP_UM, or move the start position.")
@@ -381,9 +428,9 @@ class SamplePrealignPanel:
         separator = "=" * min(width - 1, 118)
         lines = [
             separator,
-            "PAM closed-loop sample prealignment",
+            self.panel_title,
             separator,
-            HELP_TEXT,
+            self.help_text,
             separator,
         ]
         lines.extend(self.status_lines(refresh=refresh))

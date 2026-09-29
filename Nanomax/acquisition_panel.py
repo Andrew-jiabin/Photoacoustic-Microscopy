@@ -185,10 +185,18 @@ class AcquisitionDashboard:
         mat_path_provider=None,
         pause_z_controller=None,
         log_callback=None,
+        laser_section_title="Lasers",
+        allowed_hint=None,
+        command_hint=None,
     ):
         self.desc = str(desc)
         self.total = int(total)
         self.laser_manager = laser_manager
+        # Presentation overrides for programs with no laser control. All three
+        # default to the historical strings, so existing callers are unaffected.
+        self.laser_section_title = str(laser_section_title)
+        self.allowed_hint = allowed_hint
+        self.command_hint = command_hint
         self.stop_key = str(stop_key or "q").lower()
         self.stop_enabled = bool(stop_enabled)
         self.scan_items = list(scan_items or [])
@@ -446,7 +454,8 @@ class AcquisitionDashboard:
         if self.state.command_mode:
             return f"Command: :{self.state.command_buffer}"
         stop_hint = f"press {self.stop_key} to pause/confirm stop" if self.stop_enabled else "graceful stop key disabled"
-        return f"Command: press ':' for laser close-at-end commands; {stop_hint}."
+        command_hint = self.command_hint or "press ':' for laser close-at-end commands"
+        return f"Command: {command_hint}; {stop_hint}."
 
     def render(self):
         separator = "=" * min(terminal_width() - 1, 118)
@@ -461,10 +470,17 @@ class AcquisitionDashboard:
             self._command_line(),
             f"Current point: {self.state.current_position}",
             "Allowed during acquisition: "
-            f":532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh"
-            f"{', ' + self.stop_key + ' pause; paused: ' + paused_controls if self.stop_enabled else ''}",
+            + (
+                self.allowed_hint
+                or ":532 close-at-end on/off, :toptica close-at-end on/off, :laser refresh"
+            )
+            + (
+                ", " + self.stop_key + " pause; paused: " + paused_controls
+                if self.stop_enabled
+                else ""
+            ),
         ]
-        lines += format_section_lines("Lasers", self.laser_manager.panel_items(acquisition=True))
+        lines += format_section_lines(self.laser_section_title, self.laser_manager.panel_items(acquisition=True))
         if self.pause_z_controller is not None and self.pause_z_controller.available():
             lines += format_section_lines("Paused Closed-Loop Z Control", self.pause_z_controller.panel_items())
         lines += format_section_lines("Frozen Scan Parameters", self.scan_items)

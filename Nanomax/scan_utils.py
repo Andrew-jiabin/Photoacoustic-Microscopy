@@ -114,21 +114,42 @@ def build_probe_trajectory(
     return trajectory
 
 
-def validate_sample_trajectory(stage, trajectory):
-    """Fail early if any closed-loop MAX311D target is outside native travel."""
+def validate_sample_trajectory(stage, trajectory, limit_label=None):
+    """Fail early if any closed-loop sample target is outside native travel."""
     if not trajectory:
         raise ValueError("Empty sample trajectory.")
     max_x = float(stage.get_max_travel("x"))
     max_y = float(stage.get_max_travel("y"))
-    violations = [(x, y) for x, y in trajectory if x < 0.0 or x > max_x or y < 0.0 or y > max_y]
+    # A piezo with a zero datum reports a window of [0, travel]; a controller with absolute
+    # coordinates reports a signed one. Only ask a stage that offers the lower bound, so the
+    # BPC303 path keeps its historical [0, travel] behaviour and wording exactly.
+    min_travel = getattr(stage, "get_min_travel", None)
+    min_x = float(min_travel("x")) if callable(min_travel) else 0.0
+    min_y = float(min_travel("y")) if callable(min_travel) else 0.0
+    violations = [
+        (x, y)
+        for x, y in trajectory
+        if x < min_x or x > max_x or y < min_y or y > max_y
+    ]
     if violations:
         first_x, first_y = violations[0]
+        if limit_label is None:
+            limit_label = "BPC303/MAX311D"
+            advice = (
+                "Reduce SCAN_RANGE_X_UM/SCAN_RANGE_Y_UM/STEP_UM, change scan direction, "
+                "or move the stage start position."
+            )
+        else:
+            advice = (
+                "Reduce SCAN_RANGE_X_UM/SCAN_RANGE_Y_UM/STEP_UM, change scan direction, "
+                "or move the start position. Raise the working window with the matching "
+                "PAM_*_TRAVEL_UM setting only after confirming the real travel."
+            )
         raise ValueError(
-            "Closed-loop sample scan exceeds the current BPC303/MAX311D travel limit. "
+            f"Closed-loop sample scan exceeds the current {limit_label} travel limit. "
             f"First invalid target: X={first_x:.4f} um, Y={first_y:.4f} um; "
-            f"valid ranges are X=[0,{max_x:.4f}] um, Y=[0,{max_y:.4f}] um. "
-            "Reduce SCAN_RANGE_X_UM/SCAN_RANGE_Y_UM/STEP_UM, change scan direction, "
-            "or move the stage start position."
+            f"valid ranges are X=[{min_x:g},{max_x:.4f}] um, Y=[{min_y:g},{max_y:.4f}] um. "
+            + advice
         )
 
 

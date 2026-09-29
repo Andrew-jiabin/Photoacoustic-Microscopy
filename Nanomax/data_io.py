@@ -181,6 +181,18 @@ def _prepare_532_noise_reference(noise_532_reference, average_enable, records_pe
     return np.asarray(noise_data), package_reason
 
 
+# Stage identity written into every .mat. These are the historical NanoMax values and stay
+# the defaults so that an existing caller keeps producing byte-identical metadata; a program
+# driving other hardware overrides them through `stage_metadata`. Without that, a Prior scan
+# would be saved claiming a BPC303 sample stage and an MDT693B probe stage it never touched.
+DEFAULT_STAGE_METADATA = {
+    "sample_stage": "MAX311D",
+    "sample_controller": "BPC303",
+    "probe_stage": "MAX312D",
+    "probe_controller": "MDT693B",
+}
+
+
 def build_scan_mat_dict(
     all_data,
     scan_w,
@@ -198,6 +210,7 @@ def build_scan_mat_dict(
     start_z,
     noise_532_reference=None,
     noise_532_metadata=None,
+    stage_metadata=None,
 ):
     if len(all_data) == 0:
         return None, [], [], 0
@@ -319,11 +332,16 @@ def build_scan_mat_dict(
             "probe_step_v": -1 if probe_step_v is None else probe_step_v,
             "probe_um_per_v": -1 if probe_um_per_v is None else probe_um_per_v,
             "start_xyz": [start_x, start_y, 0 if start_z is None else start_z],
-            "sample_stage": "MAX311D",
-            "sample_controller": "BPC303",
-            "probe_stage": "MAX312D",
-            "probe_controller": "MDT693B",
+            "sample_stage": DEFAULT_STAGE_METADATA["sample_stage"],
+            "sample_controller": DEFAULT_STAGE_METADATA["sample_controller"],
+            "probe_stage": DEFAULT_STAGE_METADATA["probe_stage"],
+            "probe_controller": DEFAULT_STAGE_METADATA["probe_controller"],
         }
+        # A program that drives different hardware corrects the identity here instead of
+        # shipping a file that names a stage it does not have. The defaults above are the
+        # historical NanoMax values, so a caller that passes nothing is unaffected.
+        if stage_metadata:
+            mat_dict["metadata"].update(dict(stage_metadata))
         position_timeout_count = int(sum(position_timeout_list))
         return mat_dict, index_to_pos, skipped_pos, position_timeout_count
     except Exception:
@@ -366,6 +384,7 @@ def save_scan_snapshot_data(
     label="live-preview",
     noise_532_reference=None,
     noise_532_metadata=None,
+    stage_metadata=None,
 ):
     if len(all_data) == 0:
         append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_valid_data")
@@ -389,6 +408,7 @@ def save_scan_snapshot_data(
             start_z,
             noise_532_reference=noise_532_reference,
             noise_532_metadata=noise_532_metadata,
+            stage_metadata=stage_metadata,
         )
         if not index_to_pos:
             append_run_log("DATA_PREVIEW_SNAPSHOT_SKIPPED", reason="no_packageable_data", skipped_points=len(skipped_pos))
@@ -429,6 +449,7 @@ def save_scan_data(
     save_prompt_timeout_s=60.0,
     noise_532_reference=None,
     noise_532_metadata=None,
+    stage_metadata=None,
 ):
     if len(all_data) == 0:
         append_run_log("DATA_SAVE_SKIPPED", reason="no_valid_data")
@@ -456,6 +477,7 @@ def save_scan_data(
             start_z,
             noise_532_reference=noise_532_reference,
             noise_532_metadata=noise_532_metadata,
+            stage_metadata=stage_metadata,
         )
 
         if not index_to_pos:

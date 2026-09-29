@@ -249,6 +249,10 @@ def _wrap_plain_line(text, width):
 
 
 def format_section_lines(title, items, width=None):
+    if not items:
+        # No rows to print. Returning the bare header would be noise, and the column
+        # layout below cannot size itself against an empty list, so omit the section.
+        return []
     rows = [f"[{title}]"]
     width = terminal_width() if width is None else max(80, int(width))
     available = max(40, width - 3)
