@@ -433,6 +433,11 @@ Hotkeys:
 
 Commands after ':' then Enter:
   start / run / pam / image / scan   close this panel and begin acquisition
+  p1 / a                             mark the current X,Y as corner A of the scan rectangle
+  p2 / b                             mark corner B; once both corners exist the rectangle is applied
+  rect x1 y1 x2 y2                   set both corners numerically and apply the rectangle
+  rect                               re-apply the rectangle from the marked corners
+  rect clear                         drop the marked corners
   set SCAN_RANGE_X_UM <um>           scan travel along X for this run
   set SCAN_RANGE_Y_UM <um>           scan travel along Y for this run
   set STEP_UM <um>                   image pixel step for this run
@@ -445,6 +450,13 @@ Commands after ':' then Enter:
   set timeout <sec>                  move timeout
   set reissue <sec>                  resend the target while outside tolerance; 0 disables
   q / quit / cancel                  abort before acquisition
+
+Two-point rectangle scan:
+  Move the stage to one corner of the region you want -- arrow keys, 'set x/y', or the
+  controller's own hand pad -- type p1, move to the opposite corner, type p2. The panel
+  then snaps the span to a whole number of STEP_UM steps, sets the scan ranges, forces
+  the S-shaped (serpentine) pattern, moves to the start corner and shows the shape.
+  Type start to begin.
 
 This program has no laser and no open-loop probe control; those commands are not
 available. Scan travel is limited to the configured Prior working window.

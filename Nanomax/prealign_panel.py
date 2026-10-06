@@ -159,6 +159,13 @@ class SamplePrealignPanel:
             or "Closed-loop MAX311D/BPC303 prealignment phase - same PAM_Main_Nanomax.py process"
         )
         self.show_probe_rows = bool(self.display_params.get("SHOW_PROBE_ROWS", True))
+        # Two-point rectangle scan: the operator marks two opposite corners and the panel
+        # derives the scan rectangle from them, instead of hand-placing the scan start and
+        # then typing the two ranges. Each corner is read from the live stage position, so
+        # it does not matter whether the stage was moved with the panel hotkeys, the
+        # terminal commands, or the controller's own hand pad.
+        self.corner_a = None
+        self.corner_b = None
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -261,6 +268,154 @@ class SamplePrealignPanel:
         x, y, z = self.last_xyz
         return self.set_xyz(x=x + float(x_delta), y=y + float(y_delta), z=z + float(z_delta), reason=reason)
 
+    # ------------------------------------------------------------------ two-point rect
+    def mark_corner(self, which):
+        """Record the live stage position as one corner of the scan rectangle.
+
+        The position is read from the stage right now, so whatever moved it last -- the
+        panel arrow keys, a ``set x/y`` command, or the controller's hand pad -- is
+        already reflected here. Marking the second corner applies the rectangle.
+        """
+        axis = str(which).strip().lower()
+        if axis not in ("a", "b"):
+            raise ValueError("Corner must be 'a' or 'b'.")
+        x, y, _ = self.refresh()
+        point = (float(x), float(y))
+        if axis == "a":
+            self.corner_a = point
+        else:
+            self.corner_b = point
+        label = "A" if axis == "a" else "B"
+        self.log("PREALIGN_CORNER_MARKED", corner=label, x_um=f"{point[0]:.6f}", y_um=f"{point[1]:.6f}")
+        if self.corner_a is not None and self.corner_b is not None:
+            self.apply_corner_rectangle()
+            return True
+        other = "B" if axis == "a" else "A"
+        self.message = (
+            f"Corner {label} marked at X={point[0]:.4f} um, Y={point[1]:.4f} um. "
+            f"Move the stage to corner {other} and mark it too, then the rectangle is applied."
+        )
+        return True
+
+    def clear_corners(self):
+        self.corner_a = None
+        self.corner_b = None
+        self.message = "Two-point corners cleared."
+        self.log("PREALIGN_CORNERS_CLEARED")
+        return True
+
+    def corner_status_text(self):
+        def fmt(point):
+            return "-" if point is None else f"{point[0]:.4f},{point[1]:.4f}"
+
+        return fmt(self.corner_a), fmt(self.corner_b)
+
+    def apply_corner_rectangle(self):
+        """Derive the scan rectangle from the two marked corners and move to its start.
+
+        The start corner is chosen from the configured scan directions so the shared
+        trajectory builder, which walks ``+direction * range`` from the start, covers
+        exactly the marked rectangle. The hand-placed span is snapped to the nearest whole
+        number of ``STEP_UM`` steps, because the scan grid has to be a whole number of
+        steps and a hand-placed rectangle almost never lands on one.
+        """
+        if self.corner_a is None or self.corner_b is None:
+            raise ValueError("Mark both corners first: p1 then p2, or 'rect x1 y1 x2 y2'.")
+        (x1, y1), (x2, y2) = self.corner_a, self.corner_b
+        step = float(self.config.step_um)
+        span_x = abs(float(x2) - float(x1))
+        span_y = abs(float(y2) - float(y1))
+        steps_x = int(round(span_x / step))
+        steps_y = int(round(span_y / step))
+        range_x = steps_x * step
+        range_y = steps_y * step
+        dir_x = float(self.config.sample_x_direction)
+        dir_y = float(self.config.sample_y_direction)
+        start_x = min(x1, x2) if dir_x >= 0 else max(x1, x2)
+        start_y = min(y1, y2) if dir_y >= 0 else max(y1, y2)
+        end_x = start_x + dir_x * range_x
+        end_y = start_y + dir_y * range_y
+        low_x, high_x = self.axis_window("x")
+        low_y, high_y = self.axis_window("y")
+        errors = []
+        if min(start_x, end_x) < low_x - 1e-9 or max(start_x, end_x) > high_x + 1e-9:
+            errors.append(
+                f"X {min(start_x, end_x):.4f}..{max(start_x, end_x):.4f} um exceeds [{low_x:g},{high_x:.4f}]"
+            )
+        if min(start_y, end_y) < low_y - 1e-9 or max(start_y, end_y) > high_y + 1e-9:
+            errors.append(
+                f"Y {min(start_y, end_y):.4f}..{max(start_y, end_y):.4f} um exceeds [{low_y:g},{high_y:.4f}]"
+            )
+        if errors:
+            raise ValueError("Two-point rectangle is outside the stage travel window: " + "; ".join(errors))
+        moved = self.set_xyz(x=start_x, y=start_y, reason="command_rect_start_corner")
+        self.config.scan_range_x_um = range_x
+        self.config.scan_range_y_um = range_y
+        # The two-point feature is the S-shaped scan; keep it explicit so a previous
+        # 'set SCAN_PATTERN raster' cannot silently turn it back into a raster scan.
+        self.config.scan_pattern = "serpentine"
+        scan = self.evaluate_scan(refresh=True)
+        self.log(
+            "PREALIGN_RECT_READY",
+            corner_a_x_um=f"{x1:.6f}",
+            corner_a_y_um=f"{y1:.6f}",
+            corner_b_x_um=f"{x2:.6f}",
+            corner_b_y_um=f"{y2:.6f}",
+            start_x_um=f"{start_x:.6f}",
+            start_y_um=f"{start_y:.6f}",
+            scan_range_x_um=f"{range_x:.6f}",
+            scan_range_y_um=f"{range_y:.6f}",
+            step_um=f"{step:g}",
+            snap_residual_x_um=f"{span_x - range_x:.6f}",
+            snap_residual_y_um=f"{span_y - range_y:.6f}",
+            scan_w=scan.get("scan_w"),
+            scan_h=scan.get("scan_h"),
+            points=scan.get("points"),
+            scan_ok=scan.get("ok"),
+            start_corner_moved=moved,
+        )
+        if not scan.get("ok"):
+            self.message = f"Two-point rectangle applied but the check failed: {scan.get('error')}"
+            return True
+        residual = []
+        if abs(span_x - range_x) > 1e-9:
+            residual.append(f"X span {span_x:.4f}->{range_x:.4f} um")
+        if abs(span_y - range_y) > 1e-9:
+            residual.append(f"Y span {span_y:.4f}->{range_y:.4f} um")
+        residual_text = ("; snapped to STEP_UM: " + ", ".join(residual)) if residual else ""
+        self.message = (
+            f"Two-point rectangle ready: A=({x1:.4f},{y1:.4f}) B=({x2:.4f},{y2:.4f}) um -> "
+            f"start=({start_x:.4f},{start_y:.4f}), range={range_x:g} x {range_y:g} um, "
+            f"shape={scan['scan_w']} x {scan['scan_h']}, points={scan['points']}, "
+            f"pattern=serpentine (S-shaped){residual_text}. Type start to begin."
+        )
+        return True
+
+    def execute_rect(self, tokens):
+        if not tokens:
+            self.apply_corner_rectangle()
+            return
+        if len(tokens) == 1 and tokens[0].lower() in ("clear", "reset", "none"):
+            self.clear_corners()
+            return
+        if len(tokens) == 4:
+            self.corner_a = (float(tokens[0]), float(tokens[1]))
+            self.corner_b = (float(tokens[2]), float(tokens[3]))
+            self.log(
+                "PREALIGN_CORNER_MARKED",
+                corner="A+B",
+                x_um=f"{self.corner_a[0]:.6f}",
+                y_um=f"{self.corner_a[1]:.6f}",
+                corner_b_x_um=f"{self.corner_b[0]:.6f}",
+                corner_b_y_um=f"{self.corner_b[1]:.6f}",
+            )
+            self.apply_corner_rectangle()
+            return
+        raise ValueError(
+            "Use 'rect' to apply the marked corners, 'rect clear' to drop them, "
+            "or 'rect x1 y1 x2 y2' to set both corners numerically."
+        )
+
     def evaluate_scan(self, refresh=False):
         x, y, _ = self.refresh() if refresh else self.last_xyz
         try:
@@ -337,11 +492,14 @@ class SamplePrealignPanel:
             ("Y_LIMIT", f"{low_y:g}..{high_y:.2f}", "um"),
             ("Z_LIMIT", f"{low_z:g}..{high_z:.2f}", "um"),
         ]
+        corner_a_text, corner_b_text = self.corner_status_text()
         scan_items = [
             ("SCAN_RANGE_X_UM", f"{self.config.scan_range_x_um:g}", "set SCAN_RANGE_X_UM n"),
             ("SCAN_RANGE_Y_UM", f"{self.config.scan_range_y_um:g}", "set SCAN_RANGE_Y_UM n"),
             ("STEP_UM", f"{self.config.step_um:g}", "set STEP_UM n"),
             ("SCAN_PATTERN", self.config.scan_pattern, "set SCAN_PATTERN s|z"),
+            ("CORNER_A", corner_a_text, "p1: mark current X,Y"),
+            ("CORNER_B", corner_b_text, "p2: mark, then rectangle applies"),
         ]
         motion_items = [
             ("xstep", f"{self.x_step_um:g}", "set xstep n"),
@@ -476,7 +634,7 @@ class SamplePrealignPanel:
                 self.message = "Leaving prealignment before acquisition; no scan will be started."
                 self.log("PREALIGN_QUIT_REQUESTED", command=line)
                 return False
-            if cmd in ("start", "run", "pam", "image", "scan"):
+            if cmd in ("start", "run", "pam", "image", "scan", "go"):
                 if self.debug_mode:
                     self.ready_to_start = False
                     self.next_action = "quit"
@@ -499,7 +657,15 @@ class SamplePrealignPanel:
                 self.next_action = "probe"
                 self.message = "Switching to open-loop probe panel."
                 return False
-            if cmd in ("h", "help", "?"):
+            if cmd in ("p1", "a", "mark1", "point1", "m1"):
+                self.mark_corner("a")
+            elif cmd in ("p2", "b", "mark2", "point2", "m2"):
+                self.mark_corner("b")
+            elif cmd in ("rect", "rectangle", "twopoint", "two-point"):
+                self.execute_rect(tokens[1:])
+            elif cmd in ("clear", "reset", "unmark"):
+                self.clear_corners()
+            elif cmd in ("h", "help", "?"):
                 self.message = "Help refreshed."
             elif cmd in ("s", "status"):
                 self.refresh()
@@ -654,6 +820,11 @@ Hotkeys:
 Commands after ':' then Enter:
   start / run / pam / image / scan   start acquisition in this same PAM_Main_Nanomax.py process
   probe / open / mdt693b             switch to the open-loop probe panel, if enabled
+  p1 / a                             mark the current X,Y as corner A of the scan rectangle
+  p2 / b                             mark corner B; once both corners exist the rectangle is applied
+  rect x1 y1 x2 y2                   set both corners numerically and apply the rectangle
+  rect                               re-apply the rectangle from the marked corners
+  rect clear                         drop the marked corners
   set SCAN_RANGE_X_UM <um>           set scan range along X/up for this run
   set SCAN_RANGE_Y_UM <um>           set scan range along Y/left for this run
   set STEP_UM <um>                   set image pixel step for this run
@@ -672,6 +843,13 @@ Commands after ':' then Enter:
   toptica cc/pc/external/scan on/off explicitly change TOPTICA controls
   toptica close-at-end on/off        choose whether final cleanup runs TOPTICA safe off
   q / quit / cancel                  abort before acquisition
+
+Two-point rectangle scan:
+  Move the stage to one corner of the region you want (arrow keys, 'set x/y', or the
+  controller's hand pad), type p1, move to the opposite corner, type p2. The panel then
+  snaps the span to a whole number of STEP_UM steps, sets the scan ranges, forces the
+  S-shaped (serpentine) pattern, moves to the start corner, and shows the shape. Type
+  start to begin. The start corner is the low corner for the configured scan directions.
 """.strip()
 
 

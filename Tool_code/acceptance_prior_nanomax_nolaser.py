@@ -21,8 +21,9 @@ Checks
   6  no-laser      NoLaserManager status, panel items and command handling
   7  geometry      scan shape, pattern, trajectory (including flipped directions) and
                    travel validation
-  8  panel parity  the shared panels still render the historical default strings, and
-                   drop the probe rows only when the caller asks for it
+  8  panel parity  the shared panels still render the historical default strings, drop the
+                   probe rows only when the caller asks for it, and derive a two-point
+                   rectangle scan (p1/p2, span snapping, start corner, refusal)
   9  sweep         no removed hardware symbol is reachable from either entry point
  10  dry run       PAM_Main_Prior.main() runs end to end with every hardware seam faked,
                    in a scratch directory: the whole startup -> scan -> save -> return ->
@@ -1396,7 +1397,7 @@ def main():
     harness.expect("omitting the label keeps the historical BPC303/MAX311D wording", default_label_kept)
 
     # ----------------------------------------------------------- 8 panel parity
-    harness.section("8. shared panel parity")
+    harness.section("8. shared panel parity and two-point rectangle")
     try:
         terminal_panel = importlib.import_module("Nanomax.terminal_panel")
         acquisition_panel = importlib.import_module("Nanomax.acquisition_panel")
@@ -1620,6 +1621,151 @@ def main():
             overridden_meta.get("sample_unit_um_per_unit"),
             overridden_meta.get("sample_stage"),
         ),
+    )
+
+    # ---- two-point rectangle scan -------------------------------------------
+    # The operator marks two corners (p1/p2, each read from the live stage position) and the
+    # panel derives the scan rectangle from them instead of the operator hand-placing the
+    # scan start. The span is snapped to whole STEP_UM steps and the pattern is forced to
+    # the S-shaped one.
+    rect_config = prealign_panel.SamplePrealignConfig(
+        scan_range_x_um=0.0,
+        scan_range_y_um=0.0,
+        step_um=1.0,
+        x_step_um=1.0,
+        y_step_um=1.0,
+        z_step_um=1.0,
+        min_step_um=1.0,
+        position_tolerance_um=1.0,
+        position_timeout_s=5.0,
+        auto_refresh_s=5.0,
+    )
+    # um_per_unit=0.1 keeps a 96.6 um corner representable exactly, so the snapping check
+    # below is not confused by the stage's own unit quantisation.
+    rect_stage = PriorStageAdapter(
+        FakePriorStage(x_units=1000.0, y_units=200.0),
+        um_per_unit=0.1,
+        travel_um=100.0,
+        settle_default_ms=0,
+        log_callback=None,
+    )
+    rect_stage.refresh_limits()
+    rect_panel = prealign_panel.SamplePrealignPanel(rect_stage, rect_config, display_params={})
+    rect_recorder = LineRecorder()
+    rect_panel.renderer = rect_recorder
+
+    rect_panel.execute_command("p1")
+    rect_corner_a = rect_panel.corner_a
+    harness.expect(
+        "p1 records the live stage position as corner A",
+        rect_corner_a is not None
+        and abs(rect_corner_a[0] - 100.0) < 1e-6
+        and abs(rect_corner_a[1] - 20.0) < 1e-6,
+        rect_corner_a,
+    )
+    harness.expect(
+        "p1 alone does not invent a scan range",
+        rect_panel.config.scan_range_x_um == 0.0 and rect_panel.config.scan_range_y_um == 0.0,
+        (rect_panel.config.scan_range_x_um, rect_panel.config.scan_range_y_um),
+    )
+
+    rect_stage.set_position([96.0, 6.0])  # the operator walks to the opposite corner
+    rect_panel.execute_command("p2")
+    rect_corner_b = rect_panel.corner_b
+    harness.expect(
+        "p2 records the second corner",
+        rect_corner_b is not None
+        and abs(rect_corner_b[0] - 96.0) < 1e-6
+        and abs(rect_corner_b[1] - 6.0) < 1e-6,
+        rect_corner_b,
+    )
+    harness.expect(
+        "the two-point rectangle sets SCAN_RANGE_X_UM from the corner span",
+        abs(rect_panel.config.scan_range_x_um - 4.0) < 1e-9,
+        rect_panel.config.scan_range_x_um,
+    )
+    harness.expect(
+        "the two-point rectangle sets SCAN_RANGE_Y_UM from the corner span",
+        abs(rect_panel.config.scan_range_y_um - 14.0) < 1e-9,
+        rect_panel.config.scan_range_y_um,
+    )
+    harness.expect(
+        "the two-point rectangle forces the S-shaped pattern",
+        rect_panel.config.scan_pattern == "serpentine",
+        rect_panel.config.scan_pattern,
+    )
+
+    rect_result = rect_panel.result()
+    harness.expect(
+        "the panel start position becomes the rectangle start corner",
+        abs(rect_result.x_um - 96.0) < 1e-6 and abs(rect_result.y_um - 6.0) < 1e-6,
+        (rect_result.x_um, rect_result.y_um),
+    )
+    rect_summary = scan_utils.sample_scan_summary(
+        rect_result.x_um,
+        rect_result.y_um,
+        rect_result.scan_range_x_um,
+        rect_result.scan_range_y_um,
+        rect_result.step_um,
+        x_direction=1.0,
+        y_direction=1.0,
+        serpentine=True,
+        max_range_um=None,
+    )
+    harness.expect(
+        "the derived trajectory covers exactly the marked rectangle",
+        abs(rect_summary["x_min"] - 96.0) < 1e-6
+        and abs(rect_summary["x_max"] - 100.0) < 1e-6
+        and abs(rect_summary["y_min"] - 6.0) < 1e-6
+        and abs(rect_summary["y_max"] - 20.0) < 1e-6,
+        "X=%.2f..%.2f Y=%.2f..%.2f"
+        % (rect_summary["x_min"], rect_summary["x_max"], rect_summary["y_min"], rect_summary["y_max"]),
+    )
+
+    rect_panel.execute_command("rect clear")
+    harness.expect(
+        "rect clear drops both corners",
+        rect_panel.corner_a is None and rect_panel.corner_b is None,
+    )
+
+    # A hand-placed span is almost never a whole number of steps, so it has to snap.
+    rect_panel.execute_command("rect 96.6 6.0 100.0 20.0")
+    harness.expect(
+        "a 3.4 um span snaps to 3 steps of 1.0 um",
+        abs(rect_panel.config.scan_range_x_um - 3.0) < 1e-9,
+        rect_panel.config.scan_range_x_um,
+    )
+    rect_landed = rect_stage.get_position_values()[:2]
+    harness.expect(
+        "the snapped rectangle still starts at the low corner",
+        abs(rect_landed[0] - 96.6) < 1e-6 and abs(rect_landed[1] - 6.0) < 1e-6,
+        rect_landed,
+    )
+
+    rect_panel.render()
+    rect_text = rect_recorder.text()
+    harness.expect(
+        "the status panel shows both marked corners",
+        "CORNER_A" in rect_text and "CORNER_B" in rect_text,
+    )
+    harness.expect(
+        "the status panel shows the corner coordinates",
+        "96.6000,6.0000" in rect_text and "100.0000,20.0000" in rect_text,
+    )
+
+    # A rectangle the stage cannot reach is refused before anything moves. Run last,
+    # because it deliberately leaves an unusable pair of corners on the panel.
+    rect_before = rect_stage.get_position_values()[:2]
+    rect_panel.execute_command("rect 0 0 400 400")
+    harness.expect(
+        "an out-of-window rectangle is refused",
+        rect_panel.message.startswith("Command failed:"),
+        rect_panel.message,
+    )
+    harness.expect(
+        "a refused rectangle does not move the stage",
+        rect_stage.get_position_values()[:2] == rect_before,
+        (rect_before, rect_stage.get_position_values()[:2]),
     )
 
     # ------------------------------------------------------------ 9 static sweep
