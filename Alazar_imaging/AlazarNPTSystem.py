@@ -34,7 +34,12 @@ class AlazarNPTSystem:
                                        ats.TRIG_ENGINE_J,
                                        ats.TRIG_EXTERNAL, # 外部触发
                                        ats.TRIGGER_SLOPE_POSITIVE,
-                                       160,
+                                       # 8-bit bipolar code: 0 = -FS, 128 = 0 V, 255 = +FS.
+                                       # V = (level - 128) * 2.5 / 127   (ETR_2V5 range, FS = 2.5 V)
+                                       # 153 -> 0.492 V.  Lowered from 160 (0.630 V) on 2026-10-06
+                                       # so that a 500 mV rising edge can trigger.
+                                       # NOTE: shared module -- applies to every entry point.
+                                       153,
                                        ats.TRIG_ENGINE_K,
                                        ats.TRIG_DISABLE,
                                        ats.TRIGGER_SLOPE_POSITIVE,
