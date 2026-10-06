@@ -22,8 +22,9 @@ Checks
   7  geometry      scan shape, pattern, trajectory (including flipped directions) and
                    travel validation
   8  panel parity  the shared panels still render the historical default strings, drop the
-                   probe rows only when the caller asks for it, and derive a two-point
-                   rectangle scan (p1/p2, span snapping, start corner, refusal)
+                   probe rows only when the caller asks for it, derive a two-point
+                   rectangle scan (p1/p2, span snapping, start corner, refusal), and split
+                   the return to the start corner into short legs
   9  sweep         no removed hardware symbol is reachable from either entry point
  10  dry run       PAM_Main_Prior.main() runs end to end with every hardware seam faked,
                    in a scratch directory: the whole startup -> scan -> save -> return ->
@@ -1172,6 +1173,39 @@ def main():
         and abs(pinned.get_max_travel("x") - 30000.0) < 1e-9,
         "window=[%g, %g]" % (pinned.get_min_travel("x"), pinned.get_max_travel("x")),
     )
+
+    # Regression: the two window accessors share one cache-filling helper, so a single
+    # return value from it can only ever be right for one of them. The helper used to
+    # return the upper bound, which made the first get_min_travel() on a cache miss
+    # report "+travel" -- and a caller that asked for the window before refresh_limits()
+    # then rejected every negative target as out of range. The pre-alignment panel calls
+    # get_max_travel() first, so it only ever saw the correct value; that is why the rest
+    # of this file never caught it, and why the 2026-10-06 restore script tripped over it.
+    # Each accessor now gets its own adapter so the first call really is a cache miss.
+    uncached_min = PriorStageAdapter(
+        FakePriorStage(x_units=-14067.0, y_units=-1387.0),
+        um_per_unit=1.0,
+        travel_um=20000.0,
+        settle_default_ms=0,
+        log_callback=None,
+    )
+    harness.expect(
+        "get_min_travel() on a cache miss returns the lower bound, not the upper one",
+        abs(uncached_min.get_min_travel("x") + 20000.0) < 1e-9,
+        "min=%g" % (uncached_min.get_min_travel("x"),),
+    )
+    uncached_max = PriorStageAdapter(
+        FakePriorStage(x_units=-14067.0, y_units=-1387.0),
+        um_per_unit=1.0,
+        travel_um=20000.0,
+        settle_default_ms=0,
+        log_callback=None,
+    )
+    harness.expect(
+        "get_max_travel() on a cache miss returns the upper bound, not the lower one",
+        abs(uncached_max.get_max_travel("x") - 20000.0) < 1e-9,
+        "max=%g" % (uncached_max.get_max_travel("x"),),
+    )
     try:
         PriorStageAdapter(
             FakePriorStage(), um_per_unit=1.0, travel_um=100.0, travel_min_um=200.0,
@@ -1766,6 +1800,85 @@ def main():
         "a refused rectangle does not move the stage",
         rect_stage.get_position_values()[:2] == rect_before,
         (rect_before, rect_stage.get_position_values()[:2]),
+    )
+
+    # ---- the return to the start corner is split into short legs -------------
+    # Marking the corners can leave the stage at the far end, so the travel back to the
+    # scan start is issued as a chain of short closed-loop moves, never one long jump.
+    seg_config = prealign_panel.SamplePrealignConfig(
+        scan_range_x_um=0.0,
+        scan_range_y_um=0.0,
+        step_um=1.0,
+        x_step_um=1.0,
+        y_step_um=1.0,
+        z_step_um=1.0,
+        min_step_um=0.1,
+        position_tolerance_um=1.0,
+        position_timeout_s=5.0,
+        auto_refresh_s=5.0,
+    )
+    seg_stage = PriorStageAdapter(
+        FakePriorStage(x_units=0.0, y_units=0.0),
+        um_per_unit=0.1,
+        travel_um=100.0,
+        settle_default_ms=0,
+        log_callback=None,
+    )
+    seg_stage.refresh_limits()
+    seg_panel = prealign_panel.SamplePrealignPanel(seg_stage, seg_config, display_params={})
+    seg_panel.rect_return_step_um = 2.0
+    seg_stage.set_position([0.0, 0.0])
+    seg_panel.execute_command("p1")          # corner A is the start corner, at (0,0)
+    seg_fake = seg_stage.stage
+    seg_stage.set_position([8.0, 6.0])       # the operator walks to the far corner
+    seg_before = len(seg_fake.commands)
+    seg_panel.execute_command("p2")          # re-reads the stage, then returns to the start
+    seg_legs = [cmd for cmd in seg_fake.commands[seg_before:] if cmd.startswith("set_position:")]
+    harness.expect(
+        "the return to the start corner is split into legs, not one jump",
+        len(seg_legs) > 1,
+        seg_legs,
+    )
+    harness.expect(
+        "a 10 um return at RETURN_STEP_UM=2 um is 5 legs",
+        len(seg_legs) == 5,
+        len(seg_legs),
+    )
+    harness.expect(
+        "the last return leg lands exactly on the start corner",
+        seg_legs and seg_legs[-1] == "set_position:0,0",
+        seg_legs[-1] if seg_legs else "<none>",
+    )
+    harness.expect(
+        "the panel reports the leg count and travel",
+        "5 legs" in seg_panel.message and "10.0000 um travelled" in seg_panel.message,
+        seg_panel.message,
+    )
+
+    seg_panel.execute_command("set return_step 0.25")
+    harness.expect(
+        "set return_step updates the leg length",
+        abs(seg_panel.rect_return_step_um - 0.25) < 1e-9,
+        seg_panel.rect_return_step_um,
+    )
+    seg_panel.execute_command("set return_step 0.001")
+    harness.expect(
+        "set return_step below the stage minimum is refused",
+        seg_panel.message.startswith("Command failed:"),
+        seg_panel.message,
+    )
+    harness.expect(
+        "a refused return_step is not applied",
+        abs(seg_panel.rect_return_step_um - 0.25) < 1e-9,
+        seg_panel.rect_return_step_um,
+    )
+
+    seg_recorder = LineRecorder()
+    seg_panel.renderer = seg_recorder
+    seg_panel.render()
+    harness.expect(
+        "the status panel shows RECT_RETURN_STEP_UM",
+        "RECT_RETURN_STEP_UM" in seg_recorder.text(),
     )
 
     # ------------------------------------------------------------ 9 static sweep

@@ -442,6 +442,7 @@ Commands after ':' then Enter:
   set SCAN_RANGE_Y_UM <um>           scan travel along Y for this run
   set STEP_UM <um>                   image pixel step for this run
   set xstep/ystep/zstep <um>         manual move steps
+  set return_step <um>               longest leg used to travel back to the scan start corner
   set x/y/z/xy/xyz ...               set absolute position(s) in um
   set interval <sec>                 hotkey polling interval
   set refresh <sec>                  automatic screen redraw interval
@@ -457,6 +458,11 @@ Two-point rectangle scan:
   then snaps the span to a whole number of STEP_UM steps, sets the scan ranges, forces
   the S-shaped (serpentine) pattern, moves to the start corner and shows the shape.
   Type start to begin.
+  If marking the corners leaves the stage at the far end, the travel back to the start
+  corner is split into legs of at most RECT_RETURN_STEP_UM (default 1 um) so the stage
+  never makes one long jump; each leg settles before the next one is issued.
+  RECT_RETURN_STEP_UM is the panel's own setting; it is not RETURN_STEP_UM, which is the
+  line step the program uses when it returns the stage at the very end of a scan.
 
 This program has no laser and no open-loop probe control; those commands are not
 available. Scan travel is limited to the configured Prior working window.

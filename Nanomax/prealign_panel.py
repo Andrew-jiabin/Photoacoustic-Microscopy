@@ -1,4 +1,5 @@
 import ctypes
+import math
 import os
 import sys
 import time
@@ -36,6 +37,10 @@ class SamplePrealignConfig:
     position_timeout_s: float = 300.0
     position_reissue_interval_s: float = 1.0
     allow_probe_switch: bool = False
+    # Longest single leg used when the panel has to travel back to the scan start corner.
+    # Marking the corners can leave the stage at the far one, so the return is issued as a
+    # chain of short closed-loop moves rather than one jump.
+    rect_return_step_um: float = 1.0
 
 
 @dataclass
@@ -166,6 +171,11 @@ class SamplePrealignPanel:
         # terminal commands, or the controller's own hand pad.
         self.corner_a = None
         self.corner_b = None
+        self.rect_return_step_um = validate_manual_step(
+            "rect_return_step_um",
+            config.rect_return_step_um,
+            config.min_step_um,
+        )
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -268,6 +278,37 @@ class SamplePrealignPanel:
         x, y, z = self.last_xyz
         return self.set_xyz(x=x + float(x_delta), y=y + float(y_delta), z=z + float(z_delta), reason=reason)
 
+    def move_segmented_to(self, target_x, target_y, reason="segmented_move", step_um=None):
+        """Travel to an absolute X,Y as a chain of short closed-loop legs, not one jump.
+
+        Marking the two corners can leave the stage at the far corner, so returning to the
+        scan start may be a long travel. Each leg is at most ``rect_return_step_um`` long
+        and waits for the closed loop to settle before the next one is issued, so the stage
+        never takes the whole distance in a single command.
+
+        Returns ``(moved, legs, distance_um)``.
+        """
+        start_x, start_y, _ = self.last_xyz
+        delta_x = float(target_x) - float(start_x)
+        delta_y = float(target_y) - float(start_y)
+        distance = math.hypot(delta_x, delta_y)
+        segment = float(self.rect_return_step_um if step_um is None else step_um)
+        if segment <= 0:
+            raise ValueError(f"Return segment must be positive, got {segment:g} um.")
+        if distance <= segment + 1e-9:
+            return bool(self.set_xyz(x=target_x, y=target_y, reason=reason)), 1, distance
+        legs = int(math.ceil(distance / segment - 1e-9))
+        moved = False
+        for index in range(1, legs + 1):
+            if index == legs:
+                leg_x, leg_y = float(target_x), float(target_y)
+            else:
+                fraction = float(index) / float(legs)
+                leg_x = float(start_x) + delta_x * fraction
+                leg_y = float(start_y) + delta_y * fraction
+            moved = bool(self.set_xyz(x=leg_x, y=leg_y, reason=f"{reason}_leg{index}of{legs}")) or moved
+        return moved, legs, distance
+
     # ------------------------------------------------------------------ two-point rect
     def mark_corner(self, which):
         """Record the live stage position as one corner of the scan rectangle.
@@ -348,7 +389,13 @@ class SamplePrealignPanel:
             )
         if errors:
             raise ValueError("Two-point rectangle is outside the stage travel window: " + "; ".join(errors))
-        moved = self.set_xyz(x=start_x, y=start_y, reason="command_rect_start_corner")
+        # Returning to the start corner can cross the whole rectangle, so it is issued as a
+        # chain of short legs instead of one jump.
+        moved, legs, return_distance = self.move_segmented_to(
+            start_x,
+            start_y,
+            reason="command_rect_start_corner",
+        )
         self.config.scan_range_x_um = range_x
         self.config.scan_range_y_um = range_y
         # The two-point feature is the S-shaped scan; keep it explicit so a previous
@@ -373,6 +420,9 @@ class SamplePrealignPanel:
             points=scan.get("points"),
             scan_ok=scan.get("ok"),
             start_corner_moved=moved,
+            return_distance_um=f"{return_distance:.6f}",
+            return_legs=legs,
+            return_step_um=f"{self.rect_return_step_um:g}",
         )
         if not scan.get("ok"):
             self.message = f"Two-point rectangle applied but the check failed: {scan.get('error')}"
@@ -383,11 +433,17 @@ class SamplePrealignPanel:
         if abs(span_y - range_y) > 1e-9:
             residual.append(f"Y span {span_y:.4f}->{range_y:.4f} um")
         residual_text = ("; snapped to STEP_UM: " + ", ".join(residual)) if residual else ""
+        return_text = ""
+        if legs > 1:
+            return_text = (
+                f" Returned to the start corner in {legs} legs of <= {self.rect_return_step_um:g} um "
+                f"({return_distance:.4f} um travelled)."
+            )
         self.message = (
             f"Two-point rectangle ready: A=({x1:.4f},{y1:.4f}) B=({x2:.4f},{y2:.4f}) um -> "
             f"start=({start_x:.4f},{start_y:.4f}), range={range_x:g} x {range_y:g} um, "
             f"shape={scan['scan_w']} x {scan['scan_h']}, points={scan['points']}, "
-            f"pattern=serpentine (S-shaped){residual_text}. Type start to begin."
+            f"pattern=serpentine (S-shaped){residual_text}.{return_text} Type start to begin."
         )
         return True
 
@@ -505,6 +561,7 @@ class SamplePrealignPanel:
             ("xstep", f"{self.x_step_um:g}", "set xstep n"),
             ("ystep", f"{self.y_step_um:g}", "set ystep n"),
             ("zstep", f"{self.z_step_um:g}", "set zstep n"),
+            ("RECT_RETURN_STEP_UM", f"{self.rect_return_step_um:g}", "set return_step n"),
             ("interval", f"{self.sample_interval_s:g}", "set interval n"),
             ("refresh", f"{self.auto_refresh_s:g}", "set refresh n"),
             ("SETTLE_MS", f"{self.config.settle_ms:g}", "set SETTLE_MS n"),
@@ -725,6 +782,13 @@ class SamplePrealignPanel:
         elif target == "zstep" and len(tokens) == 2:
             self.z_step_um = validate_manual_step("zstep", tokens[1], self.config.min_step_um)
             self.message = f"zstep set to {self.z_step_um:g} um."
+        elif target in ("return_step", "returnstep", "rect_return_step", "rect_return_step_um", "return_step_um") and len(tokens) == 2:
+            self.rect_return_step_um = validate_manual_step(
+                "rect_return_step_um",
+                tokens[1],
+                self.config.min_step_um,
+            )
+            self.message = f"rect_return_step_um set to {self.rect_return_step_um:g} um."
         elif target in ("interval", "dt") and len(tokens) == 2:
             self.sample_interval_s = validate_positive("interval", tokens[1])
             self.message = f"interval set to {self.sample_interval_s:g} s."
@@ -829,6 +893,7 @@ Commands after ':' then Enter:
   set SCAN_RANGE_Y_UM <um>           set scan range along Y/left for this run
   set STEP_UM <um>                   set image pixel step for this run
   set xstep/ystep/zstep <um>         set manual closed-loop move steps
+  set return_step <um>               longest leg used to travel back to the scan start corner
   set x/y/z/xy/xyz ...               set absolute closed-loop position(s) in um
   set interval <sec>                 hotkey polling interval
   set refresh <sec>                  automatic screen redraw interval
@@ -850,6 +915,9 @@ Two-point rectangle scan:
   snaps the span to a whole number of STEP_UM steps, sets the scan ranges, forces the
   S-shaped (serpentine) pattern, moves to the start corner, and shows the shape. Type
   start to begin. The start corner is the low corner for the configured scan directions.
+  If the corners leave the stage at the far end, the travel back to the start corner is
+  split into legs of at most RECT_RETURN_STEP_UM (default 1 um) so the stage never makes
+  one long jump; each leg settles before the next one is issued.
 """.strip()
 
 
