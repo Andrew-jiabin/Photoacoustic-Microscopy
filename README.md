@@ -576,6 +576,14 @@ against the effective safe voltage before acquisition.
 - `SAMPLE_ZERO_XY_AT_END` is a separate BPC zero-datum rebuild switch and is
   `False` by default. Rebuilding the datum is slow and changes the controller
   reference; do not confuse it with moving to coordinate `(0, 0)`.
+- **Unit-frame rule.** A position reading is only a valid move target in the unit
+  frame it was read in. `ss` persists on the controller across programs, so
+  `um_per_unit` must always be derived from the controller
+  (`PriorStageAdapter.apply_ss_mode`) and never hardcoded, and a reading taken
+  through one adapter must never be fed into another program's absolute move.
+  Violating this on 2026-10-06 drove the stage 13.4 mm instead of a few microns
+  and destroyed the fibre taper in the beam path; see the incident note in the
+  Safety Checklist.
 
 ## Acquisition Dashboard
 
@@ -956,6 +964,30 @@ Before a real run:
 Never use an undocumented controller command as a discovery method while a
 stage is connected to a sample. Prefer read-only checks, explicit write guards,
 small motion, and a verified return path.
+
+### Incident: unintended 13.4 mm move (2026-10-06)
+
+A helper script read the stage position through a different unit frame than the
+program it then drove, and passed that number back as an absolute `set xy`
+target. The stage travelled 13.4 mm instead of the intended few microns and
+destroyed the fibre taper. **No zero, home, or datum command was issued** -- the
+log records `zero_after_return=False` and contains no `ZERO_*`/`HOME_*`/`DATUM_*`
+event, so "it tried to zero the stage" was not what happened.
+
+Rules that came out of it:
+
+- Derive `um_per_unit` from the controller; never hardcode it, and never feed a
+  reading from one unit frame into another program's absolute move.
+- A launcher does not need `set xy` at all. The pre-alignment panel already takes
+  the live stage position as its start, so the two-point flow needs only
+  `p1`/`p2`.
+- Guard absolute moves with a distance limit, and split long returns into short
+  legs so a bad target can never become one long jump.
+
+The stage was put back with `D:\LJB\_stage\_restore_prior_position.py`, which
+derives the unit from the controller, refuses to move if the unit frame disagrees
+with the recorded target, checks the target against the controller travel window,
+and walks the whole return in 10 um legs.
 
 ## License
 
