@@ -65,14 +65,15 @@ not be mixed with the NanoMax workflow.
 
 ### Verification entry points
 
-Run these first on any machine you did not build yourself. Neither one starts a
-scan or changes a laser state.
+Run these first on any machine you did not build yourself. None of them starts a
+scan or changes a laser state; the two marked **Moves stages** do move hardware.
 
 | Entry point | Purpose | Hardware touched |
 | --- | --- | --- |
 | `Tool_code/acceptance_alazar_ats9373.py` | ATSApi + DAQ wrapper acceptance | Digitizer only |
 | `Tool_code/acceptance_alazar_ats9373.py --capture` | One real laser-free acquisition | Digitizer only |
-| `Tool_code/acceptance_stages_nanomax_prior.py` | Small guarded travel on both stages | **Moves stages** |
+| `Tool_code/acceptance_trigger_frequency.py` | Measure the external trigger rate | Digitizer only |
+| `Tool_code/acceptance_nanomax_prior.py` | Small guarded travel on both stages | **Moves stages** |
 | `Tool_code/nanomax_motion_debug_panel.py` | Interactive motion-only panel | **Moves stages** |
 | `Tool_code/validate_laser_panel_no_hardware.py` | Import check for the laser panel | None |
 
@@ -144,6 +145,7 @@ make the deployment reproducible; replace them for a different installation.
 │   └── run_log.py                   # persistent startup/cleanup state log
 ├── Tool_code/                       # standalone diagnostics and tests
 │   ├── acceptance_alazar_ats9373.py    # digitizer acceptance check
+│   ├── acceptance_trigger_frequency.py # external trigger rate measurement
 │   ├── acceptance_nanomax_prior.py     # guarded stage acceptance check
 │   ├── nanomax_motion_debug_panel.py   # motion-only interactive panel
 │   ├── validate_laser_panel_no_hardware.py
@@ -296,8 +298,11 @@ python Tool_code\acceptance_alazar_ats9373.py
 # Digitizer, one real acquisition, still no laser needed
 python Tool_code\acceptance_alazar_ats9373.py --capture
 
+# Digitizer only - measures the external trigger rate
+python Tool_code\acceptance_trigger_frequency.py
+
 # Moves stages. Power them on first and read the safety note in the file.
-python Tool_code\acceptance_stages_nanomax_prior.py
+python Tool_code\acceptance_nanomax_prior.py
 ```
 
 Expected results on a healthy machine, for reference:
@@ -308,6 +313,7 @@ Expected results on a healthy machine, for reference:
 | `getChannelInfo()` | 2 channels, 12 bits per sample |
 | `configure_board(4000MSPS)` | completes in well under a second |
 | `--capture` | 2 buffers, 20 records, 81,920 bytes, non-zero noise floor |
+| `acceptance_trigger_frequency.py` | methods A and B agree to <0.05 % |
 | Prior `+10 um` | settles within ~0.2 s, error `0.000` |
 | NanoMax `+5 um` | settles within ~0.5 s, error `< 0.05 um` |
 
@@ -342,6 +348,92 @@ python Tool_code\acceptance_alazar_ats9373.py
 imported without opening CBOX or TOPTICA hardware.
 `acceptance_alazar_ats9373.py` is the digitizer acceptance check described
 above.
+
+## Trigger Frequency Measurement
+
+`Tool_code/acceptance_trigger_frequency.py` answers one question with hard
+numbers: **what rate is the external trigger actually running at?** Run it when
+a scan is slower or faster than expected, or after changing the trigger source.
+It opens the digitizer only — no stage is opened, nothing moves, and no
+acquisition parameter of the imaging programs is altered.
+
+```powershell
+python Tool_code\acceptance_trigger_frequency.py
+python Tool_code\acceptance_trigger_frequency.py --expect 1000
+```
+
+`--expect HZ` additionally prints the deviation from a nominal rate.
+
+### Why the trigger rate matters
+
+Each record needs exactly one trigger, and each scan point needs
+`records_per_point` records — 256 for `PAM_Main_Prior.py`, 512 for the NanoMax
+programs. The trigger rate therefore sets the scan speed directly:
+
+| Trigger rate | Prior, s/point | NanoMax, s/point |
+| --- | --- | --- |
+| 1000 Hz | 0.256 | 0.512 |
+| 1050 Hz | 0.244 | 0.488 |
+| 50 Hz | 5.12 | 10.24 |
+
+A source that has silently dropped from ~1 kHz to 50 Hz makes every scan twenty
+times slower with no error message anywhere. This script is how you catch that.
+
+### The two methods
+
+**Method A — digitise the trigger signal on the sample LSB.**
+The ATS9373 User Manual (p.45) states that when External Trigger Input is the
+trigger source, the LSB of each 12-bit sample is replaced by the live state of
+the trigger signal. One long record is therefore a 1-bit sampled copy of the
+trigger waveform, clocked by the board's own +/-2 ppm oscillator. Counting
+rising edges in that bit and dividing by the exact record duration gives the
+frequency without involving the Windows timer at all, plus the pulse width and
+the jitter.
+
+**Method B — count how many records the trigger produces.**
+Arm N records with the imaging programs' exact trigger settings, time each run,
+then least-squares fit `t = T0 + N / r` across several N. The fit removes the
+fixed arming overhead and the residuals show whether the trigger is regular.
+
+The two methods share no code path, so agreement between them is real evidence.
+Method B is pulse-width agnostic, so it is the tie-breaker when method A sees
+nothing — for example a trigger pulse far narrower than the chosen sample
+period.
+
+Method A prints every bit of the 16-bit word that moves. The **trigger bit** is
+the one whose edge rate is orders of magnitude below the others; the remaining
+bits are analog noise and toggle at roughly a quarter of the sample rate
+(250 kHz at 1 MS/s, 25 MHz at 100 MS/s). On this board the trigger bit is
+**bit 4** — bits 3..0 are always 0, because the 12-bit sample is left-justified
+in the 16-bit word.
+
+### Reference measurements
+
+| Date | Source | Method A | Method B | Pulse width |
+| --- | --- | --- | --- | --- |
+| 2026-09-23 | original | — | 1000.4 Hz | — |
+| 2026-10-06 | before the source swap | 50.0000 Hz | 49.9927 Hz | 5.21 us |
+| 2026-10-06 | after the source swap | 1050.0000 Hz | 1049.8238 Hz | 4.07 us |
+
+A healthy run prints, for example:
+
+```text
+  method A (sample LSB)      : 1050.0000 Hz
+  method B (record counting) : 1049.8238 Hz
+  agreement                  : 0.017 %
+```
+
+Note that the pulse width changed with the source (5.21 us -> 4.07 us), which
+confirms a physically different source rather than a divided-down version of the
+same one.
+
+### Timeout behaviour
+
+The board is configured with `setTriggerTimeOut(0)` — wait forever — exactly as
+the imaging programs do, so a host-side wall clock (25 s for method A, 60 s for
+method B) is the only thing preventing an indefinite hang when nothing is
+connected. If no trigger arrives the script reports
+`RESULT: FAIL (no external trigger detected)` and exits with code 3.
 
 ## Running the Main PAM Workflow
 
@@ -802,6 +894,18 @@ machine has no `D:\LJB` at all.
 - **A non-zero `setTriggerTimeOut()` makes the digitizer trigger on its own.**
   This is the only reason a full DMA acquisition can be tested with no laser and
   no external trigger — see `acceptance_alazar_ats9373.py --capture`.
+- **`atsapi.SAMPLE_RATE_*` constants are internal codes, not hertz.**
+  `SAMPLE_RATE_1MSPS == 20` and `SAMPLE_RATE_4000MSPS == 128`. They are the
+  correct argument for `setCaptureClock()`, but doing arithmetic on them raises
+  no error and silently produces nonsense — a one-second record computed as
+  "50000 seconds". Carry the real Hz value separately. There is no read-back
+  either: `getParameter(CHANNEL_A, 0x10000)` returns `ApiInvalidData`.
+- **The 12-bit sample is left-justified in the 16-bit word.** Bits 3..0 are
+  always 0 and the 12-bit LSB sits in bit 4, so a scan that only looks at bit 0
+  sees nothing. See the bit scan in `acceptance_trigger_frequency.py`.
+- **Never time a trigger with "records / elapsed".** The fixed arming overhead
+  dominates short runs and once produced a reading of 780 Hz for a 1 kHz source.
+  Use the multi-N fit in `acceptance_trigger_frequency.py` method B.
 - **`BPC303NativeController()` is not a read-only constructor.** It
   auto-connects, enables the piezo channels, and forces closed-loop mode. The
   channels become energised.
@@ -825,9 +929,11 @@ machine has no `D:\LJB` at all.
 
 1. `python Tool_code\validate_laser_panel_no_hardware.py`
 2. `python Tool_code\acceptance_alazar_ats9373.py`
-3. Power the stages, then `python Tool_code\acceptance_stages_nanomax_prior.py`
+3. Power the stages, then `python Tool_code\acceptance_nanomax_prior.py`
 4. `python Tool_code\acceptance_alazar_ats9373.py --capture`
-5. Only then start `PAM_Main_Nanomax.py` with a small range
+5. `python Tool_code\acceptance_trigger_frequency.py` — record the trigger rate,
+   because it sets the scan speed
+6. Only then start `PAM_Main_Nanomax.py` with a small range
    (`0.3 um` / step `0.1 um` / 16 points) and the laser variables disabled.
 
 ## Safety Checklist
