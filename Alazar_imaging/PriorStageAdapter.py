@@ -242,7 +242,8 @@ class PriorStageAdapter:
             return self.z_travel_um if self.z_enable else 0.0
         cached = self.effective_travel_um[axis]
         if cached is None:
-            cached = self._refresh_axis_limit(axis)
+            self._refresh_axis_limit(axis)
+            cached = self.effective_travel_um[axis]
         return float(cached)
 
     def get_min_travel(self, axis):
@@ -259,7 +260,8 @@ class PriorStageAdapter:
             return 0.0 if self.z_enable else 0.0
         cached = self.effective_travel_min_um[axis]
         if cached is None:
-            cached = self._refresh_axis_limit(axis)
+            self._refresh_axis_limit(axis)
+            cached = self.effective_travel_min_um[axis]
         return float(cached)
 
     def _refresh_axis_limit(self, axis):
@@ -290,7 +292,13 @@ class PriorStageAdapter:
             high = max(high, current_um)
         self.effective_travel_min_um[axis] = low
         self.effective_travel_um[axis] = high
-        return high
+        # Hand back BOTH bounds. This helper is reached from get_min_travel() *and* from
+        # get_max_travel(), which want opposite ends of the window; returning a single
+        # value could only ever be right for one of them. The pre-alignment panel happens
+        # to call get_max_travel() first, so the old single ``return high`` looked correct
+        # there while making the first get_min_travel() on a cache miss report +travel
+        # instead of -travel. refresh_limits() masks the problem by pre-filling the cache.
+        return low, high
 
     def refresh_limits(self):
         """Re-read the effective travel window. Call once at startup."""
