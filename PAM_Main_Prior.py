@@ -545,7 +545,11 @@ def main():
     POSITION_TOLERANCE_UM = env_float("PAM_PRIOR_POSITION_TOLERANCE_UM", 1.0)
     POSITION_TIMEOUT_S = env_float("PAM_PRIOR_POSITION_TIMEOUT_S", 60.0)
     POSITION_REISSUE_INTERVAL_S = env_float("PAM_PRIOR_POSITION_REISSUE_INTERVAL_S", 1.0)
-    RETURN_STEP_UM = env_float("PAM_PRIOR_RETURN_STEP_UM", 10.0)
+    # End-of-scan return to the pre-alignment start, issued as a chain of short legs. The
+    # default matches the pre-alignment panel's RECT_RETURN_STEP_UM so that no stage move
+    # anywhere in this program exceeds 2 um in one command. Raise it only if a long return
+    # is measurably too slow.
+    RETURN_STEP_UM = env_float("PAM_PRIOR_RETURN_STEP_UM", 2.0)
     RETURN_POSITION_TIMEOUT_S = env_float(
         "PAM_PRIOR_RETURN_POSITION_TIMEOUT_S",
         min(float(POSITION_TIMEOUT_S), 60.0),
