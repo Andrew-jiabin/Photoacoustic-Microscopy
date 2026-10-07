@@ -41,6 +41,10 @@ class SamplePrealignConfig:
     # Marking the corners can leave the stage at the far one, so the return is issued as a
     # chain of short closed-loop moves rather than one jump.
     rect_return_step_um: float = 1.0
+    # Hard ceiling for a single closed-loop move issued by the panel. The travel
+    # window is not enough on its own: a target computed in the wrong unit frame can
+    # sit inside the window while still being a millimetre-scale command. 0 disables.
+    max_abs_move_um: float = 100.0
 
 
 @dataclass
@@ -176,6 +180,11 @@ class SamplePrealignPanel:
             config.rect_return_step_um,
             config.min_step_um,
         )
+        env_move_limit = os.environ.get("PAM_PANEL_MAX_ABS_MOVE_UM", "").strip()
+        self.max_abs_move_um = validate_nonnegative(
+            "max_abs_move_um",
+            env_move_limit if env_move_limit else config.max_abs_move_um,
+        )
 
     def refresh(self):
         self.last_xyz = [float(value) for value in self.stage.get_position_values()]
@@ -209,13 +218,40 @@ class SamplePrealignPanel:
         clamped = max(low, min(high, float(value)))
         return clamped, abs(clamped - float(value)) > 1e-9
 
-    def set_xyz(self, x=None, y=None, z=None, reason="manual"):
+    def set_xyz(self, x=None, y=None, z=None, reason="manual", allow_long=False):
         current = dict(zip(("x", "y", "z"), self.last_xyz))
         requested = {
             "x": current["x"] if x is None else float(x),
             "y": current["y"] if y is None else float(y),
             "z": current["z"] if z is None else float(z),
         }
+        # Refuse one implausibly large command. The travel window alone cannot catch
+        # this: a target produced by a wrong unit frame (the 2026-10-06 incident turned
+        # -273.58 into -13678.99, a 50x scale error) can sit inside the window while
+        # being a millimetre-scale move. Callers that have already split the travel
+        # themselves pass allow_long=True.
+        single_move = math.sqrt(
+            sum((requested[axis] - current[axis]) ** 2 for axis in ("x", "y", "z"))
+        )
+        if (
+            not allow_long
+            and self.max_abs_move_um > 0
+            and single_move > self.max_abs_move_um + 1e-9
+        ):
+            self.message = (
+                f"Refused one {single_move:.4f} um move (limit {self.max_abs_move_um:g} um). "
+                "Check the unit frame, or raise PAM_PANEL_MAX_ABS_MOVE_UM deliberately."
+            )
+            self.log(
+                "PREALIGN_MOVE_REFUSED",
+                reason=reason,
+                distance_um=f"{single_move:.6f}",
+                limit_um=f"{self.max_abs_move_um:g}",
+                target_x_um=f"{requested['x']:.6f}",
+                target_y_um=f"{requested['y']:.6f}",
+                target_z_um=f"{requested['z']:.6f}",
+            )
+            return False
         target = {}
         clamped_axes = []
         for axis, value in requested.items():
@@ -296,7 +332,9 @@ class SamplePrealignPanel:
         if segment <= 0:
             raise ValueError(f"Return segment must be positive, got {segment:g} um.")
         if distance <= segment + 1e-9:
-            return bool(self.set_xyz(x=target_x, y=target_y, reason=reason)), 1, distance
+            return bool(
+                self.set_xyz(x=target_x, y=target_y, reason=reason, allow_long=True)
+            ), 1, distance
         legs = int(math.ceil(distance / segment - 1e-9))
         moved = False
         for index in range(1, legs + 1):
@@ -306,7 +344,10 @@ class SamplePrealignPanel:
                 fraction = float(index) / float(legs)
                 leg_x = float(start_x) + delta_x * fraction
                 leg_y = float(start_y) + delta_y * fraction
-            moved = bool(self.set_xyz(x=leg_x, y=leg_y, reason=f"{reason}_leg{index}of{legs}")) or moved
+            moved = (
+                bool(self.set_xyz(x=leg_x, y=leg_y, reason=f"{reason}_leg{index}of{legs}", allow_long=True))
+                or moved
+            )
         return moved, legs, distance
 
     # ------------------------------------------------------------------ two-point rect
@@ -562,6 +603,7 @@ class SamplePrealignPanel:
             ("ystep", f"{self.y_step_um:g}", "set ystep n"),
             ("zstep", f"{self.z_step_um:g}", "set zstep n"),
             ("RECT_RETURN_STEP_UM", f"{self.rect_return_step_um:g}", "set return_step n"),
+            ("MAX_ABS_MOVE_UM", f"{self.max_abs_move_um:g}", "set max_move n"),
             ("interval", f"{self.sample_interval_s:g}", "set interval n"),
             ("refresh", f"{self.auto_refresh_s:g}", "set refresh n"),
             ("SETTLE_MS", f"{self.config.settle_ms:g}", "set SETTLE_MS n"),
@@ -789,6 +831,11 @@ class SamplePrealignPanel:
                 self.config.min_step_um,
             )
             self.message = f"rect_return_step_um set to {self.rect_return_step_um:g} um."
+        elif target in ("max_move", "max_abs_move", "max_abs_move_um") and len(tokens) == 2:
+            self.max_abs_move_um = validate_nonnegative("max_abs_move_um", tokens[1])
+            self.message = f"max_abs_move_um set to {self.max_abs_move_um:g} um." + (
+                " (check disabled)" if self.max_abs_move_um <= 0 else ""
+            )
         elif target in ("interval", "dt") and len(tokens) == 2:
             self.sample_interval_s = validate_positive("interval", tokens[1])
             self.message = f"interval set to {self.sample_interval_s:g} s."
@@ -878,7 +925,8 @@ Hotkeys:
   + / -           Z += zstep / Z -= zstep  (closed-loop position in um, not voltage)
   s               refresh status
   h / ?           redraw help
-  0 / r           move X/Y to 0 um, keep Z; this is NOT PBC_SetZero
+  0 / r           move X/Y to 0 um, keep Z; this is NOT PBC_SetZero. Refused when
+                  the stage is further than MAX_ABS_MOVE_UM from 0
   :               command mode
 
 Commands after ':' then Enter:
@@ -894,7 +942,9 @@ Commands after ':' then Enter:
   set STEP_UM <um>                   set image pixel step for this run
   set xstep/ystep/zstep <um>         set manual closed-loop move steps
   set return_step <um>               longest leg used to travel back to the scan start corner
-  set x/y/z/xy/xyz ...               set absolute closed-loop position(s) in um
+  set max_move <um>                  refuse any one move larger than this; 0 disables the check
+  set x/y/z/xy/xyz ...               set absolute closed-loop position(s) in um; one
+                                     command may not exceed MAX_ABS_MOVE_UM
   set interval <sec>                 hotkey polling interval
   set refresh <sec>                  automatic screen redraw interval
   set SETTLE_MS <ms>

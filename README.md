@@ -605,6 +605,15 @@ each settled before the next leg is issued. `RECT_RETURN_STEP_UM` is the panel's
 own setting; it is **not** the program's `RETURN_STEP_UM`, which is the line step
 used when the program returns the stage after the scan.
 
+Every *single* pre-alignment move is capped as well. The panel refuses one
+command larger than `MAX_ABS_MOVE_UM` (default `100 um`; change it with
+`set max_move <um>` or `PAM_PANEL_MAX_ABS_MOVE_UM`, `0` disables the check) and
+logs `PREALIGN_MOVE_REFUSED` instead of moving. The travel window alone cannot
+catch this: a target computed in the wrong unit frame can sit inside the window
+while still being a millimetre-scale command, which is exactly what happened on
+2026-10-06. The segmented return legs are exempt, because the travel has already
+been split before they are issued.
+
 Open-loop probe panel movement is voltage-based:
 
 - Up/Down changes probe Z voltage.
@@ -858,6 +867,7 @@ useful runtime overrides are:
 | `PAM_PRIOR_RETURN_STEP_UM` | Segmented return step, Prior end-of-scan return (default 2 um) |
 | `PAM_SAMPLE_PREALIGN_ENABLE` | Enable the closed-loop pre-alignment panel |
 | `PAM_PRIOR_PREALIGN_ENABLE` | Enable the pre-alignment panel in `PAM_Main_Prior.py` |
+| `PAM_PANEL_MAX_ABS_MOVE_UM` | Refuse any one pre-alignment move larger than this (default 100 um; 0 disables) |
 | `PAM_ACQ_TIMEOUT_MS` | Host-side wait for one point's records; must exceed the point duration at the measured trigger rate |
 | `PAM_PRIOR_SS_MODE` | Prior unit frame: `high` (default, 0.01 um/unit), `micron`, `legacy`, `value`, `none` |
 | `PAM_PRIOR_UM_PER_UNIT` | Set the Prior unit frame explicitly, skipping the controller read |
