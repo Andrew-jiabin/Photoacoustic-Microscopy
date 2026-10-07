@@ -437,6 +437,14 @@ and the save-time `DATA_SAVE_SKIPPED reason=no_packageable_data` can never
 disagree: `no_data` appears exactly when no point was packageable, and a partial
 loss still saves the good points and reports `DATA_SAVED` with `skipped_points`.
 
+**A run whose save failed is not a clean normal end either.** `RUN_END_NORMAL` is
+written before the final save, so a run whose save reported failure used to read
+as a plain success with `zero_datum_ready` True and no `.mat` on disk. The run log
+now reports status `save_failed` instead (`zero_reason=save_failed_requires_rebuild`,
+so `auto` rebuilds the datum), derived from the `DATA_SAVE_ONCE_RETRY_NEEDED` line
+the program writes when the save returns `status: failed`. The terminal event and
+the four-event contract are unchanged.
+
 ### The two methods
 
 **Method A — digitise the trigger signal on the sample LSB.**
@@ -885,6 +893,7 @@ useful runtime overrides are:
 | `PAM_SAMPLE_POSITION_REISSUE_INTERVAL_S` | Target resend interval |
 | `PAM_SAMPLE_RETURN_STEP_UM`, `PAM_PROBE_RETURN_STEP_UM` | Segmented return step, NanoMax (default 0.1 um) |
 | `PAM_PRIOR_RETURN_STEP_UM` | Segmented return step, Prior end-of-scan return (default 2 um) |
+| `PAM_PRIOR_POSITION_TOLERANCE_UM` | Prior per-point settle tolerance (default `PAM_STEP_UM`/5, capped at 1 um, raised to at least one SDK unit) |
 | `PAM_SAMPLE_PREALIGN_ENABLE` | Enable the closed-loop pre-alignment panel |
 | `PAM_PRIOR_PREALIGN_ENABLE` | Enable the pre-alignment panel in `PAM_Main_Prior.py` |
 | `PAM_PANEL_MAX_ABS_MOVE_UM` | Refuse any one pre-alignment move larger than this (default 100 um; 0 disables) |
@@ -1121,6 +1130,11 @@ Rules that came out of it:
   `p1`/`p2`.
 - Guard absolute moves with a distance limit, and split long returns into short
   legs so a bad target can never become one long jump.
+- A clamp must never turn a one-step jog into a long move. The pause-Z helper now
+  refuses any clamp that would exceed the requested step instead of silently
+  driving to the window edge (`ACQUISITION_PAUSE_Z_MOVE_REFUSED`,
+  `reason=clamp_exceeds_step`), and it reads the stage's own lower bound when the
+  stage provides one.
 
 The stage was put back with `D:\LJB\_stage\_restore_prior_position.py`, which
 derives the unit from the controller, refuses to move if the unit frame disagrees

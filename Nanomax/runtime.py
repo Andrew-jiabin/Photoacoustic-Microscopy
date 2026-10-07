@@ -290,12 +290,23 @@ def _return_probe_xyz_segmented(probe_stage, target_x, target_y, target_z, settl
     current = [float(value) for value in probe_stage.get_voltage_xyz()]
     target = [float(target_x), float(target_y), float(target_z)]
     if um_per_v is None or float(um_per_v) <= 0:
+        # Without a microns-per-volt calibration the physical length of a voltage leg is
+        # unknown, so a single jump to the target could move the probe arbitrarily far.
+        # That breaks the rule that no single move exceeds the configured step, so refuse
+        # the move and leave the probe where it is rather than jump to the target.
         append_run_log(
             "RETURN_TO_START_SEGMENTED_SKIPPED",
             scan_target="probe_open_loop",
             reason="missing_um_per_v_calibration",
+            action="refused_probe_left_at_current_voltage",
+            target_x_v="%.6f" % target[0],
+            target_y_v="%.6f" % target[1],
+            target_z_v="%.6f" % target[2],
         )
-        probe_stage.set_voltage_xyz(x=target[0], y=target[1], z=target[2], wait=True, settle_time_ms=settle_ms)
+        print(
+            "Probe return refused: no microns-per-volt calibration, so a segmented "
+            "return cannot be bounded. The probe was left at its current voltage."
+        )
         return
 
     step_v = float(step_um) / float(um_per_v)

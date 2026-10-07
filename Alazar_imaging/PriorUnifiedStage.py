@@ -144,10 +144,22 @@ class PriorUnifiedStage:
         ret, resp = self.cmd("controller.stage.busy")
         return resp == "1"
 
-    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_step=0.05):
+    def wait_until_settled(self, target_x, target_y, settle_time_ms, tolerance_step=0.05, timeout_s=30.0):
+        """Poll until XY is within tolerance, always returning within timeout_s.
+
+        The imaging programs do not use this method; they go through
+        PriorStageAdapter.wait_until_settled, which enforces its own deadline. This
+        one used to loop forever without a deadline or a sleep whenever the stage
+        stayed outside the tolerance, which would pin the caller at 100% CPU. The
+        deadline makes that impossible.
+        """
+        deadline = time.monotonic() + max(0.001, float(timeout_s))
         flag = False
         time_count= False
         while not flag:
+            if time.monotonic() >= deadline:
+                print("settle timeout reached after %g s" % float(timeout_s))
+                break
             if time_count==True:
                 flag = True
             pos_str = self.get_position() # 获取 SDK 坐标
@@ -165,8 +177,9 @@ class PriorUnifiedStage:
                     continue
             elif (abs(curr_x - target_x) > tolerance_step and abs(curr_y - target_y) > tolerance_step) and time_count:
                     print("settle time too short!")
+            time.sleep(0.01)
 
-        return False
+        return flag
 
 
     def upgrade_to_high_precision(self):

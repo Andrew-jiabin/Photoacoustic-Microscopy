@@ -542,7 +542,16 @@ def main():
     #   "serpentine" or "s": S-shaped scan; odd rows reverse X direction.
     #   "raster" or "z": Z-shaped one-way rows; each row starts from low X.
     SCAN_PATTERN, SETTLE_MS = "serpentine", 120
-    POSITION_TOLERANCE_UM = env_float("PAM_PRIOR_POSITION_TOLERANCE_UM", 1.0)
+    # The settle tolerance has to stay a fraction of the pixel step. At one full step a
+    # point can be accepted a whole pixel away from its target, which degrades the image.
+    # Derive the default from the step using the ratio the NanoMax programs use
+    # (tolerance = step / 5), capped at the old 1.0 um so a coarse scan behaves exactly as
+    # it did before. It is raised to at least one SDK unit further down, because targets
+    # are rounded to whole units.
+    POSITION_TOLERANCE_UM = env_float(
+        "PAM_PRIOR_POSITION_TOLERANCE_UM",
+        min(1.0, max(0.02, float(STEP_UM) / 5.0)),
+    )
     POSITION_TIMEOUT_S = env_float("PAM_PRIOR_POSITION_TIMEOUT_S", 60.0)
     POSITION_REISSUE_INTERVAL_S = env_float("PAM_PRIOR_POSITION_REISSUE_INTERVAL_S", 1.0)
     # End-of-scan return to the pre-alignment start, issued as a chain of short legs. The
@@ -627,6 +636,21 @@ def main():
     # move as a timeout.
     MIN_STEP_UM = stage.resolution_step_um()
     POSITION_TOLERANCE_UM = max(float(POSITION_TOLERANCE_UM), MIN_STEP_UM)
+    if POSITION_TOLERANCE_UM >= float(STEP_UM):
+        # A tolerance of one pixel step or more means a point can be accepted a whole
+        # pixel away from where it was commanded. Warn loudly instead of refusing, so an
+        # explicit override still runs.
+        append_run_log(
+            "POSITION_TOLERANCE_COARSE",
+            position_tolerance_um=f"{POSITION_TOLERANCE_UM:g}",
+            step_um=f"{float(STEP_UM):g}",
+            note="tolerance is not finer than one pixel step",
+        )
+        print(
+            f"Warning: PAM_PRIOR_POSITION_TOLERANCE_UM={POSITION_TOLERANCE_UM:g} um is "
+            f"not finer than STEP_UM={float(STEP_UM):g} um; a point may be accepted "
+            "one pixel away from its target."
+        )
     PREALIGN_X_STEP_UM = max(PREALIGN_X_STEP_UM, MIN_STEP_UM)
     PREALIGN_Y_STEP_UM = max(PREALIGN_Y_STEP_UM, MIN_STEP_UM)
     PREALIGN_Z_STEP_UM = max(PREALIGN_Z_STEP_UM, MIN_STEP_UM)

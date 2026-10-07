@@ -66,6 +66,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_line": "",
             "final_line": "",
             "no_data_line": "",
+            "save_failed_line": "",
         }
 
     current_run = None
@@ -91,6 +92,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         "final_error_line": "",
                         "acquisition_started_line": "",
                         "no_data_line": "",
+                        "save_failed_line": "",
                     }
                 elif current_run is not None:
                     current_run["last_line"] = raw_line.strip()
@@ -116,6 +118,8 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         current_run["acquisition_started_line"] = raw_line.strip()
                     elif event == "DATA_SAVE_SKIPPED" and fields.get("reason") == "no_packageable_data":
                         current_run["no_data_line"] = raw_line.strip()
+                    elif event == "DATA_SAVE_ONCE_RETRY_NEEDED":
+                        current_run["save_failed_line"] = raw_line.strip()
     except Exception as exc:
         return {
             "status": "log_read_error",
@@ -129,6 +133,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_line": "",
             "final_line": "",
             "no_data_line": "",
+            "save_failed_line": "",
         }
 
     if current_run is None:
@@ -144,6 +149,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_line": "",
             "final_line": "",
             "no_data_line": "",
+            "save_failed_line": "",
         }
 
     event = current_run["terminal_event"] or current_run["last_event"]
@@ -160,6 +166,11 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         # SAMPLE_START_ZERO_POLICY=auto would skip rebuilding the prealignment datum. Give it
         # its own status so need_start_zero is set and the loss is visible in the log.
         status = "no_data"
+    if status == "normal" and current_run["save_failed_line"]:
+        # RUN_END_NORMAL is written before the final save, so a run whose save reported
+        # failure would otherwise still read as a clean normal end -- with zero_datum_ready
+        # True and no .mat on disk. Give it its own status so need_start_zero is set.
+        status = "save_failed"
     zero_datum_ready = bool(
         current_run["zero_line"]
         or current_run["trusted_zero_line"]
@@ -223,6 +234,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "zero_line": trusted_return_line,
         "final_line": current_run["final_line"],
         "no_data_line": current_run["no_data_line"],
+        "save_failed_line": current_run["save_failed_line"],
     }
 
 

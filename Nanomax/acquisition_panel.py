@@ -71,6 +71,7 @@ class PauseZMotionController:
         self.log = log_callback or (lambda *args, **kwargs: None)
         self.current_z_um = None
         self.max_z_um = None
+        self.min_z_um = None
         self.last_error = ""
         try:
             self.refresh()
@@ -91,6 +92,17 @@ class PauseZMotionController:
                 self.max_z_um = float(self.stage.get_max_travel("z"))
             except Exception:
                 self.max_z_um = None
+            # Only ask for a lower bound when the stage actually provides one. The Prior
+            # adapter answers 0.0 for Z, and the BPC303 controllers have no such method at
+            # all, so this stays a no-op for every stage in use today.
+            min_getter = getattr(self.stage, "get_min_travel", None)
+            if callable(min_getter):
+                try:
+                    self.min_z_um = float(min_getter("z"))
+                except Exception:
+                    self.min_z_um = None
+            else:
+                self.min_z_um = None
             self.last_error = ""
         except Exception as exc:
             self.last_error = str(exc)
@@ -100,7 +112,7 @@ class PauseZMotionController:
 
     def clamp_z(self, value):
         value = float(value)
-        low = 0.0
+        low = self.min_z_um if self.min_z_um is not None else 0.0
         high = self.max_z_um
         if high is None:
             return max(low, value), False
@@ -117,7 +129,27 @@ class PauseZMotionController:
         current = self.refresh()
         if current is None:
             return "Pause Z move unavailable: could not read current Z."
-        target, clamped = self.clamp_z(float(current) + float(direction) * float(self.step_um))
+        step = float(self.step_um)
+        target, clamped = self.clamp_z(float(current) + float(direction) * step)
+        if abs(target - float(current)) > step + 1e-9:
+            # A clamp must never turn a one-step jog into a large absolute move. That can
+            # only happen when the Z window does not contain the current position -- for
+            # example a hardcoded 0 lower bound on a stage whose absolute frame is
+            # negative -- and acting on it would drive the stage a long way. Refuse.
+            self.log(
+                "ACQUISITION_PAUSE_Z_MOVE_REFUSED",
+                reason="clamp_exceeds_step",
+                current_z_um="%.6f" % float(current),
+                target_z_um="%.6f" % target,
+                step_um="%.6f" % step,
+                min_z_um=str(self.min_z_um),
+                max_z_um=str(self.max_z_um),
+            )
+            return (
+                "Pause Z move refused: the Z window [%s, %s] does not contain the "
+                "current Z=%.4f um, so clamping would move %.4f um in one command."
+                % (self.min_z_um, self.max_z_um, float(current), abs(target - float(current)))
+            )
         if abs(target - float(current)) <= 1e-9:
             suffix = " at boundary" if clamped else ""
             return f"No Z move needed: Z={current:.4f} um{suffix}."
