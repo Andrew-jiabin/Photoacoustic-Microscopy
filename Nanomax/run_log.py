@@ -65,6 +65,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_reason": "log_missing",
             "zero_line": "",
             "final_line": "",
+            "no_data_line": "",
         }
 
     current_run = None
@@ -89,6 +90,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         "return_failed_line": "",
                         "final_error_line": "",
                         "acquisition_started_line": "",
+                        "no_data_line": "",
                     }
                 elif current_run is not None:
                     current_run["last_line"] = raw_line.strip()
@@ -112,6 +114,8 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
                         current_run["final_error_line"] = raw_line.strip()
                     elif event == "ACQUISITION_START":
                         current_run["acquisition_started_line"] = raw_line.strip()
+                    elif event == "DATA_SAVE_SKIPPED" and fields.get("reason") == "no_packageable_data":
+                        current_run["no_data_line"] = raw_line.strip()
     except Exception as exc:
         return {
             "status": "log_read_error",
@@ -124,6 +128,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_reason": "log_read_error",
             "zero_line": "",
             "final_line": "",
+            "no_data_line": "",
         }
 
     if current_run is None:
@@ -138,6 +143,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
             "zero_reason": "no_run_start",
             "zero_line": "",
             "final_line": "",
+            "no_data_line": "",
         }
 
     event = current_run["terminal_event"] or current_run["last_event"]
@@ -147,6 +153,13 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "RUN_END_ERROR": "error",
         "RUN_END_PREACQUISITION_QUIT": "preacquisition_quit",
     }.get(event, "unfinished_or_abnormal")
+    if status == "normal" and current_run["no_data_line"]:
+        # The run reached RUN_END_NORMAL but the save path packaged no usable point, which
+        # means the DAQ captured nothing (or nothing survived packaging). Reporting that as
+        # a plain success would also leave zero_datum_ready True, so the next run with
+        # SAMPLE_START_ZERO_POLICY=auto would skip rebuilding the prealignment datum. Give it
+        # its own status so need_start_zero is set and the loss is visible in the log.
+        status = "no_data"
     zero_datum_ready = bool(
         current_run["zero_line"]
         or current_run["trusted_zero_line"]
@@ -209,6 +222,7 @@ def inspect_previous_run(log_path=RUN_LOG_PATH):
         "zero_reason": zero_reason,
         "zero_line": trusted_return_line,
         "final_line": current_run["final_line"],
+        "no_data_line": current_run["no_data_line"],
     }
 
 

@@ -166,6 +166,26 @@ def package_point_data_for_save(raw_data_content, average_enable, records_per_po
     return raw_array.astype(np.uint16), "raw_from_array"
 
 
+def point_payload_is_empty(payload):
+    """True when one DAQ point carries no usable samples.
+
+    AlazarNPTSystem.get_one_acquisition swallows a per-point buffer timeout, so it can hand
+    back a point whose buffer list is empty. package_point_data_for_save treats that as no
+    data and drops the point at save time, which used to be the only place the loss showed
+    up -- after the run had already been counted as complete. The acquisition loops call
+    this while the point index is still known, so a dropped point can be logged and counted
+    instead of only showing up as a smaller .mat.
+    """
+    if payload is None:
+        return True
+    if isinstance(payload, (list, tuple)):
+        return len(payload) == 0
+    try:
+        return np.asarray(payload).size == 0
+    except Exception:
+        return True
+
+
 def _prepare_532_noise_reference(noise_532_reference, average_enable, records_per_point, samples_per_record):
     if noise_532_reference is None:
         return None, "not_collected"

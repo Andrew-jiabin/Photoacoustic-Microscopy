@@ -419,6 +419,24 @@ default 1000 ms lost all 25 points of a 4x4 um scan; the same scan at 50 Hz with
 8000 ms saved 25/25 in 133.8 s; at 1050 Hz the default 1000 ms saved 25/25 in
 12.25 s.
 
+**A run that lost its points is no longer reported as a plain success.** Every
+point is checked as it arrives: when the digitizer hands back no buffer the
+program counts it and writes one `ACQUISITION_POINT_EMPTY` line per point
+(`reason=daq_returned_no_buffer`, plus `consecutive` and the running
+`daq_empty_points`). `ACQUISITION_DONE`, `RUN_END_NORMAL`, `RUN_END_ERROR`, and
+`RUN_END_INTERRUPTED` all carry `daq_empty_points`, so the count reaches the run
+log. When every point was empty the terminal event is still `RUN_END_NORMAL` --
+the four-event terminal contract is unchanged -- but the run log reports status
+`no_data` instead of `normal`, and the sample X/Y zero datum is no longer
+trusted. A following run with `PAM_SAMPLE_START_ZERO_POLICY=auto` therefore
+rebuilds the datum (`zero_reason=no_data_requires_rebuild`) rather than assuming
+the previous run left a good one behind.
+
+The check reuses the exact predicate the save path uses, so the run-time count
+and the save-time `DATA_SAVE_SKIPPED reason=no_packageable_data` can never
+disagree: `no_data` appears exactly when no point was packageable, and a partial
+loss still saves the good points and reports `DATA_SAVED` with `skipped_points`.
+
 ### The two methods
 
 **Method A — digitise the trigger signal on the sample LSB.**
@@ -658,6 +676,8 @@ against the effective safe voltage before acquisition.
 
 - `PAM_SAMPLE_START_ZERO_POLICY=auto` rebuilds the sample X/Y zero datum only
   when the previous run log does not contain a trusted cleanup/return marker.
+  A run that produced no usable DAQ data (status `no_data`) counts as
+  untrusted, so `auto` rebuilds it (`zero_reason=no_data_requires_rebuild`).
   Valid values are `auto`, `always`, and `never`.
 - The current script default is `PAM_SAMPLE_RETURN_XY_TO_ZERO_AT_END=1`, so a
   completed sample run returns X/Y to the low-end `(0, 0)`. Set it to `0` to

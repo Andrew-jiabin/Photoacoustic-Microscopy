@@ -133,7 +133,7 @@ from Alazar_imaging.PriorUnifiedStage import PriorUnifiedStage
 from Nanomax import run_log as _run_log
 from Nanomax.acquisition_panel import AcquisitionDashboard, PauseZMotionController
 from Nanomax.daq_async import BackgroundDaqInit
-from Nanomax.data_io import save_scan_data, save_scan_snapshot_data
+from Nanomax.data_io import point_payload_is_empty, save_scan_data, save_scan_snapshot_data
 from Nanomax.no_laser_manager import NoLaserManager
 from Nanomax.prealign_panel import SamplePrealignConfig, run_sample_prealignment
 from Nanomax.result_preview import PAMResultPreviewController
@@ -789,6 +789,7 @@ def main():
     all_data, START_X, START_Y, START_Z = [], None, None, None
     coordinate_unit, total_points, acquired_points, user_stop_requested = "um", 0, 0, False
     position_timeout_points = 0
+    daq_empty_points, daq_empty_streak = 0, 0
     acquisition_loop_start_s = None
     data_save_done = False
     last_saved_mat_path = None
@@ -1277,6 +1278,21 @@ def main():
                 Average_Enable=AVERAGE_ENABLE,
             )
             attach_point_metadata(data_len_before, point_metadata)
+            if len(all_data) > data_len_before and point_payload_is_empty(all_data[-1][0]):
+                daq_empty_points += 1
+                daq_empty_streak += 1
+                append_run_log(
+                    "ACQUISITION_POINT_EMPTY",
+                    index=point_index,
+                    total=len(trajectory),
+                    x_um=f"{tx:.4f}",
+                    y_um=f"{ty:.4f}",
+                    consecutive=daq_empty_streak,
+                    daq_empty_points=daq_empty_points,
+                    reason="daq_returned_no_buffer",
+                )
+            else:
+                daq_empty_streak = 0
             acquired_points += 1
             if point_index == 1 or point_index == len(trajectory) or point_index % POINT_LOG_INTERVAL == 0:
                 append_run_log(
@@ -1321,6 +1337,7 @@ def main():
             expected_points=total_points,
             end_reason=end_reason,
             position_timeout_points=position_timeout_points,
+            daq_empty_points=daq_empty_points,
             acquisition_duration_s=f"{acquisition_duration_s:.3f}",
         )
 
@@ -1346,10 +1363,11 @@ def main():
             acquired_points=acquired_points,
             expected_points=total_points,
             end_reason=end_reason,
+            daq_empty_points=daq_empty_points,
         )
 
     except KeyboardInterrupt:
-        append_run_log("RUN_END_INTERRUPTED", acquired_points=acquired_points, expected_points=total_points)
+        append_run_log("RUN_END_INTERRUPTED", acquired_points=acquired_points, expected_points=total_points, daq_empty_points=daq_empty_points)
         print("\nUser interrupted the scan.")
         stop_daq_best_effort("keyboard_interrupt")
         save_data_once("keyboard_interrupt")
@@ -1376,6 +1394,7 @@ def main():
             error=repr(exc),
             acquired_points=acquired_points,
             expected_points=total_points,
+            daq_empty_points=daq_empty_points,
             traceback=traceback.format_exc(limit=6),
         )
         print(f"\nExperiment error: {exc}")
