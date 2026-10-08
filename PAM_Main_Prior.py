@@ -570,8 +570,10 @@ def main():
     RESULT_PREVIEW_TIMEOUT_S = env_float("PAM_RESULT_PREVIEW_TIMEOUT_S", 900.0)
     PROCESSING_SKILL_PATH = env_str("PAM_PROCESSING_SKILL_PATH", r"D:\Phd_training\skills\data-processing-skill")
 
-    # DAQ parameters, unchanged from PAM_Main_SDK.py.
-    DELAY, SAMPLES_REC, SAMPLE_RATE = 1600, 4096, ats.SAMPLE_RATE_4000MSPS
+    # DAQ parameters. DELAY is 0 since 2026-10-08; it was 1600 (400 ns at 4 GS/s)
+    # and the record window now starts exactly at the trigger edge. Everything else
+    # is unchanged from PAM_Main_SDK.py.
+    DELAY, SAMPLES_REC, SAMPLE_RATE = 0, 4096, ats.SAMPLE_RATE_4000MSPS
     AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 256, 4
     # Host-side wait for one acquisition. Aligned with the build that actually ran on the
     # Prior rig: PAM_Main_SDK.py used timeout_ms=1000 on its Prior/closed-loop branch

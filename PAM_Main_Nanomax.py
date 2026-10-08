@@ -263,8 +263,9 @@ def main():
     PROCESSING_SKILL_PATH = env_str("PAM_PROCESSING_SKILL_PATH", r"D:\Phd_training\skills\data-processing-skill")
     COLLECT_532_NOISE_PROMPT_ENABLE = env_bool("PAM_532_NOISE_PROMPT_ENABLE", True)
 
-    # DAQ parameters.
-    DELAY, SAMPLES_REC, SAMPLE_RATE = int(251*4), 4096, ats.SAMPLE_RATE_4000MSPS
+    # DAQ parameters. DELAY is 0 since 2026-10-08; it was int(251*4) = 1004
+    # (251 ns at 4 GS/s) and the record window now starts exactly at the trigger edge.
+    DELAY, SAMPLES_REC, SAMPLE_RATE = 0, 4096, ats.SAMPLE_RATE_4000MSPS
     AVERAGE_ENABLE, RECORDS_PER_POINT, BUFFER_COUNT = True, 512, 4
     ACQ_TIMEOUT_MS = env_int("PAM_ACQ_TIMEOUT_MS", 1000)
     POINT_LOG_INTERVAL, USER_STOP_ENABLE, USER_STOP_KEY = 25, True, "q"
