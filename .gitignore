@@ -36,3 +36,7 @@ PriorSDK*/
 *.exp
 *.lib
 *.so
+  
+# afm_pi build artifacts -- rebuild with Tool_code/build_afm_pi.py  
+Nanomax/afm_pi.pdb  
+Nanomax/afm_pi.lib  

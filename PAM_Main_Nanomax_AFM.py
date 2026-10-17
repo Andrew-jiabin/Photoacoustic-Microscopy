@@ -5,11 +5,16 @@ What this program does that the raster programs do not
 ------------------------------------------------------
 The raster entry points keep Z fixed and trust that the sample stays in the
 focal plane.  This one treats Z as the measurement: at every XY point the sample
-is driven towards a fixed probe until the 10 MHz ultrasound amplitude picked up
-by that probe reaches a setpoint, the A-line is taken there, and the sample is
-backed off before moving on.  That is contact-mode AFM with an acoustic
-setpoint, and it gives two extra channels per pixel for free -- the Z at which
-the surface was found, and the amplitude at that Z.
+is driven until the feedback signal reaches a setpoint, the A-line is taken
+there, and the sample is backed off before moving on.  That is contact-mode AFM
+with an acoustic setpoint, and it gives two extra channels per pixel for free --
+the Z at which the surface was found, and the value at that Z.
+
+The Z loop is a digital PI in velocity form, compiled in C++ (``afm_pi.cpp``,
+loaded through ctypes, with a bit-exact Python reference as a fallback).  It
+tracks a setpoint rather than creeping until a threshold is crossed, so it does
+not care whether the signal rises or falls with Z, and it corrects in either
+direction.  ``PAM_AFM_CONTROL_MODE=stepped`` restores the old one-way creep.
 
 Why a separate entry point
 --------------------------
@@ -68,7 +73,7 @@ from Alazar_imaging.AlazarBurstCapture import (
 )
 from Alazar_imaging.AlazarFFTSpectrum import AlazarFFTSpectrum
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
-from Nanomax.afm_scan import AfmApproachConfig, AfmScanner
+from Nanomax.afm_scan import AfmApproachConfig, AfmScanner, suggest_gains
 from Nanomax.data_io import save_scan_data
 from Nanomax.run_log import append_run_log, set_current_run_id
 from Nanomax.scan_utils import (
@@ -158,11 +163,14 @@ class RunConfig:
             "PAM_AFM_SETPOINT_UNIT", "V" if self.feedback == "demod" else "au"
         )
 
-        # Approach.
+        # Control engine.  "pi" tracks a setpoint and can correct in either
+        # direction; "stepped" is the original one-way creep, kept as a fallback.
+        self.control_mode = env_str("PAM_AFM_CONTROL_MODE", "pi").lower()
+        if self.control_mode not in ("pi", "stepped"):
+            raise ValueError("PAM_AFM_CONTROL_MODE must be 'pi' or 'stepped'")
+
+        # Approach geometry (shared).
         self.approach_sign = env_float("PAM_AFM_APPROACH_SIGN", 1.0)
-        self.coarse_step_um = env_float("PAM_AFM_COARSE_STEP_UM", 0.100)
-        self.fine_step_um = env_float("PAM_AFM_FINE_STEP_UM", 0.020)
-        self.coarse_to_fine_ratio = env_float("PAM_AFM_COARSE_TO_FINE", 0.30)
         self.max_approach_um = env_float("PAM_AFM_MAX_APPROACH_UM", 4.0)
         self.retract_um = env_float("PAM_AFM_RETRACT_UM", 0.50)
         self.max_retract_um = env_float("PAM_AFM_MAX_RETRACT_UM", 2.0)
@@ -173,6 +181,39 @@ class RunConfig:
         self.position_tolerance_um = env_float("PAM_AFM_POSITION_TOLERANCE_UM", 0.02)
         self.settle_time_ms = env_int("PAM_AFM_SETTLE_MS", 0)
         self.settle_timeout_s = env_float("PAM_AFM_SETTLE_TIMEOUT_S", 10.0)
+
+        # Stepped engine only.
+        self.coarse_step_um = env_float("PAM_AFM_COARSE_STEP_UM", 0.100)
+        self.fine_step_um = env_float("PAM_AFM_FINE_STEP_UM", 0.020)
+        self.coarse_to_fine_ratio = env_float("PAM_AFM_COARSE_TO_FINE", 0.30)
+        self.max_steps = env_int("PAM_AFM_MAX_STEPS", 4000)
+
+        # PI engine.
+        # The single most useful knob: if you know how much the feedback value
+        # changes per um of Z, set PAM_AFM_SENSITIVITY and the gains are derived
+        # from it.  Leaving it at 0 falls back to the explicit kp/ki below.
+        self.feedback_sensitivity = env_float("PAM_AFM_SENSITIVITY", 0.0)
+        self.kp = env_float("PAM_AFM_KP", 0.003)
+        self.ki = env_float("PAM_AFM_KI", 0.050)
+        self.pi_dt_s = env_float("PAM_AFM_PI_DT_S", 0.030)
+        self.dz_limit_um = env_float("PAM_AFM_DZ_LIMIT_UM", 0.050)
+        self.deadband_frac = env_float("PAM_AFM_DEADBAND_FRAC", 0.020)
+        self.deadband = env_float("PAM_AFM_DEADBAND", 0.0)
+        self.kp_boost = env_float("PAM_AFM_KP_BOOST", 1.0)
+        self.boost_error_frac = env_float("PAM_AFM_BOOST_ERROR_FRAC", 0.0)
+        self.ff_gain = env_float("PAM_AFM_FF_GAIN", 0.0)
+        self.hold_steps = env_int("PAM_AFM_HOLD_STEPS", 2)
+        self.pi_max_steps = env_int("PAM_AFM_PI_MAX_STEPS", 200)
+        self.pi_stall_um = env_float("PAM_AFM_PI_STALL_UM", 1.0)
+        self.search_floor_frac = env_float("PAM_AFM_SEARCH_FLOOR_FRAC", 0.10)
+        self.search_step_um = env_float("PAM_AFM_SEARCH_STEP_UM", 0.100)
+        self.pi_settle_ms = env_int("PAM_AFM_PI_SETTLE_MS", 0)
+        self.pi_dll = env_str("PAM_AFM_PI_DLL", "") or None
+
+        # Where the Z criterion comes from.  "feedback" (default) is the
+        # digitizer; "file:<path.py>" or "<module>" loads a module that defines
+        # create_source(config) -> object with value().
+        self.control_source = env_str("PAM_AFM_CONTROL_SOURCE", "feedback")
 
         # Point payload.
         self.records_per_point = env_int("PAM_AFM_RECORDS_PER_POINT", 256)
@@ -190,11 +231,18 @@ class RunConfig:
         hi = None if math.isnan(self.z_max_um) else self.z_max_um
         return lo, hi
 
+    def effective_gains(self):
+        """The kp/ki the controller will actually use."""
+        if self.feedback_sensitivity > 0:
+            return suggest_gains(self.feedback_sensitivity, dt_s=self.pi_dt_s)
+        return self.kp, self.ki
+
     def approach_config(self):
         lo, hi = self.z_window()
         return AfmApproachConfig(
             setpoint=self.setpoint,
             approach_sign=self.approach_sign,
+            control_mode=self.control_mode,
             coarse_step_um=self.coarse_step_um,
             fine_step_um=self.fine_step_um,
             coarse_to_fine_ratio=self.coarse_to_fine_ratio,
@@ -205,9 +253,27 @@ class RunConfig:
             min_snr=self.min_snr,
             position_tolerance_um=self.position_tolerance_um,
             settle_time_ms=self.settle_time_ms,
+            pi_settle_ms=self.pi_settle_ms,
             settle_timeout_s=self.settle_timeout_s,
             z_min_um=lo,
             z_max_um=hi,
+            max_steps=self.max_steps,
+            kp=self.kp,
+            ki=self.ki,
+            pi_dt_s=self.pi_dt_s,
+            dz_limit_um=self.dz_limit_um,
+            deadband_frac=self.deadband_frac,
+            deadband=self.deadband,
+            kp_boost=self.kp_boost,
+            boost_error_frac=self.boost_error_frac,
+            ff_gain=self.ff_gain,
+            hold_steps=self.hold_steps,
+            pi_max_steps=self.pi_max_steps,
+            pi_stall_um=self.pi_stall_um,
+            search_floor_frac=self.search_floor_frac,
+            search_step_um=self.search_step_um,
+            feedback_sensitivity=self.feedback_sensitivity,
+            pi_dll=self.pi_dll,
         )
 
     def describe(self):
@@ -216,15 +282,41 @@ class RunConfig:
             % (self.feedback, self.feedback_rate_msps, self.feedback_records,
                self.f0_hz / 1e6, self.band_hz / 1e3),
             "setpoint        : %.4f %s" % (self.setpoint, self.setpoint_unit),
-            "approach        : sign %+.0f, coarse %.3f um, fine %.3f um, budget %.2f um"
-            % (self.approach_sign, self.coarse_step_um, self.fine_step_um, self.max_approach_um),
+        ]
+        if self.control_mode == "pi":
+            kp, ki = self.effective_gains()
+            lines.append(
+                "control         : digital PI, kp %.6f um/unit, ki %.6f um/(unit s), "
+                "step <= %.3f um" % (kp, ki, self.dz_limit_um)
+            )
+            lines.append(
+                "PI guards       : deadband %.2f%% of setpoint, hold %d, "
+                "blind allowance %.2f um, %d steps max"
+                % (self.deadband_frac * 100.0, self.hold_steps,
+                   self.pi_stall_um, self.pi_max_steps)
+            )
+            if self.feedback_sensitivity > 0:
+                lines.append("gain source     : derived from sensitivity %.4f unit/um"
+                             % self.feedback_sensitivity)
+            else:
+                lines.append("gain source     : PAM_AFM_KP / PAM_AFM_KI "
+                             "(set PAM_AFM_SENSITIVITY to derive them instead)")
+        else:
+            lines.append(
+                "control         : stepped, coarse %.3f um, fine %.3f um"
+                % (self.coarse_step_um, self.fine_step_um)
+            )
+        lines.extend([
+            "approach        : sign %+.0f, budget %.2f um" % (self.approach_sign, self.max_approach_um),
             "retract         : %.2f um (max %.2f um)" % (self.retract_um, self.max_retract_um),
             "scan            : %.2f x %.2f um, step %.3f um, %s"
             % (self.scan_range_x_um, self.scan_range_y_um, self.step_um,
                "serpentine" if self.serpentine else "raster"),
             "records/point   : %d" % self.records_per_point,
             "on failure      : %s" % self.on_fail,
-        ]
+        ])
+        if self.control_source not in ("", "feedback", "auto"):
+            lines.append("control source  : %s" % self.control_source)
         lo, hi = self.z_window()
         if lo is not None or hi is not None:
             lines.append("Z window        : %s .. %s um" % (lo, hi))
@@ -233,6 +325,12 @@ class RunConfig:
 
 # --------------------------------------------------------------------------- #
 # Feedback sources
+#
+# Each one exposes ``value()``, which is the interface the Z loop reads (see
+# Nanomax.afm_scan.ControlSource).  Swapping in a different Z criterion -- a
+# demodulated phase, a lock-in output, a reading from another instrument --
+# means writing one more class with ``value()`` and pointing
+# PAM_AFM_CONTROL_SOURCE at it, without touching the scan engine.
 # --------------------------------------------------------------------------- #
 
 class DemodFeedback:
@@ -260,6 +358,9 @@ class DemodFeedback:
         # The demodulator does not produce a meaningful SNR; 0 means "unknown"
         # and is not enforced by the approach engine.
         return amplitude, 0.0
+
+    def value(self):
+        return self.measure()
 
     def finish(self):
         return None
@@ -295,6 +396,9 @@ class FftFeedback:
         )
         return amplitude, snr
 
+    def value(self):
+        return self.measure()
+
     def finish(self):
         self.fft.stop()
 
@@ -326,11 +430,55 @@ class SyntheticFeedback:
             return self.amp_max, 50.0
         return self.amp_max * math.exp(-gap / self.rise_um), 50.0
 
+    def value(self):
+        return self.measure()
+
     def finish(self):
         return None
 
     def describe(self):
         return "synthetic surface at z=%.3f um, rise %.2f um" % (self.z_contact, self.rise_um)
+
+
+def load_external_source(spec, config):
+    """Load a user-supplied Z criterion.
+
+    ``PAM_AFM_CONTROL_SOURCE`` accepts three forms::
+
+        feedback                     the digitizer (default)
+        file:D:\\path\\my_source.py    load that file
+        my_package.my_source         import that module
+
+    The module (or file) must define ``create_source(config)`` returning an
+    object with a ``value()`` method.  ``value()`` may return a bare number or
+    ``(number, snr)``; ``prepare()``/``finish()``/``describe()``/``unit`` are
+    optional.  The number is compared against ``PAM_AFM_SETPOINT`` in the same
+    unit, so nothing here converts anything -- the caller owns the units.
+    """
+    import importlib
+
+    kind, _, target = spec.partition(":")
+    if kind == "file":
+        import importlib.util
+
+        path = os.path.abspath(target)
+        if not os.path.exists(path):
+            raise ValueError("control source file not found: %s" % path)
+        module_spec = importlib.util.spec_from_file_location("pam_afm_control_source", path)
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        label = path
+    else:
+        label = spec
+        module = importlib.import_module(spec)
+
+    factory = getattr(module, "create_source", None)
+    if factory is None:
+        raise ValueError("%s must define create_source(config)" % label)
+    source = factory(config)
+    if not hasattr(source, "value"):
+        raise ValueError("create_source() must return an object with value()")
+    return source
 
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +537,7 @@ def run_scan(config, args):
         "AFM_SCAN_BEGIN",
         run_id=run_id,
         feedback=config.feedback,
+        control_mode=config.control_mode,
         setpoint=config.setpoint,
         setpoint_unit=config.setpoint_unit,
         f0_hz=config.f0_hz,
@@ -398,6 +547,10 @@ def run_scan(config, args):
         retract_um=config.retract_um,
         max_approach_um=config.max_approach_um,
         records_per_point=config.records_per_point,
+        kp=config.effective_gains()[0],
+        ki=config.effective_gains()[1],
+        dz_limit_um=config.dz_limit_um,
+        feedback_sensitivity=config.feedback_sensitivity,
     )
 
     print("\nAFM approach scan")
@@ -411,7 +564,8 @@ def run_scan(config, args):
         safe_max_output_voltage=BPC303_SAFE_MAX_OUTPUT_VOLTAGE,
         log_callback=append_run_log,
     )
-    daq = fft = feedback = None
+    daq = fft = feedback = source = scanner = None
+    external = False
     all_data = []
     z_failures = 0
     try:
@@ -466,12 +620,30 @@ def run_scan(config, args):
         print("  feedback        : %s" % feedback.describe())
         feedback.prepare()
 
+        # Where the Z criterion comes from.  Default is the digitizer; anything
+        # else is a user module, which keeps the scan engine untouched.
+        source = feedback
+        external = config.control_source not in ("", "feedback", "auto")
+        if external:
+            source = load_external_source(config.control_source, config)
+            if hasattr(source, "prepare"):
+                source.prepare()
+            label = source.describe() if hasattr(source, "describe") else config.control_source
+            print("  control source  : %s" % label)
+            unit = getattr(source, "unit", "") or ""
+            if unit and unit != config.setpoint_unit:
+                print("  setpoint unit   : %s (taken from the control source)" % unit)
+                config.setpoint_unit = unit
+            append_run_log("AFM_CONTROL_SOURCE", kind=config.control_source,
+                           describe=str(label), unit=config.setpoint_unit)
+
         scanner = AfmScanner(
             stage=stage,
-            measure=feedback.measure,
+            measure=source,
             config=config.approach_config(),
             log=append_run_log,
         )
+        print("  controller      : %s" % scanner.describe().get("pi_backend", "stepped"))
 
         z_cursor = start_z
         for index, (target_x, target_y) in enumerate(trajectory, start=1):
@@ -587,6 +759,11 @@ def run_scan(config, args):
             "afm_failed_points": z_failures,
             "afm_z_um": [round(float(item[1].split(",")[2]), 4) for item in all_data],
         }
+        # Which engine actually ran, and with which gains -- so a file can be
+        # reproduced months later without guessing.
+        for key, value in scanner.describe().items():
+            if isinstance(value, (int, float, str, bool)):
+                stage_metadata["afm_" + key] = value
 
         result = save_scan_data(
             all_data,
@@ -628,8 +805,18 @@ def run_scan(config, args):
         return 130
     finally:
         try:
+            if external and source is not None and hasattr(source, "finish"):
+                source.finish()
+        except Exception:
+            pass
+        try:
             if feedback is not None:
                 feedback.finish()
+        except Exception:
+            pass
+        try:
+            if scanner is not None:
+                scanner.close()
         except Exception:
             pass
         try:
@@ -721,6 +908,23 @@ def dry_run(config, args):
     surface = SyntheticFeedback(config)
     surface.z_contact = 0.0
     config.setpoint = config.setpoint if config.setpoint > 0 else 0.5
+    if config.feedback_sensitivity <= 0:
+        # The synthetic surface has a known slope, so derive the gains from it.
+        # Without this the dry run would use the au-scale defaults against a
+        # 0..1 V signal and creep a few nanometres per step.
+        config.feedback_sensitivity = config.setpoint / surface.rise_um
+
+    # A dry run has no stage and no digitizer, so a real clock would measure a
+    # dt of microseconds and the PI would integrate almost nothing.  Pretend
+    # each control step costs what it costs on the rig.
+    class DryRunClock:
+        def __init__(self, period_s=0.030):
+            self.t = 0.0
+            self.period = float(period_s)
+
+        def __call__(self):
+            self.t += self.period
+            return self.t
 
     print("\nDRY RUN -- synthetic surface, no hardware")
     print(config.describe())
@@ -748,7 +952,9 @@ def dry_run(config, args):
         measure=measure,
         config=config.approach_config(),
         log=lambda event, **fields: None,
+        clock=DryRunClock(),
     )
+    print("  controller      : %s" % scanner.describe().get("pi_backend", "stepped"))
 
     z_cursor = stage.get_axis_position("z")
     stops, steps_used, failures = [], [], 0
@@ -772,6 +978,7 @@ def dry_run(config, args):
               % ((len(trajectory) - 1) * tilt_per_point, stops[-1] - stops[0]))
         print("  steps per point: min %d, mean %.1f, max %d"
               % (min(steps_used), sum(steps_used) / len(steps_used), max(steps_used)))
+    scanner.close()
     print("")
     return 0
 

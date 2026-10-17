@@ -36,6 +36,234 @@ Both machines track `origin/main`. Check the deployment with `git log -1
 commit hash written down here -- this file is edited far less often than the
 code.
 
+## Machine Identity
+
+Every note, commit message, and run-log entry in this repository identifies the
+machine by its **tailnet IP**, never by hostname. Both workstations are HP Pro
+Tower ZHAN 99 G9 and both are named `DESKTOP-T8UBAOM`, so the hostname cannot
+tell them apart — that collision has already caused work to be looked for on the
+wrong machine.
+
+| tailnet IP | SSH alias | code + digitizer | ATS-SDK manuals |
+| --- | --- | --- | --- |
+| **`100.79.154.4`** | `PAM-NEW` | yes | no |
+| `100.118.93.35` | `Work` | no | yes (`D:\Phd_training\exp_materials\15万采集卡\`) |
+
+Rules that follow from the collision:
+
+- Address a machine by IP or by the SSH alias that resolves to it. A hostname in
+  a note is a bug.
+- Only `100.79.154.4` has the repository *and* the ATS9373. Only
+  `100.118.93.35` has the SDK manuals. A question that needs both needs two
+  sessions.
+- The digitizer can be opened by **one process at a time**. All digitizer
+  probes are serial. Two concurrent probes leave one of them hanging for
+  minutes on a two-second job.
+
+## Build Toolchain
+
+### Python
+
+| interpreter | version | numpy | scipy | use |
+| --- | --- | --- | --- | --- |
+| `C:\Users\HP\miniconda3\envs\PAM\python.exe` | 3.10.18 | 2.2.6 | 1.15.3 | **the imaging environment** |
+| `C:\Users\HP\python311\python.exe` | 3.11 | 2.4.6 | — | builds the DLL, runs `-m Nanomax.afm_pi` |
+
+Only the `PAM` conda environment has `scipy`, so it is the only one that can
+import `Nanomax.data_io` and therefore the only one that can run a scan or
+`--dry-run`. `python311` is enough for compiling and for the controller
+self-checks, which is why both are listed.
+
+`atsapi` is not installed as a package; it is imported from
+`Alazar_imaging\Samples_Python\Library` (verified with `where /r D:\ atsapi.py`).
+
+### C++ — the PI controller
+
+Neither workstation has MSVC or MinGW. `C:\Program Files (x86)\Microsoft Visual
+Studio\2022\BuildTools` contains only `Common7\Licenses\MSBuild`, there is no
+`VC\Tools\MSVC`, `vswhere.exe` is absent, and `zig` / `g++` / `clang++` are not
+on `PATH`. Installing a toolchain on a lab machine is not acceptable, so the
+controller is built with the **`ziglang` PyPI wheel**, which ships a complete
+C/C++ compiler and needs no installation:
+
+```bat
+:: one-off, into a scratch directory (no admin, no PATH change)
+pip install --no-deps --target D:\LJB\_stage\zigpkg ziglang-0.16.0-py3-none-win_amd64.whl
+
+:: build
+set PYTHONPATH=D:\LJB\_stage\zigpkg
+C:\Users\HP\python311\python.exe -m ziglang c++ ^
+    -target x86_64-windows-gnu -O2 -shared ^
+    -o Nanomax\afm_pi.dll Nanomax\afm_pi.cpp
+```
+
+The result is a **363,008-byte self-contained DLL** with no CRT dependency
+beyond what Windows already provides. `Tool_code\build_afm_pi.py` wraps this and
+falls back to `zig` on `PATH`, `cl`, `g++`, or `clang++` if one of those ever
+appears.
+
+Two build traps worth remembering:
+
+- mingw's `<math.h>` already declares `::finite(double)`. A helper named
+  `finite` collides with it and the build dies with twelve errors, so the
+  controller calls its own `is_finite_value`.
+- The remote `cmd.exe` console is GBK. A build or test script that prints a
+  non-ASCII character (`façade`, `µm`, `万`) raises
+  `UnicodeEncodeError: 'gbk' codec can't encode character`. Script output that
+  has to run over SSH must be pure ASCII.
+
+## How the AFM Z loop works
+
+### The loop
+
+Z is the measurement. At every XY point the sample is driven until a feedback
+signal reaches a setpoint, the A-line is taken there, and the sample backs off
+before the next point. The surface is re-discovered per point, so tilt and
+thermal drift are tracked instead of being a systematic error, and the Z travel
+per point is bounded by `retract_um + max_approach_um` no matter how long the
+scan runs.
+
+### Incremental (velocity-form) PI
+
+The stage takes an absolute Z, but the decision the loop actually has to make is
+"how far to move next", which is exactly what an incremental PI produces:
+
+```
+e[k]   = setpoint - y[k]
+dz[k]  = sign * ( Kp*(e[k]-e[k-1]) + Ki*dt*e[k] )
+z[k+1] = z[k] + clamp(dz[k], -dz_limit, +dz_limit)
+```
+
+- **No integral state to wind up.** The integrator *is* the accumulated
+  position, and the position is already bounded by the Z window and the
+  per-point travel budget, so the integral is bounded with it.
+- **Bumpless.** `e[-1]` is seeded from the first measurement, so there is no
+  derivative kick on step one, and a setpoint change mid-scan needs no
+  re-initialisation.
+- **No monotonicity assumption.** `sign` only says which way Z has to move for
+  a positive error. A signal that *falls* as the probe approaches works
+  identically with `sign = -1`; nothing creeps "until a threshold is crossed",
+  and an overshoot is corrected downward.
+- **`dt` is capped at 10× nominal**, so one long host stall cannot inject a
+  huge `Ki*dt` kick.
+
+### Two progress guards
+
+A feedback signal that ignores Z either lets the error grow or never improves.
+Without a guard the loop quietly grinds through the whole travel budget and
+reports a bogus point, so both failure modes are detected:
+
+| guard | condition | meaning |
+| --- | --- | --- |
+| `diverged` | `|e| > 1.5*|e_start| + deadband` for 8 steps | wrong sign, runaway |
+| `stalled` | no new minimum `|e|` for `stall_steps` | probe too far, no coupling |
+
+The stall test uses a **monotone ratchet** (`e_best` only ever decreases), so
+noise riding on a constant reading cannot fake progress. `stall_steps` is not a
+fixed constant: it is derived from `pi_stall_um / dz_limit_um`, because a
+*saturated* reading is flat too, and backing out of saturation needs a blind
+allowance comfortably larger than the retract distance.
+
+### Blind search
+
+Far from the surface the reading is zero — indistinguishable from a
+disconnected probe — so the PI has no information and its stall guard would
+(correctly) give up after a fraction of a micrometre. While the reading is below
+`search_floor_frac × setpoint`, Z is therefore advanced coarsely in the approach
+direction until the signal appears, and only then does the PI take over. This is
+the one place where the loop moves without feedback; it is bounded by the same
+travel budget and logged as `AFM_SEARCH_BEGIN` / `AFM_SEARCH_HANDOVER`.
+
+### Gains
+
+`kp` is µm per unit of *change* in the reading (a damping term), `ki` is µm per
+(unit · second) (the creep term). Both are in whatever unit the caller feeds to
+the loop, so a setpoint in volts gives µm/V and µm/(V·s), and a setpoint in
+board units gives µm/au.
+
+Guessing them is the main source of trouble, so the recommended path is to
+measure the plant once and let `suggest_gains()` derive them:
+
+```python
+kp, ki = suggest_gains(sensitivity_per_um)   # kp = 0.5/S, ki = 0.3/(S*dt)
+```
+
+`PAM_AFM_SENSITIVITY` feeds that in; the defaults (`kp=0.003`, `ki=0.05`) are
+tuned for the on-FPGA FFT amplitude scale of roughly 250–320 au.
+
+### Where the number comes from
+
+The loop never reads the digitizer directly. It calls `value()` on a *control
+source*, so the Z criterion can be the 10 MHz amplitude, a demodulated phase, a
+lock-in output, or a reading from another instrument:
+
+```bat
+set PAM_AFM_CONTROL_SOURCE=file:D:\path\to\my_source.py
+```
+
+The module must define `create_source(config)` returning an object with
+`value()` (see `Tool_code\example_control_source.py`). The number is compared
+against `PAM_AFM_SETPOINT` in the same unit, so nothing converts anything — the
+source owns its units.
+
+### Trigger-free acquisition
+
+The laser trigger is not connected, and this board does not free-run on
+`TRIG_DISABLE` alone. What actually works, measured on hardware at 4×4096:
+
+| configuration | result |
+| --- | --- |
+| `TRIG_DISABLE` + timeout **0** | ✗ `ApiWaitTimeout` after 2.0 s |
+| `TRIG_DISABLE` + timeout **0.01 s** | ✓ 0.010 s, valid data |
+| `TRIG_EXTERNAL` + 0.01 s | ✓ 0.011 s |
+| `TRIG_CHAN_A` + 0.01 s | ✓ 0.009 s |
+| DSP FFT, `TRIG_DISABLE` + 0 | ✗ `ApiWaitTimeout` |
+| DSP FFT, `TRIG_DISABLE` + 0.01 s | ✓ 0.020 s |
+
+`setTriggerTimeOut(0)` means **"wait forever"**, not "do not wait" — a non-zero
+timeout is what makes the board self-trigger when the interval expires. The
+parameter is an **integer count of 10 µs ticks**, not seconds; passing a float
+raises `ctypes.ArgumentError`.
+
+### On-FPGA FFT
+
+`DSP_MODULE 0 id=0x10000 (FFT) v5.32, maxLength 4096, 12 bits`. With
+`fftSetup` at 4096 points the board returns 2048 `FLOAT_AMP2` bins per record,
+so the 10 MHz peak is read without a host-side FFT: **325 readings/s** versus
+**20 readings/s** for the time-domain path. Both modes run at 100 MS/s, because
+a 4096-sample record then spans 40.96 µs — 409.6 cycles of the carrier, against
+10.24 cycles at 4 GS/s.
+
+Three traps, all found on hardware:
+
+- **FFT/DSP methods live on `DspModule`, not on `Board`.** Probing
+  `hasattr(ats.Board, "fftSetup")` wrongly suggests the SDK is missing six
+  symbols. Use `board.dspGetModules()[0]`.
+- **Never abort and restart the capture per reading.** After a
+  `dspAbortCapture()` the second `beforeAsyncRead()` does not re-arm the FFT and
+  the first buffer comes back **1854–1882 of 2048 bins NaN**. Start once, keep
+  the stream running, and get freshness from `flush()`, which reads and discards
+  exactly `buffer_count` buffers (327 µs at 8×4096 @ 100 MS/s).
+- **`ats.AlazarAllocBufferU16` is not a module attribute** — it lives on the
+  loaded DLL object. Allocate through `ats.DMABuffer(handle, c_uint16, bytes)`
+  and reinterpret the memory as float32; it owns the matching free.
+
+### Timing
+
+The loop measures its own period, so the clock has to be able to resolve it.
+`time.monotonic()` on Windows is backed by `GetTickCount64` and only resolves to
+about 15 ms; two consecutive reads inside one control step often return the same
+value, `dt` comes out as 0, and the controller silently falls back to its
+nominal period. The scan engine uses `time.perf_counter()`.
+
+## Backups
+
+The working tree on the target must be **clean before a scan**, because a `.mat`
+file is only reproducible if the code that produced it is committed. The
+discipline is: verify, then `git add` the specific files, then commit with a
+message that says what was measured and on which machine (by tailnet IP), then
+`git push`. Uncommitted work on `100.79.154.4` is work that does not exist.
+
 ## Highlights
 
 - Closed-loop 2D sample scanning with `MAX311D + BPC303` in micrometres.
@@ -65,6 +293,7 @@ code.
 | `PAM_Main_Nanomax.py` | Main integrated NanoMax PAM program; sample or probe target | Recommended |
 | `PAM_Main_Prior.py` | Prior ProScan PAM with no laser; same panel, dashboard and run log | Recommended for a Prior stage |
 | `PAM_Main_Nanomax_ClosedLoop.py` | NanoMax closed-loop PAM with no laser | Recommended for a laser-free NanoMax |
+| `PAM_Main_Nanomax_AFM.py` | AFM approach/retract scan: Z tracks a feedback setpoint, one A-line per point | Recommended for surface tracking |
 | `Tool_code/nanomax_motion_debug_panel.py` | Motion-only panel for MAX311D/MAX312D; no DAQ or laser | Recommended for motion checks |
 | `PAM_Main_LBTEK.py` | One-dimensional EM-LSS65-13C1 LBTEK scan | Separate validated path |
 | `PAM_Main_SDK.py` | Older Prior/LBTEK-compatible PAM prototype | Legacy |
@@ -95,6 +324,9 @@ scan or changes a laser state; the two marked **Moves stages** do move hardware.
 | `Tool_code/acceptance_prior_nanomax_nolaser.py` | Laser-free entry-point self-check, no hardware needed | None |
 | `Tool_code/nanomax_motion_debug_panel.py` | Interactive motion-only panel | **Moves stages** |
 | `Tool_code/validate_laser_panel_no_hardware.py` | Import check for the laser panel | None |
+| `Tool_code/test_afm_offline.py` | AFM engine + PI controller, 85 checks | None |
+| `python -m Nanomax.afm_pi --selftest` | C++/Python controller agreement | None |
+| `PAM_Main_Nanomax_AFM.py --dry-run` | Full AFM loop on a synthetic surface | None |
 
 ## Hardware Topology
 
@@ -144,6 +376,7 @@ make the deployment reproducible; replace them for a different installation.
 .
 ├── PAM_Main_Nanomax.py              # current integrated PAM entry point
 ├── PAM_Main_Nanomax_ClosedLoop.py   # NanoMax closed-loop PAM, no laser
+├── PAM_Main_Nanomax_AFM.py          # AFM approach/retract scan, PI Z loop
 ├── PAM_Main_Prior.py                # Prior ProScan PAM, no laser
 ├── PAM_Main_LBTEK.py                # validated 1D LBTEK PAM path
 ├── PAM_Main.py                      # legacy Prior acquisition loop
@@ -151,6 +384,7 @@ make the deployment reproducible; replace them for a different installation.
 ├── PAM_Main_software.py             # legacy GUI application
 ├── Alazar_imaging/                  # hardware wrappers and ATS examples
 │   ├── AlazarNPTSystem.py           # ATS9373 NPT acquisition wrapper
+│   ├── AlazarFFTSpectrum.py         # on-FPGA FFT readout, trigger-free
 │   ├── BPC303NativeController.py   # closed-loop BPC303 controller
 │   ├── PriorStageAdapter.py         # Prior ProScan behind the BPC303 interface
 │   ├── PriorUnifiedStage.py         # Prior SDK transport
@@ -163,6 +397,9 @@ make the deployment reproducible; replace them for a different installation.
 │   ├── open_loop_panel.py           # open-loop probe panel
 │   ├── acquisition_panel.py         # fixed acquisition dashboard
 │   ├── scan_utils.py                # range, step, pattern, and travel checks
+│   ├── afm_scan.py                  # approach/retract state machine
+│   ├── afm_pi.py                    # digital PI: ctypes binding + reference
+│   ├── afm_pi.cpp                   # the compiled controller (stable C ABI)
 │   ├── data_io.py                   # MAT packaging and safe save/rename
 │   ├── result_preview.py            # data-processing bridge
 │   ├── terminal_panel.py            # shared terminal rendering helpers
