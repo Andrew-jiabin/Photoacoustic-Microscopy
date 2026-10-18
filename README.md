@@ -1453,7 +1453,7 @@ machine has no `D:\LJB` at all.
 | --- | --- |
 | `README.md` (this file) | Entry points, contracts, deployment, backup |
 | `LBTEK_1D_STAGE_NOTES.md` | LBTEK hardware behaviour and field experience |
-| `docs/DLM3000_scope_report.md` | Yokogawa DLM3034: VXI-11 waveform readout, measured timings, pitfalls |
+| `docs/DLM3000_scope_report.md` | Yokogawa DLM3034: VXI-11 waveform readout, measured timings, the 2-9.4 Hz scalar measurement path, pitfalls |
 | `reference/` | Integration decisions and lab notes |
 | `run_logs/PAM_Main_Nanomax_run.log` | Previous run state; drives the startup zero-datum decision |
 | `run_logs/pam_scan_speed_history.json` | Median scan speed per target/step, used for time estimates |
@@ -1493,19 +1493,27 @@ and Yokogawa's CDN returns 403 for it).
 | One fresh record, four channels | ~590 ms → **~1.7 Hz** |
 | Extra channels | cost ~110 ms total, not 4x |
 | Bottleneck | the instrument, **not** the network (250 kB crosses the LAN in 3-11 ms) |
+| **One scalar, via the scope's own measurement engine** | **2-9.4 Hz** (shorter record = faster), 0.4 ms per query, **no `:STOP` needed** |
 
-~2 Hz is a hard ceiling. The scope is a **slow reference / second opinion /
-calibration source**, never the sensor of a fast loop — the ATS9373 on-FPGA FFT
-is the fast path.
+A whole waveform is capped at ~2 Hz and **shrinking the transfer window does not
+help** — 99 points and 9 999 points both refresh at 2.21-2.22 Hz, because the
+0.45 s is the instrument producing a *new record*, not moving bytes. If a loop
+only needs a number, let the scope compute it: `:MEASure:MODE ON` plus
+`:MEASure:CHANnel<n>:<item>:VALue?` answers in 0.41 ms and refreshes at
+**5.9 Hz** (TDIV 2 ms / 125 kpts) up to **9.4 Hz** (TDIV 20 us / 1 250 pts),
+against 2.26 Hz for the waveform at the same settings. See report section 15.
+
+The scope is a **slow reference / second opinion / calibration source**, never
+the sensor of a fast loop — the ATS9373 on-FPGA FFT is the fast path.
 
 ### Files
 
 | File | Role |
 | --- | --- |
-| `Nanomax/dlm_scope.py` | Zero-dependency VXI-11 client, `DlmScope`, `Waveform`, `Streamer`, `ScopeSource` |
+| `Nanomax/dlm_scope.py` | Zero-dependency VXI-11 client, `DlmScope`, `Waveform`, `Streamer`, `ScopeSource`, `MeasureStreamer` / `MeasureSource` |
 | `Tool_code/dlm_scope_cli.py` | ASCII-only command line front end (GBK console safe) |
 | `Tool_code/dlm_scope_web.py` | Browser scope view, standard library only |
-| `Tool_code/test_dlm_scope_offline.py` | 66 offline checks, no instrument needed |
+| `Tool_code/test_dlm_scope_offline.py` | 84 offline checks, no instrument needed |
 
 ### Quick start
 
@@ -1513,6 +1521,7 @@ is the fast path.
 python -m Tool_code.dlm_scope_cli --check        :: identity, state, one record
 python -m Tool_code.dlm_scope_cli --bench 10     :: latency, rate, distinct records
 python -m Tool_code.dlm_scope_cli --follow 8     :: sustained streaming, snapshot latency
+python -m Tool_code.dlm_scope_cli --measure RMS --tdiv 20E-6 --rlen 1250 --follow 10
 python -m Tool_code.dlm_scope_web --channels 1,2,3,4 --port 8791
 ```
 
@@ -1532,6 +1541,15 @@ a `pythonw.exe`.
    settle to `MULTI_SETTLE_S = 0.15 s` and then measures 8/8 aligned. Do not
    interleave other SCPI commands inside the sweep — the unlucky one pays
    ~130 ms + ~320 ms for the next record.
+4. **`:MEASure:MODE` ships OFF.** Every `:MEASure:...:VALue?` answers `NAN`
+   until it is switched on, which reads like "the command does not exist".
+   Set the time base **first**, then call `measure_on()` — touching `TDIV` or
+   `RLENgth` afterwards sends every value back to `NAN`. And `PKPK` / `MEAN`
+   are not measurement items here; use `MAX - MIN` or `AMPL`.
+5. **`410,"Query INTERRUPTED"` does not mean "unknown header".** It means the
+   header exists but the response was never read. Only `113,"Undefined
+   header"` means it does not exist — I mis-wrote off six real headers by
+   trusting the 410.
 
 ### Codes, not volts
 

@@ -21,8 +21,11 @@
 | 怎么给实时控制用 | 用 `Streamer` 后台线程解耦：抓取按示波器节奏走，控制循环调 `snapshot()` **微秒级返回**并附带 `age_s` |
 | 能不能在示波器运行时读 | **不能**。运行中 `:WAVEFORM:SEND?` 返回 `#9000000000`（0 字节合法块），必须 `:STOP` 之后读 |
 | `:STOP` 之后记录会冻结吗 | **不会**。示波器继续以 ~2 Hz 采，`SEND?` 只交出最新那条。`latest()` 不保证等于上一次 `read()` |
+| **窗口切小能更实时吗** | **不能**。窗口 9999 点 → 99 点（数据减 100 倍），换记录速率仍是 **2.21–2.22 Hz**。0.45 s 是"产出新记录"的节拍，不是搬字节的节拍（见 §15.1） |
+| **那怎么才算实时** | **别搬波形，读标量**：`:MEASure:MODE ON` + `:MEASure:CHANnel<n>:<item>:VALue?`，0.41 ms/次、**不用 STOP**、**2–9.4 Hz**（记录越短越快，地板 ~102 ms）（见 §15.3） |
+| 标量通道最容易踩什么 | `:MEASure:MODE` 出厂 **OFF**，不开就全是 `NAN`；且必须先设时基再开测量，否则又回 `NAN` |
 
-**一句话选型建议**：如果控制回路快于 0.5 s，示波器**不能**当主传感器——应该用 ATS9373 采集卡的片上 FFT；示波器适合当**慢速参考/第二意见/标定用**。
+**一句话选型建议**：要"实时"就别搬波形——让示波器把波形算成一个数（`MeasureStreamer`，2–9.4 Hz），需要波形本身时才走 `Streamer`（~2.2 Hz）。若控制回路快于 0.1 s，示波器仍**不能**当主传感器——应该用 ATS9373 采集卡的片上 FFT；示波器适合当**慢速参考/第二意见/标定用**。
 
 ---
 
@@ -181,6 +184,22 @@ def write(self, data, io_timeout=5000, flags=OP_FLAG_END):
 
 **实测不存在的头部**（发下去会往错误队列推 `113,"Undefined header;..."`）：
 `:SINGle`、`:SYSTem:ERRor?`、`:WAVEFORM:ASC?`、`:WAVEFORM:DATA?`、`:WAVEFORM:WORD?`、`:WAVEFORM:MODE?`、`:WAVEFORM:RLENGTH?`、`:WAVEFORM:STATUS?`、`:ACQUIRE:STATUS?`、`:ACQUIRE:SRATE?`、`:STARt?`、`:STOP?`、`:RUN?`、`:ACQuire:STATe?`、`:TIMebase:MODE?`、`:HISTory:MODE?`。
+
+**实测存在、但不在波形路径上的头部**（§15.3 才挖出来的，别被 `410` 骗了）：
+
+| 命令 | 说明 |
+|---|---|
+| `:MEASure:MODE ON\|OFF` | 自动测量引擎总开关，**出厂 OFF** |
+| `:MEASure:CHANnel<n>:<item>:STATe 0\|1` | 逐项开关（item ∈ `RMS MAX MIN AMPL SDEV FREQ PER`） |
+| `:MEASure:CHANnel<n>:<item>:VALue?` | 读标量，**0.41 ms/次，不需要 STOP** |
+| `:MEASure?` | dump 整棵树（19 745 字符，21 trace × 36 item） |
+| `:TIMebase:SRATe?` | 采样率（6.25e6） |
+| `:ACQuire:COUNT?` | 返回 `INF`（连续采集），不是计数器 |
+| `:COMMunicate?` / `:COMMunicate:HEADer?` | 通讯设置，`HEAD 1` 表示响应带头部 |
+| `:MATH1:...` | 运算/FFT 配置（`HCUT/LCUT` 已见 10 MHz） |
+| `:HISTory:...` | 历史记录（`REC 0`），未深挖 |
+
+> ⚠️ **`410,"Query INTERRUPTED"` 的含义**：不是"命令不存在"，而是"这个头**存在**，但你发了查询却没把响应读走"。只有 `113,"Undefined header"` 才是真的不存在。我一开始就是先 `write` 再读错误队列，于是把 6 个存在的头误判成不存在。
 
 ### 5.1 块格式
 
@@ -414,10 +433,10 @@ C:\Users\HP\miniconda3\envs\PAM\python.exe -m Tool_code.dlm_scope_web ^
 
 | 文件 | 作用 |
 |---|---|
-| `Nanomax/dlm_scope.py` | 核心库：VXI-11 传输、`DlmScope`、`Waveform`、`Streamer`、`ScopeSource` |
+| `Nanomax/dlm_scope.py` | 核心库：VXI-11 传输、`DlmScope`、`Waveform`、`Streamer`、`ScopeSource`、**`MeasureStreamer` / `MeasureSource`（标量通道）** |
 | `Tool_code/dlm_scope_cli.py` | 命令行前端（**纯 ASCII 输出，GBK 控制台安全**） |
 | `Tool_code/dlm_scope_web.py` | 网页示波器 |
-| `Tool_code/test_dlm_scope_offline.py` | 离线自检（**66 项全过**），不需要连示波器 |
+| `Tool_code/test_dlm_scope_offline.py` | 离线自检（**84 项全过**），不需要连示波器 |
 
 CLI 用法（在仓库根目录）：
 
@@ -428,6 +447,9 @@ python -m Tool_code.dlm_scope_cli --stream 5               :: 打印 5 条新记
 python -m Tool_code.dlm_scope_cli --follow 8               :: 后台流式 8 秒，报 records / 延迟 / age
 python -m Tool_code.dlm_scope_cli --save rec.csv --window 0 9999
 python -m Tool_code.dlm_scope_cli --source pkpk            :: 以 AFM 源的方式取标量
+:: 标量通道（快 1.1-4.2 倍，不用 STOP）：
+python -m Tool_code.dlm_scope_cli --measure RMS
+python -m Tool_code.dlm_scope_cli --measure RMS,MAX --channels 1,2 --tdiv 20E-6 --rlen 1250 --follow 10
 ```
 
 `--host` 默认 `192.168.1.100`，`--channel` 默认 1。
@@ -438,7 +460,7 @@ python -m Tool_code.dlm_scope_cli --source pkpk            :: 以 AFM 源的方�
 
 | 项目 | 结果 |
 |---|---|
-| 离线自检 | **66 / 66 passed** |
+| 离线自检 | **84 / 84 passed**（2026-10-18 追加标量通道 18 项后） |
 | `--check` | 10000 pts / 345.6 ms（独占时）；`latest()` 3–4 ms |
 | `--bench 6` | median **454.2 ms**，distinct **6/6**（每条都是新记录），rate **2.20 Hz** |
 | `--follow 6` | 12 records / 6.0 s = **2.00 Hz**；snapshot median 6 µs / max 165 µs |
@@ -446,6 +468,8 @@ python -m Tool_code.dlm_scope_cli --source pkpk            :: 以 AFM 源的方�
 | `read_multi(..., verify=True)` ×8 | median 919 ms（verify 多花 ~330 ms），misaligned 0/8 |
 | 多通道同源（手写突发，10 次） | **10 / 10 字节一致** |
 | 网页 | `http://100.79.154.4:8791/` → 200 / 4485 B；`/data` 4 通道约 30 kB，rate 1.98–2.12 Hz |
+| **`--measure RMS --follow 6`**（TDIV 2 ms / 125 kpts） | **5.72 Hz**，median gap 206.6 ms，941 次轮询/s，age median 1 ms |
+| **`--measure RMS --follow 6`**（TDIV 20 µs / 1 250 pts） | **9.34 Hz**，median gap 102.5 ms，1276 次轮询/s |
 
 ---
 
@@ -466,13 +490,170 @@ payload 是**未加 CH offset / VDIV 的原始 ADC 码**。验证：改 `:CHANne
 ### 14.2 建议的下一步
 
 1. **标定 `CODES_PER_DIV`**（一次即可，写回 `dlm_scope.py` 常量）。
-2. **把示波器接进 AFM 回路当慢速参考**：`Streamer` + `ScopeSource`，与采集卡片上 FFT 并行。
-3. 如果要更快：只能换数据源（采集卡），示波器这条路已到 ~2.2 Hz / 四通道 ~1.7 Hz 的天花板。
-4. 可以尝试用 FTP（端口 21 也开）批量导出记录文件——适合离线存盘，不适合实时。
+2. **把示波器接进 AFM 回路当慢速参考**：`Streamer` + `ScopeSource`，与采集卡片上 FFT 并行。只要标量的话改用 `MeasureStreamer` / `MeasureSource`（**2–9.4 Hz**，见 §15.3）。
+3. **有信号时重测触发路径**：接上 10 MHz 超声后，把 `:TRIGger:MODE` 切 NORM 对比 `--measure` 更新率——理论上限会从"100 ms 超时"变成"触发率"（§15.2，目前无信号无法验证）。
+4. 如果要更快：只能换数据源（采集卡），示波器波形通道已到 ~2.2 Hz / 四通道 ~1.7 Hz 的天花板。
+5. 可以尝试用 FTP（端口 21 也开）批量导出记录文件——适合离线存盘，不适合实时。
+6. 可考虑用 `:MATH1`（FFT，`HCUT/LCUT` 已见 10 MHz 字样）让示波器直接做频谱，再读其测量值——对"10 MHz 分量幅值"比时域 RMS 更贴题，尚未验证。
 
 ---
 
-## 15. 附录：踩坑清单（按被坑概率排序）
+## 15. 追问：「能不能更小一段、更实时？」（2026-10-18 追加）
+
+> 提问原话：*"感觉数据是一大段一大段传输过来的，可是我需要的是实时拿到当前的波形呀，能不能更小一段传输……你再看看说明书"*
+>
+> **结论先说**：把窗口切小**不能**提高实时性，因为 0.45 s 是"示波器产出一条新记录"的节拍，不是"搬字节"的节拍。但顺着这个问题在说明书和命令树里翻，找到了一条**真的更快**的路：**让示波器自己算标量**（`MEASure` 引擎），~0.4 ms 一次查询、**不需要 `:STOP`**、更新率 **2–9.4 Hz**（视记录长度），是波形通道的 **1.1–4.2 倍**，且 IO 成本降低约三个数量级。若控制回路只需要"当前幅值"这一个数，就该走这条。
+
+### 15.1 直接回答：窗口切到 99 点，换记录速率一点没变
+
+两个对照实验（每次 6 s，同一台示波器）：
+
+**A) 一次 `:STOP` 后死轮询，不再重新 arm**
+
+| 窗口点数 | 读次数 | unique payload | 单次读耗时 |
+|---|---|---|---|
+| 99 | 3863 | **1** | 1.3 ms |
+| 999 | 3919 | **1** | 1.4 ms |
+| 9999 | 2673 | **1** | 2.0 ms |
+| 124999 | 460 | **1** | 9.9 ms |
+
+6 秒里读了几千次，**交出来的始终是同一条记录**（0.17–0.20 条/s）。轮询很快，但快的是"重复要同一份东西"。
+
+**B) 每次重新 arm（即 `read()` 的做法）**
+
+| 窗口点数 | 读次数 | unique | 换记录速率 |
+|---|---|---|---|
+| 99 | 14 | 14 | **2.22 Hz** |
+| 999 | 14 | 14 | **2.22 Hz** |
+| 9999 | 14 | 14 | **2.21 Hz** |
+
+窗口从 9999 点缩到 99 点（数据量减 100 倍），**换记录速率完全不变**。数据变少了，节拍没变。
+
+**为什么？** 再做一个反证：一次 `:STOP` 之后**交替**取两个不同窗口（`0-99` 与 `1-100`），每轮只要 **1.7 ms**（599 轮/s），窗口位置换到 `50000-59999` 也一样（2.3 ms，438 轮/s）。这说明**示波器完全能廉价地切任意片段**——它慢的不是"切片"，而是**产生下一条记录**。所以：
+
+> 0.45 s = 示波器准备一条新记录的时间。要更实时，只能减少"需要新记录的次数"，或者干脆不搬波形。
+
+### 15.2 说明书里唯一相关的一条：AUTO 超时 = max(100 ms, 10 div)
+
+说明书（`DLM3000用户手册` 2.1 节）原文：
+
+- **AUTO 模式**：*"如果在超时时间内满足触发条件，仪器将在每次触发时更新显示波形。否则……自动更新显示的波形"*
+- **超时时间 = max(100 ms, 时间轴 10 div 对应的时间)**
+- **NORM 模式**：*"仪器只在触发条件成立时更新显示波形"*
+
+这条规则**实测成立**（用标量通道测，见 15.3，因为它比波形通道干净得多）：
+
+| TDIV | 10 div | 说明书预测 | 实测 |
+|---|---|---|---|
+| 50 ms/div | 500 ms | 2.00 Hz | **1.98 Hz（511 ms）** ✅ |
+| 20 µs/div | 0.2 ms → 取 100 ms | 10 Hz | **9.36 Hz（102 ms）** ✅（100 ms 地板） |
+
+→ 那个"~100 ms 地板"就是说明书里的 **100 ms 最小超时**，不是玄学。
+
+**但触发这条路现在验证不了**，原因很具体：
+- 触发源固定是 **CHAN4**（`:TRIGger:SOURce?` 返回四通道复合串，CHAN4 `LEV 340 mV`）；
+- **`:TRIGger:SOURce` 不可远程设置**（`113,"Undefined header"`），`:TRIGger:HOLDoff` 也只能查不能设；
+- **四个通道当前都没有任何真实信号**（只有本底噪声）。切 NORM + 把电平放到 CHAN4 均值后，8 次读**全部 0 点**——没有触发，NORM 就永不更新。
+
+> ⚠️ **待现场验证**：一旦 10 MHz 超声真的接上，NORM 模式下 AUTO 超时不再生效，更新率会变成**触发率**，天花板应该明显高于 10 Hz。这一条必须在有信号时重测（`--measure ... --follow`，同时把 `:TRIGger:MODE` 切 NORM 对比）。
+
+另外 TDIV 500 ms/div 时实测反而 **5.14 Hz**（波形通道降到 1.87 Hz），与"10 div = 5 s → 0.2 Hz"不符——这个时基应已进入**滚动模式**（说明书：滚动模式下不显示 MATH 波形、不能用历史功能），更新行为另算。慢时基不在实时控制范围内，未深究。
+
+### 15.3 ⭐ 真正更快的路：让示波器自己算，只读一个数
+
+示波器内置**自动测量引擎**，本来就每帧在算 RMS / MAX / MIN / AMPL / FREQ。之前一直读不到，是因为踩了两个坑：
+
+1. **`:MEASure:MODE` 出厂是 `OFF`**。此时所有 `:MEASure:...:VALue?` 都回 **`NAN`**，看着像命令不存在。
+2. **`:MEASure:CHANnel<n>:<item>:STATe 1` 必须在时基设置之后**。先开测量再改 `TDIV` / `RLENgth`，值会全部退回 `NAN`（实测）。
+
+打开之后：
+
+```
+:MEASure:MODE ON
+:MEASure:CHANnel1:RMS:STATe 1
+:MEASure:CHANnel1:RMS:VALue?        ->  :MEAS:CHAN1:RMS:VAL 803.261E-06
+```
+
+**成本**：一次查询 **0.41 ms**（实测 2415 次/s），而且**示波器在运行（RUN）状态下就能读，不需要 `:STOP`**。对比波形通道一次 ~450 ms、还必须先停。
+
+**更新率（决定性对照表，同一次实验、同一台机）**：
+
+| TDIV | RLEN | SRATE | 标量更新率 | 中位间隔 | 同设置下波形速率 |
+|---|---|---|---|---|---|
+| 2 ms | 125 000 | 6.25 MS/s | 5.92 Hz | 196 ms | 2.24 Hz |
+| 200 µs | 12 500 | 6.25 MS/s | 7.31 Hz | 116 ms | 2.26 Hz |
+| **20 µs** | **1 250** | 6.25 MS/s | **9.36 Hz** | **102 ms** | 2.26 Hz |
+| 2 µs | 125 | 62.5 MS/s | 8.82 Hz | 104 ms | 2.25 Hz |
+| 50 ms | 125 000 | 250 kS/s | 1.98 Hz | 511 ms | 2.26 Hz |
+| 500 ms | 125 000 | 25 kS/s | 5.14 Hz | 212 ms | 1.87 Hz |
+
+两个要点：
+
+- **记录越短，标量越快**（2 ms → 20 µs：5.9 → 9.4 Hz），**而波形通道一动不动（2.24 → 2.26 Hz）**。这是"标量通道"和"波形通道"最本质的区别：波形通道的 0.45 s 与记录长度无关，标量通道的节拍里**有**记录长度那一项。
+- **地板是 ~102 ms**（≈说明书那个 100 ms 最小超时）。
+
+**CLI 实测**（真机，`--measure`）：
+
+```
+$ python -m Tool_code.dlm_scope_cli --measure RMS --channels 1 --tdiv 20E-6 --rlen 1250 --follow 6
+values    44 changes in 4.7 s -> 9.34 Hz (median gap 102.5 ms)
+polls     7660 -> 1276 queries/s (each ~0.4 ms, none of them blocks)
+age       median 0.000 s
+staleness worst case = one refresh gap = 133 ms, not the poll rate
+```
+
+**可用的测量项**（`MEAS_ITEMS`）：`RMS` `MAX` `MIN` `AMPL` `SDEV` `FREQ` `PER`。
+⚠️ **`PKPK` 和 `MEAN` 不存在**——这两个是最容易先猜的，实测都是 `113,"Undefined header"`；要峰峰值用 `MAX - MIN` 或 `AMPL`。
+
+**延迟语义**：`age_s` 是"距上次成功轮询"，只能证明链路活着；**控制决策的最坏陈旧度 = 一个刷新间隔（102–208 ms）**，不是轮询周期。这一点在 `MeasureStreamer.snapshot()` 的注释里写死了。
+
+### 15.4 选型：什么需求走哪条路
+
+| 你需要 | 用什么 | 速率 | 代价 |
+|---|---|---|---|
+| **一个标量**（幅值/有效值/峰值）做控制判据 | `MeasureStreamer` / `MeasureSource` | **2–9.4 Hz**（记录越短越快） | 0.4 ms/次，不阻塞，不用 STOP |
+| **整条波形**（看形状、算 FFT、存盘） | `Streamer` / `DlmScope.read()` | **~2.2 Hz**（四通道 ~1.7 Hz） | ~450 ms/帧，必须 STOP |
+| 快于 0.1 s 的闭环 | **换数据源**：ATS9373 采集卡片上 FFT | 30 ms 级 | 示波器这条路已到物理天花板 |
+
+**一句话**：要"实时"，就不要搬波形——让示波器把波形算成一个数，你只取那个数。10 MHz 超声的幅值判据正好只要一个数。
+
+### 15.5 用法
+
+```python
+from Nanomax.dlm_scope import DlmScope, MeasureStreamer, MeasureSource
+
+# 想更快就先缩短记录：20 us/div + 1250 点 -> ~9.4 Hz
+with DlmScope("192.168.1.100") as scope:
+    scope.write(":TIMebase:TDIV 20E-6")
+    scope.write(":ACQuire:RLENgth 1250")
+    import time; time.sleep(0.5)          # 时基先落定，再开测量
+
+    # 后台线程按示波器节奏轮询，控制循环拿 snapshot() 只需微秒
+    with MeasureStreamer(scope, channels=(1,), items=("RMS",)) as m:
+        while running:
+            values, age = m.snapshot()     # {1: {"RMS": 8.0e-04}}, 0.001
+            amp = values.get(1, {}).get("RMS")
+            ...                            # 决策
+```
+
+接 AFM Z 回路（和 `ScopeSource` 同一个契约，可直接替换）：
+
+```python
+src = MeasureSource(scope, item="RMS", channel=1)
+value, weight = src.value()        # ~0.4 ms，而不是 ~450 ms
+```
+
+命令行：
+
+```bash
+python -m Tool_code.dlm_scope_cli --measure RMS                  # 读一次
+python -m Tool_code.dlm_scope_cli --measure RMS,MAX --channels 1,2 \
+       --tdiv 20E-6 --rlen 1250 --follow 10                      # 流 10 秒
+```
+
+---
+
+## 16. 附录：踩坑清单（按被坑概率排序）
 
 1. **`device_write` 不带 `OP_FLAG_END` (0x08)** → 命令不执行，下一次 read 报 error 15 挂满超时。最隐蔽。
 2. **`device_write` 参数写成 5 个 int** → 返回 size 0。正确是 4 个 int + opaque（`>iIII`）。
@@ -493,3 +674,9 @@ payload 是**未加 CH offset / VDIV 的原始 ADC 码**。验证：改 `:CHANne
 17. **远程 `start /b`** → 进程随 ssh 会话死，必须常驻启动。
 18. **PAM-NEW 端口 8765 被占** → 换 8791。
 19. **GBK 远程控制台** → 所有程序输出必须纯 ASCII（`dlm_scope_cli.py` 已按此约束写）。
+20. **以为 `:MEASure:...:VALue?` 不存在** → 它存在，只是 `:MEASure:MODE` 出厂 `OFF`，所以回 `NAN`。先 `:MEASure:MODE ON`。
+21. **先开测量、后改时基** → 值全部退回 `NAN`。顺序必须是：`TDIV` → `RLENgth` → 等一下 → `measure_on()`。
+22. **查 `:MEASure?` 时先 write 再读错误队列** → 会得到 `410,"Query INTERRUPTED"`。**410 不是"不存在"**，恰恰是"这个头存在、但你没把响应读走"；只有 `113,"Undefined header"` 才是真的不存在。我一开始据此误判了 6 个存在的头。
+23. **猜 `PKPK` / `MEAN`** → 这两个测量项不存在（`113`）。可用项是 `RMS MAX MIN AMPL SDEV FREQ PER`。
+24. **把"轮询很快"当成"数据很新"** → 一次 STOP 后紧轮询 6 秒能读 3863 次，但只有 **1** 条 unique payload。速度不等于新鲜度，必须数 unique。
+25. **改时基后没重跑自检** → 本地 `repo/` 是残缺副本（缺 `Nanomax/afm_control.py`），离线自检必须在 PAM-NEW 上跑，否则 `[8]` 段会 ImportError 而看不出原因。

@@ -13,6 +13,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import struct
 import sys
+import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -295,6 +296,69 @@ def test_multi_settle():
     eq("an explicit settle wins", seen[-1], 0.4)
 
 
+def test_measure_engine():
+    """The instrument's own measurement engine: the fast scalar path."""
+    print("[12] measurement engine")
+    answers = {
+        ":MEASure:MODE?": ":MEAS:MODE ON",
+        ":MEASure:CHANnel1:RMS:VALue?": ":MEAS:CHAN1:RMS:VAL 1.234E-03",
+        ":MEASure:CHANnel2:MAX:VALue?": ":MEAS:CHAN2:MAX:VAL 3.000E-03",
+        ":MEASure:CHANnel1:MAX:VALue?": ":MEAS:CHAN1:MAX:VAL NAN",
+    }
+    scope = make_scope([], answers)
+
+    eq("measure_mode echoes the state", scope.measure_mode(True),
+       ":MEAS:MODE ON")
+    check("measure_mode writes the switch",
+          ":MEASure:MODE ON" in scope.transport.written)
+
+    pairs = scope.measure_on(items=("RMS",), channels=(1,))
+    eq("measure_on returns the enabled pairs", pairs, [(1, "RMS")])
+    check("measure_on clears the other items",
+          ":MEASure:CHANnel4:SDEV:STATe 0" in scope.transport.written,
+          scope.transport.written[-6:])
+    check("measure_on enables the requested item",
+          ":MEASure:CHANnel1:RMS:STATe 1" in scope.transport.written)
+
+    eq("measure_value parses the float", scope.measure_value(1, "RMS"), 1.234e-03)
+    check("measure_value maps NAN to nan",
+          scope.measure_value(1, "MAX") != scope.measure_value(1, "MAX"),
+          "nan should not equal itself")
+
+    scope.measure_on(items=("RMS", "MAX"), channels=(1, 2))
+    allv = scope.measure_all()
+    eq("measure_all keys by channel", sorted(allv), [1, 2])
+    eq("measure_all keys by item", sorted(allv[2]), ["MAX", "RMS"])
+    eq("measure_all reads ch2", allv[2]["MAX"], 3.000e-03)
+
+    scope.measure_off()
+    check("measure_off switches everything off",
+          ":MEASure:CHANnel2:MAX:STATe 0" in scope.transport.written)
+
+    # background poller
+    scope.measure_on(items=("RMS",), channels=(1,))
+    m = ds.MeasureStreamer(scope, channels=(1,), items=("RMS",), setup=False)
+    time.sleep(0.15)
+    vals, age = m.snapshot()
+    st = m.stats()
+    m.stop()
+    eq("MeasureStreamer publishes the value", vals.get(1, {}).get("RMS"), 1.234e-03)
+    check("MeasureStreamer reports an age", age is not None and age >= 0.0, age)
+    check("MeasureStreamer polls in a loop", st["polls"] > 1, st)
+
+    # adapter used by the Z loop
+    src = ds.MeasureSource(scope, item="RMS", channel=1)
+    got = src.value()
+    src.finish()
+    eq("MeasureSource returns (value, weight)", got, (1.234e-03, 1.0))
+    check("MeasureSource describes itself", "RMS" in src.describe(), src.describe())
+
+    from Tool_code import dlm_scope_cli as cli
+    args = cli.build_parser().parse_args(["--measure", "RMS", "--channels", "1,2"])
+    eq("cli accepts --measure", args.measure, "RMS")
+    eq("cli accepts --channels", args.channels, "1,2")
+
+
 def main():
     test_framing()
     test_xdr()
@@ -307,6 +371,7 @@ def main():
     test_error_paths()
     test_cli_window_helper()
     test_multi_settle()
+    test_measure_engine()
     print()
     if FAILED:
         print("SELFTEST FAILED: %d of %d checks failed" % (len(FAILED), COUNT[0]))

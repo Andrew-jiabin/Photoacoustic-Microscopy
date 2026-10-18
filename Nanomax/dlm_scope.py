@@ -46,6 +46,32 @@ What the instrument actually does  (measured 2026-10-18, DLM3034, FW 2.00)
   read after it is the same cached record -- verified by changing CH1's offset
   and VDIV and watching the payload not move.  Only START -> STOP gives a new
   record.
+* **Shrinking the window does not make it faster.**  Measured 2026-10-18: the
+  record refreshes at 2.21-2.26 Hz whether the window is 100 points or 12 500,
+  and whether the record is 125 points or 125 000.  The 0.45 s is the
+  instrument producing a *new* record, not the bytes being moved -- the LAN
+  moves 250 kB in 3-11 ms.  So "transfer a smaller chunk" buys bandwidth, not
+  latency.  Polling harder does not help either: after one :STOP a tight loop
+  gets 1.3 ms reads, but 6 s of it yielded exactly **one** distinct payload.
+* **Use the scope's own measurement engine when a number is enough.**  With
+  ``:MEASure:MODE ON`` the instrument computes RMS / MAX / MIN / AMPL / FREQ
+  itself and ``:MEASure:CHANnel<n>:<item>:VALue?`` returns it.  That query costs
+  ~0.4 ms (measured 2 400 queries/s), works **while the scope is running** (no
+  :STOP needed), and the number refreshes at 2-9.4 Hz depending on the record
+  length -- 5.9 Hz at TDIV 2 ms / 125 kpts, 9.4 Hz at TDIV 20 us / 1 250 pts.
+  That is 2.6-4.2x the waveform rate for ~1000x less I/O.  See
+  :class:`MeasureStreamer`.
+* The refresh rate is paced by the AUTO trigger timeout -- the manual (2.1)
+  says "timeout = max(100 ms, the time of 10 divisions)", and TDIV 50 ms
+  measured 1.98 Hz (511 ms) against a predicted 500 ms.  **At TDIV 2 us the
+  floor is ~103 ms, i.e. that same 100 ms.**  With a *real* trigger in NORM
+  mode the timeout never applies and the rate becomes the trigger rate, so the
+  ceiling above should rise once a signal is actually connected.
+* ``:MEASure:MODE`` defaults to **OFF** and every ``:VALue?`` then answers
+  ``NAN`` -- which looks like a broken command but is just a switched-off
+  feature.  Changing TDIV or RLEN *after* configuring measurements also sends
+  the values back to NAN: set the time base first, then call
+  :meth:`DlmScope.measure_on`.
 * ``:SYSTem:ERRor?`` does not exist on this firmware; the error queue is
   ``:STATus:ERRor?``.  A bad header pushes 113 into that queue and leaves the
   query unanswered, which shows up here as a read timeout, not as an error.
@@ -62,6 +88,13 @@ Contract
                            ``(waveform, age_s)`` in microseconds
 ``DlmScope.measure()``  -> dict of pk-pk / mean / rms, codes and volts
 ``ScopeSource``         -> ``value()`` adapter for ``Nanomax.afm_control``
+
+Fast scalar path (no waveform transfer, no :STOP):
+``DlmScope.measure_on()``    -> switch the instrument's own engine on
+``DlmScope.measure_value()`` -> one float, ~0.4 ms
+``MeasureStreamer``          -> background poller; ``snapshot()`` gives
+                                ``(values, age_s)`` at 2-9 Hz
+``MeasureSource``            -> ``value()`` adapter for ``Nanomax.afm_control``
 
 Units
 -----
@@ -85,9 +118,17 @@ import time
 
 __all__ = [
     "Vxi11Transport", "DlmScope", "Waveform", "Streamer", "ScopeSource",
+    "MeasureStreamer", "MeasureSource",
     "RpcError", "VxiError", "ScopeError",
-    "CODES_PER_DIV", "MULTI_SETTLE_S", "block_payload",
+    "CODES_PER_DIV", "MULTI_SETTLE_S", "MEAS_ITEMS", "block_payload",
 ]
+
+#: Measurement items this firmware really exposes under
+#: ``:MEASure:<trace>:<item>:VALue?``.  Found by dumping ``:MEASure?`` (21
+#: traces x 36 items) and reading the error queue; note that ``PKPK`` and
+#: ``MEAN`` -- the two you would guess first -- answer
+#: ``113,"Undefined header"`` here.  Use ``AMPL`` / ``AVER`` instead.
+MEAS_ITEMS = ("RMS", "MAX", "MIN", "AMPL", "SDEV", "FREQ", "PER")
 
 #: 16-bit codes per vertical division.  See the module docstring: verify once.
 CODES_PER_DIV = 8192.0
@@ -436,8 +477,9 @@ class DlmScope(object):
         self._srate = 0.0
         self._vdivs = {}
         self._last = None
+        self._meas = []            #: (channel, item) pairs enabled by measure_on
         self.stats = {"reads": 0, "rearm_s": 0.0, "transfer_s": 0.0, "empty": 0,
-                      "misaligned": 0}
+                      "misaligned": 0, "meas": 0}
 
     # -- lifecycle --------------------------------------------------------
     def open(self):
@@ -733,6 +775,60 @@ class DlmScope(object):
             wave = self.read(arm=arm)
         return wave.summary()
 
+    # -- the instrument's own measurement engine --------------------------
+    def measure_mode(self, on=True):
+        """Global ``:MEASure:MODE`` switch.
+
+        It ships **OFF**, and while it is off every ``:VALue?`` answers ``NAN``.
+        Turn it on before reading any value.
+        """
+        self.write(":MEASure:MODE %s" % ("ON" if on else "OFF"))
+        return self.query(":MEASure:MODE?").strip()
+
+    def measure_on(self, items=("RMS",), channels=(1,), clear=True):
+        """Enable the given ``(channel, item)`` pairs and return them.
+
+        Order matters: set ``:TIMebase:TDIV`` / ``:ACQuire:RLENgth`` **first**.
+        Touching the acquisition after this call sends every value back to NAN
+        (measured), so re-call :meth:`measure_on` after any timebase change.
+        """
+        self.measure_mode(True)
+        pairs = [(int(c), str(i).upper()) for c in channels for i in items]
+        if clear:
+            for ch in (1, 2, 3, 4):
+                for it in MEAS_ITEMS:
+                    self.write(":MEASure:CHANnel%d:%s:STATe 0" % (ch, it))
+        for ch, it in pairs:
+            self.write(":MEASure:CHANnel%d:%s:STATe 1" % (ch, it))
+        self._meas = pairs
+        return list(pairs)
+
+    def measure_off(self):
+        """Switch every item off again (the engine itself stays ON)."""
+        for ch in (1, 2, 3, 4):
+            for it in MEAS_ITEMS:
+                self.write(":MEASure:CHANnel%d:%s:STATe 0" % (ch, it))
+        self._meas = []
+        return []
+
+    def measure_value(self, channel=1, item="RMS"):
+        """One scalar, as a float.  ``nan`` means "no valid measurement yet".
+
+        Costs ~0.4 ms (measured ~2 400 queries/s).  The *value* itself refreshes
+        at the instrument's own pace, 2-9.4 Hz -- see the module docstring.
+        Works while the scope is running; no :STOP required.
+        """
+        self.stats["meas"] += 1
+        return self.query_float(":MEASure:CHANnel%d:%s:VALue?"
+                                % (int(channel), str(item).upper()))
+
+    def measure_all(self):
+        """``{channel: {item: value}}`` for whatever :meth:`measure_on` enabled."""
+        out = {}
+        for ch, it in getattr(self, "_meas", [(1, "RMS")]):
+            out.setdefault(ch, {})[it] = self.measure_value(ch, it)
+        return out
+
 
 # --------------------------------------------------------------------------- #
 # Background streaming
@@ -861,6 +957,217 @@ class Streamer(object):
         return {"records": n, "age_s": age, "points": spans[-1] if spans else 0,
                 "errors": errors,
                 "rate_hz": (n / elapsed) if elapsed > 0 else 0.0}
+
+
+# --------------------------------------------------------------------------- #
+# Fast scalar streaming: the instrument computes, we only read a number
+# --------------------------------------------------------------------------- #
+
+class MeasureStreamer(object):
+    """Poll the scope's own measurement engine in a background thread.
+
+    This is the answer to "I need the *current* value, not a big block of
+    samples".  One poll is one tiny SCPI query -- measured 0.41 ms, about
+    2 400 queries/s -- so the thread can loop far above the value's own refresh
+    rate and always publish the newest number.  The control loop calls
+    :meth:`snapshot` and gets an answer in microseconds; the age comes with it,
+    so the loop can decide whether the value is fresh enough.
+
+    Measured on the DLM3034 (2026-10-18), one item on CH1:
+
+    ============================  ===========  =================
+    time base / record            value rate   waveform rate
+    ============================  ===========  =================
+    TDIV 2 ms,   125 000 points   5.9 Hz       2.24 Hz
+    TDIV 200 us,  12 500 points   7.3 Hz       2.26 Hz
+    TDIV 20 us,    1 250 points   9.4 Hz       2.26 Hz
+    TDIV 50 ms,  125 000 points   2.0 Hz       2.26 Hz
+    ============================  ===========  =================
+
+    ::
+
+        with DlmScope(host) as scope:
+            with MeasureStreamer(scope, channels=(1,), items=("RMS",)) as m:
+                while running:
+                    values, age = m.snapshot()   # {1: {"RMS": 3.1e-4}}, 0.02
+                    ...
+    """
+
+    def __init__(self, scope, channels=(1,), items=("RMS",), interval=0.0,
+                 autostart=True, setup=True):
+        self.scope = scope
+        self.channels = tuple(int(c) for c in channels)
+        self.items = tuple(str(i).upper() for i in items)
+        self.interval = float(interval)
+        self._thread = None
+        self._stop = None
+        self._lock = None
+        self._values = {}
+        self._stamp = 0.0
+        self._count = 0
+        self._changes = 0
+        self._last_sig = None
+        self._changed_at = 0.0
+        self._errors = []
+        self._t_start = time.time()
+        if setup:
+            scope.measure_on(items=self.items, channels=self.channels)
+        if autostart:
+            self.start()
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self):
+        if self._thread is not None:
+            return self
+        import threading
+        self._t_start = time.time()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run)
+        self._thread.daemon = True
+        self._thread.start()
+        return self
+
+    def stop(self):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        return self
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+
+    # -- worker -----------------------------------------------------------
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                vals = {}
+                for ch in self.channels:
+                    vals[ch] = {}
+                    for it in self.items:
+                        vals[ch][it] = self.scope.measure_value(ch, it)
+                if any(not _isnan(v) for d in vals.values()
+                       for v in d.values()):
+                    sig = repr(sorted((c, i, vals[c][i])
+                                      for c in vals for i in vals[c]))
+                    with self._lock:
+                        self._values = vals
+                        self._stamp = time.time()
+                        if sig != self._last_sig:
+                            self._last_sig = sig
+                            self._changes += 1
+                            self._changed_at = self._stamp
+                        self._count += 1
+            except Exception as exc:            # never kill the thread
+                self._errors.append("%s: %s" % (type(exc).__name__, exc))
+                if len(self._errors) > 20:
+                    self._errors = self._errors[-20:]
+            if self.interval > 0:
+                self._stop.wait(self.interval)
+
+    # -- consumer side ----------------------------------------------------
+    def snapshot(self):
+        """``(values, age_s)`` -- ``values`` is ``{channel: {item: float}}``.
+
+        ``age_s`` is the time since the last *successful poll*, i.e. proof that
+        the link is alive.  The number itself cannot be older than the scope's
+        own refresh period (~100-200 ms, see :meth:`stats`'s ``value_hz``), so
+        treat that as the worst-case staleness of a control decision.
+        """
+        with self._lock:
+            return dict((c, dict(d)) for c, d in self._values.items()), \
+                (time.time() - self._stamp) if self._stamp else None
+
+    def latest(self):
+        """Just the values, no age."""
+        return self.snapshot()[0]
+
+    def rate(self):
+        """How often the value actually *changed*, in Hz (its real refresh)."""
+        with self._lock:
+            if self._count < 2 or not self._stamp:
+                return 0.0
+            return self._changes / max(time.time() - self._t0(), 1e-9)
+
+    def _t0(self):
+        return getattr(self, "_t_start", None) or self._stamp or time.time()
+
+    def stats(self):
+        with self._lock:
+            elapsed = time.time() - self._t0() if self._stamp else 0.0
+        now = time.time()
+        return {"polls": self._count, "changes": self._changes,
+                "poll_hz": (self._count / elapsed) if elapsed > 0 else 0.0,
+                "value_hz": (self._changes / elapsed) if elapsed > 0 else 0.0,
+                "age_s": (now - self._stamp) if self._stamp else None,
+                "change_age_s": (now - self._changed_at) if self._changed_at else None,
+                "errors": list(self._errors)}
+
+
+def _isnan(x):
+    try:
+        return x != x
+    except Exception:
+        return True
+
+
+class MeasureSource(object):
+    """Present one measurement item as a ``value()`` source for the AFM Z loop.
+
+    Drop-in replacement for :class:`ScopeSource` when the loop needs a number
+    and not a trace: ~0.4 ms per read instead of ~450 ms, and 2-9 Hz instead of
+    ~2.2 Hz.  ``item`` is any of :data:`MEAS_ITEMS`; ``RMS`` or ``AMPL`` are the
+    sensible choices for an ultrasound amplitude criterion.
+    """
+
+    REQUIRED = ("value",)
+    OPTIONAL = ("prepare", "finish", "describe", "ready", "unit")
+
+    def __init__(self, scope, item="RMS", channel=1, autostart=True):
+        self.scope = scope
+        self.item = str(item).upper()
+        self.channel = int(channel)
+        self.unit = "V"
+        self._opened_here = False
+        if self.scope.transport is None:
+            self.scope.open()
+            self._opened_here = True
+        self.streamer = MeasureStreamer(scope, channels=(self.channel,),
+                                        items=(self.item,), autostart=autostart)
+
+    # -- contract ---------------------------------------------------------
+    def value(self):
+        vals, age = self.streamer.snapshot()
+        d = vals.get(self.channel, {})
+        x = d.get(self.item)
+        if x is None or _isnan(x):
+            return None
+        return float(x), 1.0
+
+    def describe(self):
+        return "DLM3034 ch%d %s [V, measurement engine]" % (self.channel,
+                                                            self.item)
+
+    def ready(self):
+        vals, _ = self.streamer.snapshot()
+        return bool(vals)
+
+    def prepare(self):
+        if self.scope.transport is None:
+            self.scope.open()
+            self._opened_here = True
+        self.streamer.start()
+
+    def finish(self):
+        self.streamer.stop()
+        if self._opened_here:
+            self.scope.close()
+            self._opened_here = False
 
 
 # --------------------------------------------------------------------------- #

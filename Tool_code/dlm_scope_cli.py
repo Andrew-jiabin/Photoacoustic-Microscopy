@@ -10,6 +10,7 @@ mojibake or a UnicodeEncodeError.
     python -m Tool_code.dlm_scope_cli --stream 5
     python -m Tool_code.dlm_scope_cli --save rec.csv --window 0 9999
     python -m Tool_code.dlm_scope_cli --source pkpk
+    python -m Tool_code.dlm_scope_cli --measure RMS --follow 10
 
 Default host is 192.168.1.100 (what the DLM3034 reports on the lab router).
 """
@@ -24,10 +25,12 @@ import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from Nanomax.dlm_scope import (DlmScope, ScopeSource, Streamer,
+    from Nanomax.dlm_scope import (DlmScope, MeasureSource, MeasureStreamer,
+                                   ScopeSource, Streamer, MEAS_ITEMS,
                                    VxiError, RpcError)
 else:
-    from Nanomax.dlm_scope import (DlmScope, ScopeSource, Streamer,
+    from Nanomax.dlm_scope import (DlmScope, MeasureSource, MeasureStreamer,
+                                   ScopeSource, Streamer, MEAS_ITEMS,
                                    VxiError, RpcError)
 
 DEFAULT_HOST = "192.168.1.100"
@@ -177,6 +180,76 @@ def do_follow(scope, args):
             print("errors    %s" % st["errors"])
 
 
+def do_measure(scope, args):
+    """Read the instrument's own measurement engine -- the fast scalar path.
+
+    No waveform transfer, no :STOP.  One query costs ~0.4 ms and the number
+    refreshes at 2-9 Hz depending on the record length, against 2.2 Hz for a
+    whole record.
+    """
+    items = tuple(i.strip().upper() for i in args.measure.split(",") if i.strip())
+    chans = tuple(int(c) for c in args.channels.split(",") if c.strip())
+    scope.write(":TIMebase:TDIV %s" % args.tdiv)
+    scope.write(":ACQuire:RLENgth %d" % args.rlen)
+    time.sleep(0.5)                 # the timebase change has to settle first
+    scope.measure_on(items=items, channels=chans)
+    print("measure: channels %s items %s  (TDIV %s, RLEN %d)"
+          % (",".join(str(c) for c in chans), ",".join(items),
+             args.tdiv, args.rlen))
+    print("  srate %s" % scope.query(":TIMebase:SRATe?").strip())
+
+    if args.follow is None:
+        for ch in chans:
+            for it in items:
+                t0 = time.time()
+                x = scope.measure_value(ch, it)
+                print("  ch%d %-5s = %-16.9g   (%.2f ms)"
+                      % (ch, it, x, (time.time() - t0) * 1e3))
+        return
+
+    secs = float(args.follow)
+    print()
+    print("follow %.1f s -- only *changes* are printed, so the rate below is"
+          % secs)
+    print("the real refresh rate of the instrument, not the poll rate")
+    with MeasureStreamer(scope, channels=chans, items=items, setup=False) as m:
+        t0 = time.time()
+        last, stamps, ages = None, [], []
+        while time.time() - t0 < secs:
+            vals, age = m.snapshot()
+            ages.append(age)
+            sig = repr(sorted((c, i, vals.get(c, {}).get(i))
+                              for c in chans for i in items))
+            if vals and sig != last:
+                last = sig
+                now = time.time() - t0
+                stamps.append(now)
+                print("  t=%6.2f  age %5.3f s  %s"
+                      % (now, age if age is not None else -1.0,
+                         "  ".join("ch%d.%s=%.6g" % (c, i, vals.get(c, {}).get(i))
+                                   for c in chans for i in items)))
+            time.sleep(0.005)
+        st = m.stats()
+    print()
+    if len(stamps) > 1:
+        gaps = [(b - a) * 1e3 for a, b in zip(stamps, stamps[1:])]
+        print("values    %d changes in %.1f s -> %.2f Hz (median gap %.1f ms)"
+              % (len(stamps) - 1, stamps[-1],
+                 (len(stamps) - 1) / stamps[-1], statistics.median(gaps)))
+    else:
+        print("values    %d (not enough to derive a rate)" % len(stamps))
+    print("polls     %d -> %.0f queries/s (each ~0.4 ms, none of them blocks)"
+          % (st["polls"], st["poll_hz"]))
+    fresh = [a for a in ages if a is not None]
+    if fresh:
+        print("age       median %.3f s  max %.3f s (time since the last poll)"
+              % (statistics.median(fresh), max(fresh)))
+    print("staleness worst case = one refresh gap = %.0f ms, not the poll rate"
+          % (1000.0 / st["value_hz"] if st["value_hz"] else 0.0))
+    if st["errors"]:
+        print("errors    %s" % st["errors"][:3])
+
+
 def _window(args):
     if args.window is None:
         return None
@@ -207,13 +280,23 @@ def build_parser():
                    help="stream continuously for SECONDS through a background thread")
     p.add_argument("--source", metavar="STAT",
                    help="exercise the afm_control adapter: pkpk/rms/mean/min/max")
+    p.add_argument("--measure", metavar="ITEMS",
+                   help="read the instrument's measurement engine instead of a "
+                        "waveform, e.g. RMS or RMS,MAX,AMPL (no :STOP needed)")
+    p.add_argument("--channels", default="1",
+                   help="channels for --measure, e.g. 1 or 1,2,3,4 (default 1)")
+    p.add_argument("--tdiv", default="2E-3",
+                   help="time base for --measure (default 2E-3); shorter records "
+                        "refresh faster, 20E-6 gives the ~100 ms floor")
+    p.add_argument("--rlen", type=int, default=125000,
+                   help="record length for --measure (default 125000)")
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if not any((args.check, args.bench, args.stream, args.save, args.source,
-                args.follow is not None)):
+                args.measure, args.follow is not None)):
         args.check = True
     try:
         with DlmScope(args.host, channel=args.channel) as scope:
@@ -225,7 +308,9 @@ def main(argv=None):
                 do_stream(scope, args)
             if args.save:
                 do_save(scope, args)
-            if args.follow is not None:
+            if args.measure:
+                do_measure(scope, args)
+            elif args.follow is not None:
                 do_follow(scope, args)
             if args.source:
                 do_source(scope, args)
