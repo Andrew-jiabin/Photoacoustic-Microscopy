@@ -510,11 +510,23 @@ class _PythonPi:
         # lets the error grow (wrong sign, runaway) or never improves (probe far
         # away, no coupling at all).  Without both checks the loop would quietly
         # grind through the whole travel budget and report a bogus point.
+        #
+        # Only steps taken *towards* the surface count as evidence of a dead
+        # loop.  A step away from it cannot be: when the probe starts inside the
+        # sample (a retract that was too small for the next point's height) the
+        # reading is clipped at its maximum, so "no improvement" is exactly what
+        # a correct retreat looks like.  ``sign`` is the sign of
+        # d(reading)/dZ, so the only steps that are *not* retreating have
+        # ``dz * sign >= 0``; a zero-length step counts too, which is what keeps
+        # a gains-off guard check honest.  (The weaker condition
+        # ``dz * sign * e > 0`` is useless here: a correctly wired loop always
+        # moves in the direction that reduces |e|.)
         e_abs = abs(e)
+        toward = 1 if (dz * cfg.sign) >= 0.0 else 0
         if e_abs < self.e_best:
             self.e_best = e_abs      # monotone ratchet: noise cannot fake progress
             self.stall = 0
-        else:
+        elif toward:
             self.stall += 1
 
         if e_abs > self.e_abs_start * 1.5 + cfg.deadband:

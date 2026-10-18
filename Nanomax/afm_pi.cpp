@@ -305,12 +305,24 @@ AFM_PI_EXPORT int afm_pi_step(void* handle, double setpoint, double measurement,
     // lets the error grow (wrong sign, runaway) or never improves (probe far
     // away, no coupling at all).  Without both checks the loop would quietly
     // grind through the whole travel budget and report a bogus point.
+    //
+    // Only steps taken *towards* the surface count as evidence of a dead loop.
+    // A step away from it cannot be: when the probe starts inside the sample
+    // (a retract that was too small for the next point's height) the reading
+    // is clipped at its maximum, so "no improvement" is exactly what a correct
+    // retreat looks like.  ``sign`` is the sign of d(reading)/dZ, so the only
+    // steps that are *not* retreating have ``dz * sign >= 0``; a zero-length
+    // step counts too, which is what keeps a gains-off guard check honest.
+    // (Note the weaker condition ``dz * sign * e > 0`` is useless here: a
+    // correctly wired loop always moves in the direction that reduces |e|, so
+    // it would always be true.)
     const double e_abs = std::fabs(e);
+    const int toward = ((dz * cfg.sign) >= 0.0) ? 1 : 0;
 
     if (e_abs < st->e_best) {
         st->e_best = e_abs;      // monotone ratchet: noise cannot fake progress
         st->stall = 0;
-    } else {
+    } else if (toward) {
         st->stall += 1;
     }
 
@@ -400,7 +412,7 @@ AFM_PI_EXPORT void afm_pi_destroy(void* handle) {
 }
 
 AFM_PI_EXPORT const char* afm_pi_version(void) {
-    return "afm_pi 1.3 (incremental PI, C++/C ABI)";
+    return "afm_pi 1.4 (incremental PI, C++/C ABI)";
 }
 
 // Deterministic closed-loop check, so the Python side can prove that the DLL it

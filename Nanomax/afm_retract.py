@@ -372,6 +372,39 @@ def constant_map(height_um=0.0, name="flat"):
 
 
 # --------------------------------------------------------------------------- #
+# How big a lift a known shape needs
+# --------------------------------------------------------------------------- #
+
+def dome_rise(height_um, radius_um, pitch_um):
+    """Worst protrusion gain between two neighbouring points on a cell.
+
+    A cell is modelled as a Gaussian bump ``h(x) = H exp(-x^2 / (2 s^2))`` with
+    ``radius_um`` taken as the 1/e radius ``s``.  Its steepest slope is at
+    ``x = s``, where ``|dh/dx| = H / (s sqrt(e))``, so a scan at ``pitch_um``
+    can climb at most
+
+        ``rise = H * pitch / (s * sqrt(e))``
+
+    between two points.  Feeding that number to ``retract_um`` (or to
+    ``PAM_AFM_RETRACT_UM``) is what makes a reactive policy safe on a dome: the
+    ``slope`` policy has to *see* a flank before it can follow it, and the very
+    first step onto the flank is blind.  A two-level target does not need this
+    at all -- there the answer is simply the step height.
+
+    The result is a conservative bound, not an exact value: it assumes the
+    steepest part of the bump falls between two sample points.
+    """
+    height_um = abs(float(height_um))
+    radius_um = abs(float(radius_um))
+    pitch_um = abs(float(pitch_um))
+    if radius_um <= 0.0 or not math.isfinite(radius_um):
+        raise ValueError("dome radius must be positive, got %r" % (radius_um,))
+    if pitch_um <= 0.0 or not math.isfinite(pitch_um):
+        raise ValueError("pitch must be positive, got %r" % (pitch_um,))
+    return height_um * pitch_um / (radius_um * math.sqrt(math.e))
+
+
+# --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
 

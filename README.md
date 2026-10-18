@@ -162,13 +162,27 @@ reports a bogus point, so both failure modes are detected:
 | guard | condition | meaning |
 | --- | --- | --- |
 | `diverged` | `|e| > 1.5*|e_start| + deadband` for 8 steps | wrong sign, runaway |
-| `stalled` | no new minimum `|e|` for `stall_steps` | probe too far, no coupling |
+| `stalled` | no new minimum `|e|` for `stall_steps`, counting only steps that are **not** retreating | probe too far, no coupling |
 
 The stall test uses a **monotone ratchet** (`e_best` only ever decreases), so
 noise riding on a constant reading cannot fake progress. `stall_steps` is not a
 fixed constant: it is derived from `pi_stall_um / dz_limit_um`, because a
 *saturated* reading is flat too, and backing out of saturation needs a blind
 allowance comfortably larger than the retract distance.
+
+Only steps that are **not retreating** count towards `stalled` (`dz * sign >= 0`,
+where `sign` is the sign of `d(reading)/dZ`). A step away from the surface cannot
+be evidence of a dead loop: when the retract was smaller than the next point's
+height the probe *starts* inside the sample, the reading is clipped at its
+maximum, and "no improvement" is exactly what a correct retreat looks like. Before
+that exemption, a 5 µm cell dome scanned with the old 0.5 µm lift lost 5 of 13
+points to `stalled` — not a crash, but a hole in the image. A zero-length step
+still counts, which is what keeps the gains-off guard check in the selftest
+honest.
+
+Note the weaker-looking condition `dz * sign * e > 0` is useless here: a
+correctly wired loop always moves in the direction that reduces `|e|`, so it
+would always be true.
 
 ### Blind search
 
@@ -281,7 +295,7 @@ set PAM_AFM_RETRACT_MAP=file:surface.csv :: only for policy=map
 | --- | --- | --- |
 | `fixed` | always `retract_um` | old behaviour, a flat sample |
 | `running_max` | deepest Z seen so far + margin | anything that only ever gets higher |
-| `slope` | local height slope × distance to the next point | a dome, with no map |
+| `slope` | local height slope × distance to the next point | a dome, with no map (lags one point — see below) |
 | `map` | `h(next) - h(here) + margin` | a known step, cleared *before* stepping onto it |
 | `auto` | max of fixed + running_max + slope | default; never less than the old constant |
 
@@ -299,6 +313,35 @@ The property that matters is not "the lift looks reasonable" but "at the moment
 XY moves, Z clears the next point". `Tool_code/test_afm_offline.py` asserts
 exactly that on a stepped surface: with `map` the probe clears all four moves,
 with `fixed` it clears one — which is why the policy exists.
+
+The same test then scans a **cell dome** (5 µm high, 4 µm 1/e radius, 2 µm pitch,
+13 points) with every policy and counts the moves where Z was still inside the
+next point when XY moved:
+
+| policy | moves inside the sample |
+| --- | --- |
+| `fixed` 0.5 µm | 3 / 12 |
+| `slope` | 3 / 12, and all of them on the ascent |
+| `auto` | 1 / 12 |
+| `map` | 0 / 12 |
+| `fixed` with `retract_um = dome_rise(...)` | 0 / 12 |
+
+That is the honest answer for a cell: a **reactive** policy cannot be right on a
+convex flank, because the least-squares slope underestimates the *next* rise and
+is therefore always one point late. `auto` only wins the descent, where
+`running_max` still remembers the apex. So on a dome, either supply a map or
+compute the floor from the geometry:
+
+```python
+from Nanomax.afm_retract import dome_rise
+dome_rise(height_um=5.0, radius_um=4.0, pitch_um=2.0)   # 1.516 um
+```
+
+`dome_rise` returns `H * pitch / (r * sqrt(e))`: the worst climb between two
+neighbouring points of `H exp(-x^2 / (2 r^2))`, assuming the steepest part of the
+bump falls between two sample points. It is a bound, not an estimate, which is
+what a safety floor should be. A two-level target needs no such helper — the
+number is the bar height, and a `fixed` lift of that size clears every move.
 
 ### Trigger-free acquisition
 
@@ -418,7 +461,7 @@ scan or changes a laser state; the two marked **Moves stages** do move hardware.
 | `Tool_code/acceptance_prior_nanomax_nolaser.py` | Laser-free entry-point self-check, no hardware needed | None |
 | `Tool_code/nanomax_motion_debug_panel.py` | Interactive motion-only panel | **Moves stages** |
 | `Tool_code/validate_laser_panel_no_hardware.py` | Import check for the laser panel | None |
-| `Tool_code/test_afm_offline.py` | AFM engine + PI controller + the two interfaces, 128 checks | None |
+| `Tool_code/test_afm_offline.py` | AFM engine + PI controller + the three interfaces + both sample shapes, 142 checks | None |
 | `python -m Nanomax.afm_pi --selftest` | C++/Python controller agreement | None |
 | `python -m Nanomax.afm_pi --compare` | 200-step bit-exact DLL vs reference | None |
 | `PAM_Main_Nanomax_AFM.py --dry-run` | Full AFM loop on a synthetic surface | None |
@@ -508,7 +551,7 @@ make the deployment reproducible; replace them for a different installation.
 │   ├── acceptance_nanomax_prior.py     # guarded stage acceptance check
 │   ├── acceptance_prior_nanomax_nolaser.py # laser-free entry-point self-check
 │   ├── nanomax_motion_debug_panel.py   # motion-only interactive panel
-│   ├── test_afm_offline.py             # 128 offline checks for the AFM path
+│   ├── test_afm_offline.py             # 142 offline checks for the AFM path
 │   ├── build_afm_pi.py                 # compiler-agnostic DLL build
 │   ├── example_control_source.py       # template for a custom Z criterion
 │   ├── example_height_map.csv          # template for a surface height map

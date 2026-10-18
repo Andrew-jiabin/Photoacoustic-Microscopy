@@ -916,7 +916,38 @@ class TwoLevelSurface:
         return self.amp_max * math.exp(-gap / self.rise_um)
 
 
-def _scan_line(surface, policy, xs, retract_um=0.5, map_fn=None):
+class DomeSurface:
+    """A Gaussian bump -- a cell.
+
+    ``height`` is the apex protrusion and ``sigma`` its 1/e radius, in the same
+    *protrusion* convention as :class:`TwoLevelSurface`: the top of the bump is
+    met at a *lower* stage Z, so staying put while XY moves onto the flank means
+    the probe is already inside the sample.
+    """
+
+    def __init__(self, height=5.0, sigma=4.0, rise_um=0.3, amp_max=1.0, sign=1.0):
+        self.height = float(height)
+        self.sigma = float(sigma)
+        self.rise_um = float(rise_um)
+        self.amp_max = float(amp_max)
+        self.sign = 1.0 if sign >= 0 else -1.0
+        self.x = 0.0
+
+    def protrusion(self, x=None):
+        x = self.x if x is None else float(x)
+        return self.height * math.exp(-0.5 * (x / self.sigma) ** 2)
+
+    def contact_z(self, x=None):
+        return -self.sign * self.protrusion(x)
+
+    def amplitude(self, z):
+        gap = (self.contact_z() - z) * self.sign
+        if gap <= 0:
+            return self.amp_max
+        return self.amp_max * math.exp(-gap / self.rise_um)
+
+
+def _scan_line(surface, policy, xs, retract_um=0.5, map_fn=None, **extra):
     """Walk a line of points the way run_scan() does; return (results, lifts)."""
     stage = FakeStage(z0=-1.0)
     surface.x = xs[0]
@@ -927,6 +958,7 @@ def _scan_line(surface, policy, xs, retract_um=0.5, map_fn=None):
         retract_policy=policy, retract_map=map_fn,
         approach_speed_um_s=1.0, final_speed_um_s=0.0,
         pi_max_steps=300, max_approach_s=0.0,
+        **extra
     )
     scanner = AfmScanner(stage, lambda: (surface.amplitude(stage.z), 50.0),
                          config, clock=FakeClock())
@@ -1052,6 +1084,103 @@ def test_retract_policies():
 
 
 # --------------------------------------------------------------------------- #
+# The two sample shapes the user actually scans
+# --------------------------------------------------------------------------- #
+
+def test_two_sample_archetypes():
+    print("\n[25] a cell dome and a two-level target need different answers")
+
+    # A cell: 5 um high, 1/e radius 4 um, scanned on a 2 um pitch.  The model
+    # does not simulate a crash -- it measures whether Z was already inside the
+    # *next* point at the moment XY moved, which is the event that breaks a
+    # probe.
+    dome = DomeSurface(height=5.0, sigma=4.0)
+    xs = [float(v) for v in range(-12, 14, 2)]      # 13 points, -12 .. +12
+
+    rises = [dome.protrusion(xs[i + 1]) - dome.protrusion(xs[i])
+             for i in range(len(xs) - 1)]
+    worst = max(rises)
+    check("the dome climbs %.2f um between neighbouring points" % worst,
+          1.0 < worst < 2.0, "rises %s" % " ".join("%.2f" % r for r in rises))
+
+    # The conservative analytic bound is the number a user should feed to
+    # retract_um: it assumes the steepest part of the bump falls between two
+    # sample points, so it is never optimistic.
+    bound = afm_retract.dome_rise(5.0, 4.0, 2.0)
+    check("dome_rise bounds the sampled climb", bound >= worst - 1e-9,
+          "bound %.3f um vs sampled %.3f um" % (bound, worst))
+    check("dome_rise rejects a zero radius",
+          _raises(afm_retract.dome_rise, 5.0, 0.0, 2.0))
+    check("dome_rise rejects a zero pitch",
+          _raises(afm_retract.dome_rise, 5.0, 4.0, 0.0))
+
+    def _misses(cursors, surface, xs_line):
+        """Indices where Z was NOT clear of the next point when XY moved."""
+        return [i for i, z in enumerate(cursors[:-1])
+                if not (z <= surface.contact_z(xs_line[i + 1]) - 0.05 + 1e-9)]
+
+    def _run(policy, surface, xs_line, retract_um=0.5, map_fn=None):
+        results, _lifts, cursors = _scan_line(surface, policy, xs_line,
+                                              retract_um=retract_um,
+                                              map_fn=map_fn)
+        return results, _misses(cursors, surface, xs_line)
+
+    # 1. The old constant: fine on a flat surface, blind on a dome.
+    results_fixed, miss_fixed = _run("fixed", dome, xs, retract_um=0.5)
+    check("every dome point still reaches the setpoint", all(r.ok for r in results_fixed),
+          ",".join(r.reason for r in results_fixed))
+    check("a fixed 0.5 um lift does not clear a cell dome",
+          len(miss_fixed) >= 3,
+          "%d/%d moves inside the sample: %s"
+          % (len(miss_fixed), len(xs) - 1, miss_fixed))
+
+    # 2. The reactive slope policy: on a convex flank the least-squares slope
+    #    underestimates the *next* rise, so the lift is systematically one point
+    #    late.  It must not be sold as a cure -- only lookahead is.
+    _results_slope, miss_slope = _run("slope", dome, xs, retract_um=0.5)
+    check("the slope policy still leaves points inside the sample",
+          len(miss_slope) >= 1,
+          "%d still inside: %s" % (len(miss_slope), miss_slope))
+    check("its misses are all on the ascending flank",
+          all(xs[i] < 0.0 for i in miss_slope),
+          "misses at x = %s" % [xs[i] for i in miss_slope])
+
+    # 3. A map: exact, because the lift is computed from the *next* point.
+    results_map, miss_map = _run("map", dome, xs, retract_um=0.5,
+                                 map_fn=lambda x, _y: dome.protrusion(x))
+    check("a height map clears every move over the dome",
+          all(r.ok for r in results_map) and not miss_map,
+          "%d misses" % len(miss_map))
+
+    # 4. No map, but retract_um set from dome_rise: also clears, because the
+    #    lift is now bigger than the worst climb the surface can present.
+    _results_roomy, miss_roomy = _run("fixed", dome, xs, retract_um=bound + 0.05)
+    check("retract_um from dome_rise clears every move",
+          not miss_roomy, "%d misses" % len(miss_roomy))
+
+    # 5. The other archetype.  A two-level target is a step, not a flank: a
+    #    slope policy never sees it coming, and the only inputs that work are
+    #    the step height (known) or a map.
+    step = TwoLevelSurface(step_x=2.0, height=1.5)
+    xs_step = [0.0, 1.0, 2.0, 3.0, 4.0]
+    _results_step_slope, miss_step_slope = _run("slope", step, xs_step, retract_um=0.5)
+    check("the slope policy cannot clear a step", len(miss_step_slope) >= 1,
+          "%d/%d inside" % (len(miss_step_slope), len(xs_step) - 1))
+    _results_step_tall, miss_step_tall = _run("fixed", step, xs_step, retract_um=1.55)
+    check("a lift equal to the step height clears a two-level target",
+          not miss_step_tall, "%d misses" % len(miss_step_tall))
+
+    # 6. auto is the default.  It beats a fixed lift only because running_max
+    #    remembers the apex for the descent; it still cannot see the ascent.
+    _results_auto, miss_auto = _run("auto", dome, xs, retract_um=0.5)
+    check("auto beats a fixed lift on the dome",
+          len(miss_auto) < len(miss_fixed),
+          "auto %d vs fixed %d" % (len(miss_auto), len(miss_fixed)))
+    check("but auto still leaves the first steep step exposed",
+          len(miss_auto) >= 1, "%d still inside" % len(miss_auto))
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -1085,6 +1214,7 @@ def main():
         test_control_source_interface,
         test_approach_speed_is_a_rate,
         test_retract_policies,
+        test_two_sample_archetypes,
     ):
         test()
 
