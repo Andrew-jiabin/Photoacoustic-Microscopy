@@ -377,13 +377,30 @@ AFM_PI_EXPORT int afm_pi_set_gains(void* handle, double kp, double ki) {
     return ST_OK;
 }
 
+// Change the per-step travel cap without disturbing the loop state.
+//
+// The caller uses this to hold a *speed* rather than a step size: it passes
+// ``speed_um_s * dt`` measured over the step that just finished, so the loop
+// closes at the requested um/s no matter how long a step actually took (a
+// settle, a slow digitizer read, an OS hiccup).  Clamping a fixed step instead
+// would make the real speed drift with the loop period -- slow when the host is
+// slow, fast when it is idle -- which is exactly the behaviour that breaks
+// probes.
+AFM_PI_EXPORT int afm_pi_set_dz_limit(void* handle, double dz_limit_um) {
+    if (handle == nullptr) return ST_BADARG;
+    if (!is_finite_value(dz_limit_um) || dz_limit_um <= 0.0) return ST_BADARG;
+    afm_pi_state* st = static_cast<afm_pi_state*>(handle);
+    st->cfg.dz_limit_um = dz_limit_um;
+    return ST_OK;
+}
+
 AFM_PI_EXPORT void afm_pi_destroy(void* handle) {
     if (handle == nullptr) return;
     delete static_cast<afm_pi_state*>(handle);
 }
 
 AFM_PI_EXPORT const char* afm_pi_version(void) {
-    return "afm_pi 1.2 (incremental PI, C++/C ABI)";
+    return "afm_pi 1.3 (incremental PI, C++/C ABI)";
 }
 
 // Deterministic closed-loop check, so the Python side can prove that the DLL it

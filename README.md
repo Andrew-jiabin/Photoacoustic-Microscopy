@@ -123,6 +123,12 @@ thermal drift are tracked instead of being a systematic error, and the Z travel
 per point is bounded by `retract_um + max_approach_um` no matter how long the
 scan runs.
 
+Three things are interfaces rather than constants, because they are the three
+things that change with the sample: **what** the Z decision is based on
+(`PAM_AFM_CONTROL_SOURCE`), **how fast** the gap may close
+(`PAM_AFM_APPROACH_SPEED_UM_S`), and **how high** to lift between points
+(`PAM_AFM_RETRACT_POLICY`). Each has its own section below.
+
 ### Incremental (velocity-form) PI
 
 The stage takes an absolute Z, but the decision the loop actually has to make is
@@ -205,6 +211,94 @@ The module must define `create_source(config)` returning an object with
 `value()` (see `Tool_code\example_control_source.py`). The number is compared
 against `PAM_AFM_SETPOINT` in the same unit, so nothing converts anything — the
 source owns its units.
+
+The contract lives in `Nanomax/afm_control.py` and is deliberately small:
+
+| member | required | meaning |
+| --- | --- | --- |
+| `value()` | yes | `number`, `(number, snr)`, or `None` |
+| `unit` | no | logging and metadata only |
+| `prepare()` / `finish()` | no | open / close the instrument |
+| `describe()` | no | one line for the run log |
+
+`None` or a NaN means **no valid reading**; the point then fails with
+`no_reading` instead of the loop acting on garbage. `adopt()` accepts a plain
+callable, an object with `measure()`, or a full source, so `create_source` can
+return `lambda: read_my_lockin()`. Adapters in the same module do the usual
+shaping: `ScaledSource` (gain/offset, so the setpoint keeps its meaning),
+`SmoothSource` (EMA or median — the honest alternative to widening the deadband,
+which hides noise by refusing to act and therefore biases the landing point).
+
+### Speed: slow towards the probe, fast away from it
+
+The dangerous motion is the one that closes the gap, so the closing rate is a
+**rate**, in µm/s, not a step size:
+
+```bat
+set PAM_AFM_APPROACH_SPEED_UM_S=1.0      :: far from the setpoint
+set PAM_AFM_FINAL_SPEED_UM_S=0.4         :: last 15% of the error
+set PAM_AFM_FINAL_BAND_FRAC=0.15
+set PAM_AFM_SEARCH_SPEED_UM_S=3.0        :: the blind phase, still capped
+```
+
+Each step the scanner calls `afm_pi_set_dz_limit(speed * measured_dt)`, so the
+closing rate is the same whether a step took 30 ms or 300 ms. A fixed µm/step
+limit is *not* a speed: at a 30 ms loop it means 1.7 µm/s and at 300 ms 0.17 µm/s,
+and the probe only cares about the first number. `dz_limit_um` remains as an
+absolute per-step backstop.
+
+Moving *away* is a single stage command at full speed with no settle — it is the
+one motion that cannot break anything, so there is nothing to ramp and nothing
+to wait for.
+
+"Careful" and "unusably slow" are the same code path, so the bound on slowness is
+explicit rather than hoped for:
+
+- `PAM_AFM_MAX_APPROACH_S` caps the wall-clock time per point (default 15 s).
+  A step count cannot do this, because the number of steps depends on the loop
+  period.
+- `check_config()` compares `max_approach_um / (speed × dt)` against
+  `pi_max_steps` and prints the worst-case cost before the scan starts, so a
+  rate limit that would turn every point into `max_steps` is visible up front
+  instead of looking like a broken probe.
+
+### Retract height is a policy, not a number
+
+How far to lift before the XY move depends on the sample: a **cell** is a dome
+(little lift on top, a lot at the rim) and a **resolution target** is two levels
+(nothing for most points, the full bar height on the one point that climbs). One
+constant cannot be right for both, so `Nanomax/afm_retract.py` makes it a
+function of *where we are going next*:
+
+```bat
+set PAM_AFM_RETRACT_POLICY=auto
+set PAM_AFM_RETRACT_UM=0.5               :: hard floor, never less than this
+set PAM_AFM_RETRACT_MARGIN_UM=0.05       :: clearance on top of the computed lift
+set PAM_AFM_RETRACT_MAP=file:surface.csv :: only for policy=map
+```
+
+| policy | lift | use |
+| --- | --- | --- |
+| `fixed` | always `retract_um` | old behaviour, a flat sample |
+| `running_max` | deepest Z seen so far + margin | anything that only ever gets higher |
+| `slope` | local height slope × distance to the next point | a dome, with no map |
+| `map` | `h(next) - h(here) + margin` | a known step, cleared *before* stepping onto it |
+| `auto` | max of fixed + running_max + slope | default; never less than the old constant |
+
+`retract_um` is a floor applied by the scanner itself, so a policy can only ever
+make the retract **bigger**. `max_retract_um` caps it, and the Z window clamps
+the result.
+
+The height map is **protrusion towards the probe**, not a stage Z: a cell top is
+positive, a gap between cells is zero. The same map then works for either
+`approach_sign`. CSV format is a header row of x values followed by
+`y,h,h,...`; blank cells or `nan` mean unknown and fall back to the floor. See
+`Tool_code\example_height_map.csv`.
+
+The property that matters is not "the lift looks reasonable" but "at the moment
+XY moves, Z clears the next point". `Tool_code/test_afm_offline.py` asserts
+exactly that on a stepped surface: with `map` the probe clears all four moves,
+with `fixed` it clears one — which is why the policy exists.
 
 ### Trigger-free acquisition
 
@@ -324,8 +418,9 @@ scan or changes a laser state; the two marked **Moves stages** do move hardware.
 | `Tool_code/acceptance_prior_nanomax_nolaser.py` | Laser-free entry-point self-check, no hardware needed | None |
 | `Tool_code/nanomax_motion_debug_panel.py` | Interactive motion-only panel | **Moves stages** |
 | `Tool_code/validate_laser_panel_no_hardware.py` | Import check for the laser panel | None |
-| `Tool_code/test_afm_offline.py` | AFM engine + PI controller, 85 checks | None |
+| `Tool_code/test_afm_offline.py` | AFM engine + PI controller + the two interfaces, 128 checks | None |
 | `python -m Nanomax.afm_pi --selftest` | C++/Python controller agreement | None |
+| `python -m Nanomax.afm_pi --compare` | 200-step bit-exact DLL vs reference | None |
 | `PAM_Main_Nanomax_AFM.py --dry-run` | Full AFM loop on a synthetic surface | None |
 
 ## Hardware Topology
@@ -398,6 +493,8 @@ make the deployment reproducible; replace them for a different installation.
 │   ├── acquisition_panel.py         # fixed acquisition dashboard
 │   ├── scan_utils.py                # range, step, pattern, and travel checks
 │   ├── afm_scan.py                  # approach/retract state machine
+│   ├── afm_control.py               # the Z criterion as a pluggable interface
+│   ├── afm_retract.py               # how high to lift between points
 │   ├── afm_pi.py                    # digital PI: ctypes binding + reference
 │   ├── afm_pi.cpp                   # the compiled controller (stable C ABI)
 │   ├── data_io.py                   # MAT packaging and safe save/rename
@@ -411,6 +508,10 @@ make the deployment reproducible; replace them for a different installation.
 │   ├── acceptance_nanomax_prior.py     # guarded stage acceptance check
 │   ├── acceptance_prior_nanomax_nolaser.py # laser-free entry-point self-check
 │   ├── nanomax_motion_debug_panel.py   # motion-only interactive panel
+│   ├── test_afm_offline.py             # 128 offline checks for the AFM path
+│   ├── build_afm_pi.py                 # compiler-agnostic DLL build
+│   ├── example_control_source.py       # template for a custom Z criterion
+│   ├── example_height_map.csv          # template for a surface height map
 │   ├── validate_laser_panel_no_hardware.py
 │   └── pam_scan_processing_src/     # vendored processing fallback source
 ├── MATLAB/                          # reconstruction and analysis scripts

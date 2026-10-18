@@ -16,6 +16,28 @@ tracks a setpoint rather than creeping until a threshold is crossed, so it does
 not care whether the signal rises or falls with Z, and it corrects in either
 direction.  ``PAM_AFM_CONTROL_MODE=stepped`` restores the old one-way creep.
 
+Three things are deliberately interfaces rather than constants
+--------------------------------------------------------------
+``PAM_AFM_CONTROL_SOURCE``
+    What the Z decision is based on.  Default is the digitizer amplitude; any
+    module implementing ``value()`` can replace it (``Nanomax.afm_control``), so
+    a processed signal from another instrument can drive Z without touching the
+    scan engine.
+
+``PAM_AFM_APPROACH_SPEED_UM_S`` / ``PAM_AFM_FINAL_SPEED_UM_S``
+    Closing speed in **um/s**, converted to a per-step distance with the
+    measured loop period, so the rate is the same at any host speed.  The last
+    ``PAM_AFM_FINAL_BAND_FRAC`` of the error is approached more slowly.  Moving
+    *away* from the probe is a single command at full stage speed: it is the one
+    motion that cannot break anything.
+
+``PAM_AFM_RETRACT_POLICY`` / ``PAM_AFM_RETRACT_MAP``
+    How far to lift before the XY move (``Nanomax.afm_retract``).  A cell is a
+    dome and a resolution target is two levels, so one constant cannot be right
+    for both: ``auto`` takes the max of the fixed floor, a running maximum and
+    the local slope; ``map`` uses a supplied height map and is the only one that
+    clears a step before stepping onto it.
+
 Why a separate entry point
 --------------------------
 ``PAM_Main_Nanomax_ClosedLoop.py`` is a 1100-line raster state machine whose
@@ -73,7 +95,13 @@ from Alazar_imaging.AlazarBurstCapture import (
 )
 from Alazar_imaging.AlazarFFTSpectrum import AlazarFFTSpectrum
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
-from Nanomax.afm_scan import AfmApproachConfig, AfmScanner, suggest_gains
+from Nanomax.afm_scan import (
+    AfmApproachConfig,
+    AfmScanner,
+    check_config,
+    suggest_gains,
+)
+from Nanomax import afm_control, afm_retract
 from Nanomax.data_io import save_scan_data
 from Nanomax.run_log import append_run_log, set_current_run_id
 from Nanomax.scan_utils import (
@@ -172,8 +200,10 @@ class RunConfig:
         # Approach geometry (shared).
         self.approach_sign = env_float("PAM_AFM_APPROACH_SIGN", 1.0)
         self.max_approach_um = env_float("PAM_AFM_MAX_APPROACH_UM", 4.0)
+        self.max_approach_s = env_float("PAM_AFM_MAX_APPROACH_S", 15.0)
         self.retract_um = env_float("PAM_AFM_RETRACT_UM", 0.50)
         self.max_retract_um = env_float("PAM_AFM_MAX_RETRACT_UM", 2.0)
+        self.retract_settle_ms = env_int("PAM_AFM_RETRACT_SETTLE_MS", 0)
         self.safety_amplitude = env_float("PAM_AFM_SAFETY_AMP", 0.0)
         self.min_snr = env_float("PAM_AFM_MIN_SNR", 0.0)
         self.z_min_um = env_float("PAM_AFM_Z_MIN_UM", float("nan"))
@@ -181,6 +211,25 @@ class RunConfig:
         self.position_tolerance_um = env_float("PAM_AFM_POSITION_TOLERANCE_UM", 0.02)
         self.settle_time_ms = env_int("PAM_AFM_SETTLE_MS", 0)
         self.settle_timeout_s = env_float("PAM_AFM_SETTLE_TIMEOUT_S", 10.0)
+
+        # Speed.  Away from the probe the only limit is the stage; closing in,
+        # the rate is what protects the probe, and the final band gets its own
+        # slower rate.  All three are um/s, not um/step, so they mean the same
+        # thing at any loop period.
+        self.approach_speed_um_s = env_float("PAM_AFM_APPROACH_SPEED_UM_S", 1.000)
+        self.final_speed_um_s = env_float("PAM_AFM_FINAL_SPEED_UM_S", 0.400)
+        self.final_band_frac = env_float("PAM_AFM_FINAL_BAND_FRAC", 0.150)
+        self.retract_speed_um_s = env_float("PAM_AFM_RETRACT_SPEED_UM_S", 20.0)
+        self.search_speed_um_s = env_float("PAM_AFM_SEARCH_SPEED_UM_S", 3.000)
+
+        # How high to lift between points.  A dome and a two-level target need
+        # different answers, so this is a policy, not a number.
+        self.retract_policy = env_str("PAM_AFM_RETRACT_POLICY", "auto").lower()
+        self.retract_margin_um = env_float("PAM_AFM_RETRACT_MARGIN_UM", 0.050)
+        self.retract_slope_window = env_int("PAM_AFM_RETRACT_SLOPE_WINDOW", 5)
+        self.retract_slope_safety = env_float("PAM_AFM_RETRACT_SLOPE_SAFETY", 2.0)
+        # "file:surface.csv" / "file:surface.py" / "module:name"
+        self.retract_map = env_str("PAM_AFM_RETRACT_MAP", "")
 
         # Stepped engine only.
         self.coarse_step_um = env_float("PAM_AFM_COARSE_STEP_UM", 0.100)
@@ -249,6 +298,18 @@ class RunConfig:
             max_approach_um=self.max_approach_um,
             retract_um=self.retract_um,
             max_retract_um=self.max_retract_um,
+            retract_settle_ms=self.retract_settle_ms,
+            retract_policy=self.retract_policy,
+            retract_margin_um=self.retract_margin_um,
+            retract_slope_window=self.retract_slope_window,
+            retract_slope_safety=self.retract_slope_safety,
+            retract_map=self.retract_map or None,
+            approach_speed_um_s=self.approach_speed_um_s,
+            final_speed_um_s=self.final_speed_um_s,
+            final_band_frac=self.final_band_frac,
+            retract_speed_um_s=self.retract_speed_um_s,
+            search_speed_um_s=self.search_speed_um_s,
+            max_approach_s=self.max_approach_s,
             safety_amplitude=self.safety_amplitude,
             min_snr=self.min_snr,
             position_tolerance_um=self.position_tolerance_um,
@@ -308,13 +369,35 @@ class RunConfig:
             )
         lines.extend([
             "approach        : sign %+.0f, budget %.2f um" % (self.approach_sign, self.max_approach_um),
-            "retract         : %.2f um (max %.2f um)" % (self.retract_um, self.max_retract_um),
+            "speed           : closing <= %.2f um/s, final band %.0f%% at <= %.2f um/s, "
+            "retract %.0f um/s"
+            % (self.approach_speed_um_s, self.final_band_frac * 100.0,
+               self.final_speed_um_s, self.retract_speed_um_s),
+            "retract         : >= %.2f um (max %.2f um), policy %s"
+            % (self.retract_um, self.max_retract_um, self.retract_policy),
             "scan            : %.2f x %.2f um, step %.3f um, %s"
             % (self.scan_range_x_um, self.scan_range_y_um, self.step_um,
                "serpentine" if self.serpentine else "raster"),
             "records/point   : %d" % self.records_per_point,
             "on failure      : %s" % self.on_fail,
         ])
+        if self.retract_map:
+            lines.append("height map      : %s" % self.retract_map)
+        # The cost of the speed settings, before a long scan rather than after.
+        try:
+            cfg = self.approach_config()
+            eta = cfg.approach_eta_s()
+            if cfg.control_mode == "pi" and eta > 0:
+                lines.append(
+                    "approach cost   : <= %.1f s per point worst case "
+                    "(%d steps to cross %.1f um at %.2f um/s)"
+                    % (eta, cfg.steps_needed(), self.max_approach_um,
+                       self.approach_speed_um_s)
+                )
+            for problem in check_config(cfg):
+                lines.append("WARNING         : %s" % problem)
+        except Exception as exc:  # configuration errors surface at run time
+            lines.append("WARNING         : %r" % (exc,))
         if self.control_source not in ("", "feedback", "auto"):
             lines.append("control source  : %s" % self.control_source)
         lo, hi = self.z_window()
@@ -441,44 +524,27 @@ class SyntheticFeedback:
 
 
 def load_external_source(spec, config):
-    """Load a user-supplied Z criterion.
+    r"""Load a user-supplied Z criterion (Nanomax.afm_control.load_source).
 
-    ``PAM_AFM_CONTROL_SOURCE`` accepts three forms::
+    ``PAM_AFM_CONTROL_SOURCE`` accepts::
 
         feedback                     the digitizer (default)
-        file:D:\\path\\my_source.py    load that file
+        const:1.25                   a fixed reading, for bench tests
+        file:D:\path\my_source.py    load that file
         my_package.my_source         import that module
 
     The module (or file) must define ``create_source(config)`` returning an
-    object with a ``value()`` method.  ``value()`` may return a bare number or
-    ``(number, snr)``; ``prepare()``/``finish()``/``describe()``/``unit`` are
-    optional.  The number is compared against ``PAM_AFM_SETPOINT`` in the same
-    unit, so nothing here converts anything -- the caller owns the units.
+    object with a ``value()`` method -- a bare callable works too.  ``value()``
+    may return a number, ``(number, snr)``, or ``None`` for "no reading";
+    ``prepare()`` / ``finish()`` / ``describe()`` / ``unit`` are optional.  The
+    number is compared against ``PAM_AFM_SETPOINT`` in the same unit, so nothing
+    here converts anything -- the caller owns the units.
+
+    This is the seam that makes the Z criterion swappable: the 10 MHz amplitude
+    is only the default implementation, and the scan engine never sees which one
+    is in use.
     """
-    import importlib
-
-    kind, _, target = spec.partition(":")
-    if kind == "file":
-        import importlib.util
-
-        path = os.path.abspath(target)
-        if not os.path.exists(path):
-            raise ValueError("control source file not found: %s" % path)
-        module_spec = importlib.util.spec_from_file_location("pam_afm_control_source", path)
-        module = importlib.util.module_from_spec(module_spec)
-        module_spec.loader.exec_module(module)
-        label = path
-    else:
-        label = spec
-        module = importlib.import_module(spec)
-
-    factory = getattr(module, "create_source", None)
-    if factory is None:
-        raise ValueError("%s must define create_source(config)" % label)
-    source = factory(config)
-    if not hasattr(source, "value"):
-        raise ValueError("create_source() must return an object with value()")
-    return source
+    return afm_control.load_source(spec, config)
 
 
 # --------------------------------------------------------------------------- #
@@ -646,7 +712,12 @@ def run_scan(config, args):
         print("  controller      : %s" % scanner.describe().get("pi_backend", "stepped"))
 
         z_cursor = start_z
+        retract_lifts = []
         for index, (target_x, target_y) in enumerate(trajectory, start=1):
+            # Where we are going after this point -- the retract policy needs it
+            # to decide how high to lift before the XY move (a dome rises at the
+            # rim, a two-level target steps up in one place).
+            next_xy = trajectory[index] if index < total_points else None
             append_run_log(
                 "AFM_POINT_BEGIN", index=index, total=total_points,
                 x_um="%.4f" % target_x, y_um="%.4f" % target_y, z_from_um="%.4f" % z_cursor,
@@ -664,7 +735,10 @@ def run_scan(config, args):
                 # capture; restart it before approaching.
                 feedback.prepare()
 
-            result, z_retract = scanner.scan_point(z_cursor)
+            result, z_retract = scanner.scan_point(
+                z_cursor, here_xy=(target_x, target_y), next_xy=next_xy
+            )
+            retract_lifts.append(round(abs(z_retract - result.z_um), 4) if result.ok else 0.0)
 
             if not result.ok:
                 z_failures += 1
@@ -754,6 +828,11 @@ def run_scan(config, args):
             "afm_coarse_step_um": config.coarse_step_um,
             "afm_fine_step_um": config.fine_step_um,
             "afm_retract_um": config.retract_um,
+            "afm_retract_policy": config.retract_policy,
+            "afm_retract_lifts": retract_lifts,
+            "afm_approach_speed_um_s": config.approach_speed_um_s,
+            "afm_final_speed_um_s": config.final_speed_um_s,
+            "afm_control_source": config.control_source,
             "afm_max_approach_um": config.max_approach_um,
             "afm_feedback_records": config.feedback_records,
             "afm_failed_points": z_failures,
@@ -958,14 +1037,17 @@ def dry_run(config, args):
 
     z_cursor = stage.get_axis_position("z")
     stops, steps_used, failures = [], [], 0
+    lifts = []
     for index, (x, y) in enumerate(trajectory, start=1):
+        next_xy = trajectory[index] if index < len(trajectory) else None
         stage.move_axis("x", x)
         stage.move_axis("y", y)
         surface.z_contact = (index - 1) * tilt_per_point
-        result, z_retract = scanner.scan_point(z_cursor)
+        result, z_retract = scanner.scan_point(z_cursor, here_xy=(x, y), next_xy=next_xy)
         if result.ok:
             stops.append(result.z_um)
             steps_used.append(result.steps)
+            lifts.append(abs(z_retract - result.z_um))
         else:
             failures += 1
         z_cursor = z_retract
@@ -978,6 +1060,12 @@ def dry_run(config, args):
               % ((len(trajectory) - 1) * tilt_per_point, stops[-1] - stops[0]))
         print("  steps per point: min %d, mean %.1f, max %d"
               % (min(steps_used), sum(steps_used) / len(steps_used), max(steps_used)))
+    if lifts:
+        print("  retract lift   : min %.3f, mean %.3f, max %.3f um (%s)"
+              % (min(lifts), sum(lifts) / len(lifts), max(lifts),
+                 scanner.describe().get("retract_policy", "?")))
+    print("  config checks  : %s"
+          % (", ".join(check_config(config.approach_config())) or "none"))
     scanner.close()
     print("")
     return 0

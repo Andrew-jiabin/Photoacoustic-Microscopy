@@ -79,7 +79,13 @@ def install_atsapi_stub():
 
 install_atsapi_stub()
 
-from Nanomax.afm_scan import AfmApproachConfig, AfmScanner, suggest_gains  # noqa: E402
+from Nanomax.afm_scan import (  # noqa: E402
+    AfmApproachConfig,
+    AfmScanner,
+    check_config,
+    suggest_gains,
+)
+from Nanomax import afm_control, afm_retract  # noqa: E402
 from Alazar_imaging import AlazarBurstCapture, AlazarFFTSpectrum  # noqa: E402
 import Nanomax.afm_pi as afm_pi  # noqa: E402
 
@@ -208,12 +214,24 @@ def make_scanner(surface, stage, setpoint=0.5, **overrides):
         search_floor_frac=overrides.pop("search_floor_frac", 0.10),
         search_step_um=overrides.pop("search_step_um", 0.100),
         feedback_sensitivity=overrides.pop("feedback_sensitivity", 0.0),
+        # speed / retract controls
+        approach_speed_um_s=overrides.pop("approach_speed_um_s", 1.0),
+        final_speed_um_s=overrides.pop("final_speed_um_s", 0.4),
+        final_band_frac=overrides.pop("final_band_frac", 0.15),
+        max_approach_s=overrides.pop("max_approach_s", 15.0),
+        search_speed_um_s=overrides.pop("search_speed_um_s", 3.0),
+        retract_policy=overrides.pop("retract_policy", "auto"),
+        retract_margin_um=overrides.pop("retract_margin_um", 0.05),
+        retract_map=overrides.pop("retract_map", None),
     )
     recorder = Recorder()
     clock = overrides.pop("clock", None) or FakeClock()
+    measure = overrides.pop("measure", None)
+    if measure is None:
+        measure = lambda: (surface.amplitude(stage.z), 100.0)  # noqa: E731
     scanner = AfmScanner(
         stage=stage,
-        measure=lambda: (surface.amplitude(stage.z), 100.0),
+        measure=measure,
         config=config,
         log=recorder,
         clock=clock,
@@ -416,6 +434,17 @@ def test_defaults_are_sane():
           % (config.pi_max_steps * config.dz_limit_um, config.max_approach_um))
     check("deadband is a small fraction of the setpoint",
           0.0 < config.deadband_frac < 0.1, "%.3f" % config.deadband_frac)
+    # Speed and retract defaults, now that both are first-class.
+    check("default closing speed is cautious but not absurd",
+          0.1 <= config.approach_speed_um_s <= 5.0,
+          "%.2f um/s" % config.approach_speed_um_s)
+    check("final band is slower than the general approach",
+          0 < config.final_speed_um_s <= config.approach_speed_um_s,
+          "%.2f <= %.2f um/s" % (config.final_speed_um_s, config.approach_speed_um_s))
+    check("default retract policy is adaptive", config.retract_policy == "auto",
+          config.retract_policy)
+    check("default config has no warnings", not check_config(config),
+          "; ".join(check_config(config)))
 
 
 # --------------------------------------------------------------------------- #
@@ -652,6 +681,377 @@ def _raises(fn, *args):
 
 
 # --------------------------------------------------------------------------- #
+# The Z criterion is an interface
+# --------------------------------------------------------------------------- #
+
+def test_control_source_interface():
+    print("\n[22] the Z criterion is a pluggable interface")
+
+    # adopt() accepts all three shapes the code base actually uses.
+    plain = afm_control.adopt(lambda: 2.0)
+    check("adopts a bare callable", plain.value() == 2.0, "%.3f" % plain.value())
+
+    class OnlyMeasure:
+        unit = "V"
+
+        def measure(self):
+            return 3.0, 12.0
+
+    adopted = afm_control.adopt(OnlyMeasure())
+    check("adopts an object with measure()", adopted.value() == (3.0, 12.0))
+    check("keeps the unit through adoption", adopted.unit == "V", adopted.unit)
+
+    class Full:
+        unit = "au"
+
+        def value(self):
+            return 4.0
+
+    check("adopting a source is a no-op", afm_control.adopt(Full()).value() == 4.0)
+    check("check_source accepts a valid source", afm_control.check_source(Full()) == [])
+    check("check_source reports a missing value()",
+          afm_control.check_source(object()) != [],
+          "; ".join(afm_control.check_source(object())))
+
+    # Adapters.
+    const = afm_control.ConstantSource(1.25)
+    check("constant source", const.value() == 1.25)
+    scaled = afm_control.ScaledSource(afm_control.ConstantSource(2.0), gain=3.0, offset=1.0)
+    check("scaled source applies gain and offset", scaled.value() == (7.0, 0.0),
+          "%r" % (scaled.value(),))
+
+    # EMA smooths, median rejects a spike.
+    ema = afm_control.SmoothSource(afm_control.ConstantSource(0.0), alpha=1.0)
+    check("alpha=1 passes the signal through", ema.value()[0] == 0.0)
+    median = afm_control.SmoothSource(
+        afm_control.CallableSource(lambda: next(feed)), mode="median", window=5)
+    feed = iter([1.0, 1.0, 1.0, 1.0, 50.0])
+    for _ in range(5):
+        out = median.value()
+    check("median rejects a single spike", abs(out[0] - 1.0) < 1e-9, "%.3f" % out[0])
+
+    # "No reading" is a first-class answer, not a crash.
+    check("None becomes NaN",
+          math.isnan(afm_control.read_value(afm_control.CallableSource(lambda: None))[0]))
+    check("NaN from a source becomes NaN",
+          math.isnan(afm_control.read_value(
+              afm_control.CallableSource(lambda: float("nan")))[0]))
+
+    # Loading by spec.
+    check("const spec", afm_control.load_source("const:2.5").value() == 2.5)
+    check("'feedback' must be resolved by the caller",
+          _raises(afm_control.load_source, "feedback"))
+
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), "_pam_afm_src_%d.py" % os.getpid())
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "UNIT = 'V'\n"
+            "def create_source(config):\n"
+            "    return lambda: 7.5\n"
+        )
+    try:
+        loaded = afm_control.load_source("file:" + path)
+        check("loads a user module from a file", loaded.value() == 7.5)
+        check("describes the loaded source",
+              "callable" in afm_control.describe_source(loaded),
+              afm_control.describe_source(loaded))
+    finally:
+        os.remove(path)
+
+    # A source that drops a reading must fail the point, not move on garbage.
+    class Flaky:
+        unit = "au"
+
+        def __init__(self):
+            self.n = 0
+
+        def value(self):
+            self.n += 1
+            return None if self.n == 2 else 1.0
+
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    stage = FakeStage(z0=-2.0)
+    scanner, _, _ = make_scanner(surface, stage, setpoint=0.5, control_mode="pi",
+                                 measure=Flaky())
+    result = scanner.approach(stage.z)
+    check("a dropped reading stops the point", result.reason == "no_reading",
+          result.reason)
+
+
+# --------------------------------------------------------------------------- #
+# Speed: careful on approach, fast on retract
+# --------------------------------------------------------------------------- #
+
+def test_approach_speed_is_a_rate():
+    print("\n[23] closing speed is um/s, not um/step")
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    gains = local_sensitivity(surface, 0.5)
+
+    for period in (0.030, 0.100):
+        surface = Surface(z_contact=0.0, rise_um=0.3)
+        stage = FakeStage(z0=-2.0)
+        scanner, _, config = make_scanner(
+            surface, stage, setpoint=0.5, control_mode="pi",
+            feedback_sensitivity=gains, dz_limit_um=10.0,   # no absolute cap
+            approach_speed_um_s=1.0, final_speed_um_s=0.0,
+            # No blind search: this test is about the PI's rate, and the search
+            # phase is deliberately faster (it is checked separately below).
+            search_floor_frac=0.0,
+            max_approach_s=0.0, clock=FakeClock(period))
+        result = scanner.approach(stage.z)
+        moves = [-2.0] + list(stage.commands)
+        deltas = [abs(b - a) for a, b in zip(moves, moves[1:])]
+        cap = 1.0 * period
+        check("step <= %.4f um at a %.0f ms loop" % (cap, period * 1e3),
+              result.ok and max(deltas) <= cap * 1.02,
+              "max %.5f um, %d steps" % (max(deltas), len(deltas)))
+
+    # The blind search may be quicker, but only up to search_speed_um_s.
+    for period in (0.030, 0.100):
+        surface = Surface(z_contact=0.0, rise_um=0.3)
+        stage = FakeStage(z0=-2.0)
+        scanner, _, config = make_scanner(
+            surface, stage, setpoint=0.5, control_mode="pi",
+            feedback_sensitivity=gains, dz_limit_um=10.0,
+            approach_speed_um_s=1.0, final_speed_um_s=0.0,
+            search_floor_frac=0.10, search_step_um=0.5,
+            search_speed_um_s=3.0, max_approach_s=0.0, clock=FakeClock(period))
+        result = scanner.approach(stage.z)
+        search = [t for t in result.trace if t.get("search")]
+        if search:
+            zs = [search[0]["z_um"]]
+            zs.extend(t["z_um"] for t in search[1:])
+            deltas = [abs(b - a) for a, b in zip(zs, zs[1:])]
+            cap = 3.0 * period
+            check("search step <= %.4f um at a %.0f ms loop" % (cap, period * 1e3),
+                  max(deltas) <= cap * 1.02,
+                  "max %.5f um over %d steps" % (max(deltas), len(deltas)))
+        else:
+            check("search step capped at %.3f um/s" % 3.0, False, "no search phase ran")
+
+    # The last band gets the slower rate.
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    stage = FakeStage(z0=-2.0)
+    scanner, _, config = make_scanner(
+        surface, stage, setpoint=0.5, control_mode="pi",
+        feedback_sensitivity=gains, dz_limit_um=10.0,
+        approach_speed_um_s=1.0, final_speed_um_s=0.4, final_band_frac=0.15,
+        max_approach_s=0.0)
+    result = scanner.approach(stage.z)
+    last = abs(result.last_step_um)
+    check("the final band is slower than the approach",
+          result.ok and last <= 0.4 * 0.030 * 1.05,
+          "last step %.5f um <= %.5f" % (last, 0.4 * 0.030))
+
+    # A slow setting must still land, given enough steps.
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    stage = FakeStage(z0=-2.0)
+    scanner, _, config = make_scanner(
+        surface, stage, setpoint=0.5, control_mode="pi",
+        feedback_sensitivity=gains, dz_limit_um=10.0,
+        approach_speed_um_s=0.5, final_speed_um_s=0.0,
+        pi_max_steps=400, max_approach_s=0.0)
+    result = scanner.approach(stage.z)
+    check("0.5 um/s still converges", result.ok, "%s in %d steps"
+          % (result.reason, result.steps))
+
+    # "Not too slow": the time budget is the bound a step count cannot give.
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    stage = FakeStage(z0=-2.0)
+    scanner, _, config = make_scanner(
+        surface, stage, setpoint=0.5, control_mode="pi",
+        feedback_sensitivity=gains, dz_limit_um=10.0,
+        approach_speed_um_s=0.05, final_speed_um_s=0.0,
+        pi_max_steps=4000, max_approach_s=0.5)
+    result = scanner.approach(stage.z)
+    check("a crawl is cut off by the time budget", result.reason == "time_budget",
+          "%s after %.1f s" % (result.reason, result.elapsed_s))
+
+    # ... and the configuration check warns before the scan starts.
+    slow = AfmApproachConfig(setpoint=0.5, approach_speed_um_s=0.001,
+                             max_approach_um=4.0, pi_max_steps=200)
+    problems = check_config(slow)
+    check("an unusably slow speed is reported", len(problems) > 0,
+          problems[0] if problems else "")
+    fast = AfmApproachConfig(setpoint=0.5, approach_speed_um_s=2.0,
+                             max_approach_um=4.0, pi_max_steps=200)
+    check("a sane speed produces no warning", not check_config(fast),
+          "; ".join(check_config(fast)))
+
+
+# --------------------------------------------------------------------------- #
+# Retract height
+# --------------------------------------------------------------------------- #
+
+class TwoLevelSurface:
+    """Flat, then one step up at ``step_x`` -- a resolution target.
+
+    ``height`` is *protrusion*: how much closer to the probe the surface is past
+    the step.  With ``approach_sign = +1`` the Z at which contact happens is
+    therefore ``-height``, which is the whole point -- a taller feature is met at
+    a *lower* stage Z, so staying at the old Z means the probe is already inside
+    the sample.
+    """
+
+    def __init__(self, step_x=2.0, height=1.5, rise_um=0.3, amp_max=1.0, sign=1.0):
+        self.step_x = float(step_x)
+        self.height = float(height)
+        self.rise_um = float(rise_um)
+        self.amp_max = float(amp_max)
+        self.sign = 1.0 if sign >= 0 else -1.0
+        self.x = 0.0
+
+    def protrusion(self, x=None):
+        x = self.x if x is None else float(x)
+        return self.height if x >= self.step_x else 0.0
+
+    def contact_z(self, x=None):
+        return -self.sign * self.protrusion(x)
+
+    def amplitude(self, z):
+        gap = (self.contact_z() - z) * self.sign
+        if gap <= 0:
+            return self.amp_max
+        return self.amp_max * math.exp(-gap / self.rise_um)
+
+
+def _scan_line(surface, policy, xs, retract_um=0.5, map_fn=None):
+    """Walk a line of points the way run_scan() does; return (results, lifts)."""
+    stage = FakeStage(z0=-1.0)
+    surface.x = xs[0]
+    config = AfmApproachConfig(
+        setpoint=0.5, approach_sign=1.0, control_mode="pi",
+        feedback_sensitivity=0.5 / surface.rise_um,
+        max_approach_um=4.0, retract_um=retract_um, max_retract_um=2.0,
+        retract_policy=policy, retract_map=map_fn,
+        approach_speed_um_s=1.0, final_speed_um_s=0.0,
+        pi_max_steps=300, max_approach_s=0.0,
+    )
+    scanner = AfmScanner(stage, lambda: (surface.amplitude(stage.z), 50.0),
+                         config, clock=FakeClock())
+    results, lifts, cursors = [], [], []
+    z_cursor = stage.z
+    for i, x in enumerate(xs):
+        surface.x = x
+        next_xy = (xs[i + 1], 0.0) if i + 1 < len(xs) else None
+        result, z_retract = scanner.scan_point(z_cursor, here_xy=(x, 0.0),
+                                               next_xy=next_xy)
+        results.append(result)
+        lifts.append(abs(z_retract - result.z_um) if result.ok else 0.0)
+        cursors.append(z_retract)
+        z_cursor = z_retract
+    scanner.close()
+    return results, lifts, cursors
+
+
+def test_retract_policies():
+    print("\n[24] retract height follows the surface, not a constant")
+
+    # A two-level target: only the point that climbs needs the step height.
+    xs = [0.0, 1.0, 2.0, 3.0, 4.0]
+    surface = TwoLevelSurface(step_x=2.0, height=1.5)
+    height_map = lambda x, y: 1.5 if x >= 2.0 else 0.0  # noqa: E731
+
+    results, lifts, cursors = _scan_line(surface, "map", xs, retract_um=0.5,
+                                        map_fn=height_map)
+    check("all points reached the setpoint", all(r.ok for r in results),
+          ",".join(r.reason for r in results))
+    # Point x=1 is followed by x=2, which is 1.5 um higher.
+    check("the climbing point lifts by the step height",
+          lifts[1] >= 1.5, "lift %.3f um at x=1" % lifts[1])
+    check("flat points keep the minimum lift", abs(lifts[0] - 0.5) < 1e-6,
+          "lift %.3f um at x=0" % lifts[0])
+    # The real property: at the moment XY moves, Z clears the next surface.
+    clears = []
+    for i, z_retract in enumerate(cursors[:-1]):
+        clears.append(z_retract <= surface.contact_z(xs[i + 1]) - 0.05 + 1e-9)
+    check("Z clears the next point before the XY move", all(clears),
+          "%d/%d clear" % (sum(clears), len(clears)))
+
+    # Without a map, a fixed retract cannot clear the step -- that is exactly
+    # why the policy exists.
+    results_fixed, lifts_fixed, cursors_fixed = _scan_line(surface, "fixed", xs,
+                                                           retract_um=0.5)
+    fixed_clears = [cursors_fixed[i] <= surface.contact_z(xs[i + 1]) - 0.05 + 1e-9
+                    for i in range(len(cursors_fixed) - 1)]
+    check("a fixed retract does NOT clear the step",
+          not all(fixed_clears), "%d/%d clear" % (sum(fixed_clears), len(fixed_clears)))
+
+    # A running max remembers the high level and lifts from the low one.
+    policy = afm_retract.RunningMaxLift(margin_um=0.05, floor_um=0.5, max_um=2.0)
+    policy.observe(0.0)
+    policy.observe(1.5)          # the high level has been visited
+    lift_low = policy.lift_um(0.0, (0.0, 0.0), (1.0, 0.0), [], 1.0)
+    check("running max lifts a low point clear of the high level",
+          abs(lift_low - 1.55) < 1e-6, "%.3f um" % lift_low)
+    check("running max forgets on reset",
+          policy.reset() is None and
+          abs(policy.lift_um(0.0, (0, 0), (1, 0), [], 1.0) - 0.5) < 1e-6,
+          "%.3f um after reset" % policy.lift_um(0.0, (0, 0), (1, 0), [], 1.0))
+
+    # A dome: the slope policy lifts more at the rim than on top, with no map.
+    slope = afm_retract.SlopeLift(margin_um=0.05, floor_um=0.0, window=5, safety=2.0)
+    radius = 3.0
+    h = lambda x: math.sqrt(max(0.0, radius * radius - x * x))  # noqa: E731
+    flank_history = [(-3.0, 0.0, h(-3.0)), (-2.5, 0.0, h(-2.5)),
+                     (-2.0, 0.0, h(-2.0))]
+    lift_flank = slope.lift_um(h(-2.0), (-2.0, 0.0), (-1.5, 0.0), flank_history, 1.0)
+    top_history = [(-1.0, 0.0, h(-1.0)), (-0.5, 0.0, h(-0.5))]
+    lift_top = slope.lift_um(h(0.0), (0.0, 0.0), (0.5, 0.0), top_history, 1.0)
+    check("the slope policy lifts more at the rim than on top",
+          lift_flank > 2.0 * lift_top,
+          "rim %.3f um vs top %.3f um" % (lift_flank, lift_top))
+
+    # Composite never returns less than its parts.
+    composite = afm_retract.make_policy("auto", base_um=0.5, margin_um=0.05, max_um=2.0)
+    check("auto is at least the fixed floor",
+          composite.lift_um(0.0, (0, 0), (1, 0), [], 1.0) >= 0.5,
+          "%.3f um" % composite.lift_um(0.0, (0, 0), (1, 0), [], 1.0))
+    check("auto describes its parts", "max of" in composite.describe(),
+          composite.describe())
+
+    # The map loader: a CSV grid, which is what a profilometer dump looks like.
+    import tempfile
+    csv_path = os.path.join(tempfile.gettempdir(), "_pam_afm_map_%d.csv" % os.getpid())
+    with open(csv_path, "w", encoding="utf-8") as handle:
+        handle.write("y/x,0,1,2\n0,0.0,0.0,1.5\n")
+    try:
+        loaded = afm_retract.csv_map(csv_path)
+        check("csv map reads a grid", loaded(2.0, 0.0) == 1.5 and loaded(1.0, 0.0) == 0.0,
+              "%.2f / %.2f" % (loaded(2.0, 0.0), loaded(1.0, 0.0)))
+        built = afm_retract.make_map_policy("file:" + csv_path, base_um=0.5,
+                                            margin_um=0.05, max_um=2.0)
+        check("make_map_policy lifts over the step",
+              abs(built.lift_um(0.0, (1.0, 0.0), (2.0, 0.0), [], 1.0) - 1.55) < 1e-6,
+              "%.3f um" % built.lift_um(0.0, (1.0, 0.0), (2.0, 0.0), [], 1.0))
+    finally:
+        os.remove(csv_path)
+
+    # A policy that raises must not stop the scan.
+    class Broken(afm_retract.RetractPolicy):
+        name = "broken"
+
+        def lift_um(self, *args, **kwargs):
+            raise RuntimeError("policy exploded")
+
+    stage = FakeStage(z0=-1.0)
+    surface = Surface(z_contact=0.0, rise_um=0.3)
+    config = AfmApproachConfig(setpoint=0.5, control_mode="pi",
+                               feedback_sensitivity=0.5 / 0.3,
+                               retract_policy="fixed", retract_um=0.5)
+    scanner = AfmScanner(stage, lambda: (surface.amplitude(stage.z), 50.0), config,
+                         clock=FakeClock())
+    scanner._policy = Broken()
+    result, z_retract = scanner.scan_point(-1.0, here_xy=(0.0, 0.0),
+                                           next_xy=(1.0, 0.0))
+    check("a broken policy falls back to the minimum lift",
+          result.ok and abs(z_retract - (result.z_um - 0.5)) < 1e-6,
+          "%.4f -> %.4f" % (result.z_um, z_retract))
+    scanner.close()
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -682,6 +1082,9 @@ def main():
         test_pi_tracks_tilt,
         test_pi_gain_helper,
         test_pi_module_selftest,
+        test_control_source_interface,
+        test_approach_speed_is_a_rate,
+        test_retract_policies,
     ):
         test()
 

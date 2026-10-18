@@ -325,6 +325,12 @@ class _CppPi:
         lib.afm_pi_get_state.restype = ctypes.c_int
         lib.afm_pi_set_gains.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
         lib.afm_pi_set_gains.restype = ctypes.c_int
+        # Optional: only in 1.3 and later.  An older DLL simply keeps its fixed
+        # step cap and the speed limiter degrades to a per-point constant.
+        self._has_set_dz_limit = hasattr(lib, "afm_pi_set_dz_limit")
+        if self._has_set_dz_limit:
+            lib.afm_pi_set_dz_limit.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            lib.afm_pi_set_dz_limit.restype = ctypes.c_int
         lib.afm_pi_destroy.argtypes = [ctypes.c_void_p]
         lib.afm_pi_destroy.restype = None
         lib.afm_pi_version.argtypes = []
@@ -363,6 +369,23 @@ class _CppPi:
             raise ValueError("afm_pi_set_gains rejected the gains")
         self.config.kp = float(kp)
         self.config.ki = float(ki)
+        return self
+
+    def set_dz_limit(self, dz_limit_um):
+        """Change the per-step travel cap in place (bumpless).
+
+        Used by the scanner to hold a *speed*: it passes
+        ``speed_um_s * measured_dt`` every step, so the closing rate stays what
+        was asked for even when a step takes much longer than nominal.
+        """
+        dz_limit_um = float(dz_limit_um)
+        if not dz_limit_um > 0.0:
+            raise ValueError("dz_limit_um must be positive")
+        if self._has_set_dz_limit:
+            rc = self._lib.afm_pi_set_dz_limit(self._handle, dz_limit_um)
+            if rc != STATUS_OK:
+                raise ValueError("afm_pi_set_dz_limit rejected the value")
+        self.config.dz_limit_um = dz_limit_um
         return self
 
     def close(self):
@@ -537,6 +560,12 @@ class _PythonPi:
         self.config.ki = float(ki)
         return self
 
+    def set_dz_limit(self, dz_limit_um):
+        if not float(dz_limit_um) > 0.0:
+            raise ValueError("dz_limit_um must be positive")
+        self.config.dz_limit_um = float(dz_limit_um)
+        return self
+
     def close(self):
         return None
 
@@ -607,6 +636,11 @@ class PiController:
         self._impl.set_gains(kp, ki)
         self.config.kp = float(kp)
         self.config.ki = float(ki)
+        return self
+
+    def set_dz_limit(self, dz_limit_um):
+        self._impl.set_dz_limit(dz_limit_um)
+        self.config.dz_limit_um = float(dz_limit_um)
         return self
 
     def close(self):
