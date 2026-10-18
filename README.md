@@ -1453,6 +1453,7 @@ machine has no `D:\LJB` at all.
 | --- | --- |
 | `README.md` (this file) | Entry points, contracts, deployment, backup |
 | `LBTEK_1D_STAGE_NOTES.md` | LBTEK hardware behaviour and field experience |
+| `docs/DLM3000_scope_report.md` | Yokogawa DLM3034: VXI-11 waveform readout, measured timings, pitfalls |
 | `reference/` | Integration decisions and lab notes |
 | `run_logs/PAM_Main_Nanomax_run.log` | Previous run state; drives the startup zero-datum decision |
 | `run_logs/pam_scan_speed_history.json` | Median scan speed per target/step, used for time estimates |
@@ -1471,6 +1472,73 @@ machine has no `D:\LJB` at all.
    16 points) and the laser variables disabled: `PAM_Main_Nanomax.py` for the
    integrated program, or `PAM_Main_Prior.py` / `PAM_Main_Nanomax_ClosedLoop.py`
    when no laser should be in the process at all.
+
+## Yokogawa DLM3034 Scope — slow reference over VXI-11
+
+The lab's small scope (`YOKOGAWA,DLM3034,90Y500919,F2.00`, IP `192.168.1.100`)
+can hand a waveform to the PC over the LAN. It is **read-only** here: nothing
+in this repository changes an imaging parameter on it, and nothing arms
+anything.
+
+**Read `docs/DLM3000_scope_report.md` before touching this.** Every command and
+every timing number in it was measured on this unit; the manual set we own has
+no SCPI command table (the communication manual `IM DLM3054-17EN` is missing
+and Yokogawa's CDN returns 403 for it).
+
+### What it is good for
+
+| | |
+| --- | --- |
+| One fresh record, one channel | ~450-480 ms → **~2.2 Hz** |
+| One fresh record, four channels | ~590 ms → **~1.7 Hz** |
+| Extra channels | cost ~110 ms total, not 4x |
+| Bottleneck | the instrument, **not** the network (250 kB crosses the LAN in 3-11 ms) |
+
+~2 Hz is a hard ceiling. The scope is a **slow reference / second opinion /
+calibration source**, never the sensor of a fast loop — the ATS9373 on-FPGA FFT
+is the fast path.
+
+### Files
+
+| File | Role |
+| --- | --- |
+| `Nanomax/dlm_scope.py` | Zero-dependency VXI-11 client, `DlmScope`, `Waveform`, `Streamer`, `ScopeSource` |
+| `Tool_code/dlm_scope_cli.py` | ASCII-only command line front end (GBK console safe) |
+| `Tool_code/dlm_scope_web.py` | Browser scope view, standard library only |
+| `Tool_code/test_dlm_scope_offline.py` | 66 offline checks, no instrument needed |
+
+### Quick start
+
+```bat
+python -m Tool_code.dlm_scope_cli --check        :: identity, state, one record
+python -m Tool_code.dlm_scope_cli --bench 10     :: latency, rate, distinct records
+python -m Tool_code.dlm_scope_cli --follow 8     :: sustained streaming, snapshot latency
+python -m Tool_code.dlm_scope_web --channels 1,2,3,4 --port 8791
+```
+
+Then open `http://100.79.154.4:8791/`. Port 8765 is already taken on PAM-NEW by
+a `pythonw.exe`.
+
+### Three things that will bite you
+
+1. **One client at a time.** Two processes issuing `:START`/`:STOP` interrupt
+   each other: a single read went from 345 ms to 772 ms under contention, and
+   `latest()` stopped returning the same record.
+2. **`:STOP` does not freeze the record.** The scope keeps acquiring at ~2 Hz
+   and `SEND?` just hands over the newest one, so `latest()` is not guaranteed
+   to repeat `read()`.
+3. **Multi-channel needs a long enough settle.** With the default 0.02 s only
+   1 sweep in 4 is time-aligned (and it is *slower*); `read_multi()` raises the
+   settle to `MULTI_SETTLE_S = 0.15 s` and then measures 8/8 aligned. Do not
+   interleave other SCPI commands inside the sweep — the unlucky one pays
+   ~130 ms + ~320 ms for the next record.
+
+### Codes, not volts
+
+The payload is raw ADC codes. `CODES_PER_DIV = 8192.0` is the Yokogawa 16-bit
+convention and is **not yet bench-calibrated** — see section 14 of the report.
+`Waveform.codes` is exact either way, and a control loop only needs a monotone
+proxy, so use the codes until someone calibrates the constant.
 
 ## Safety Checklist
 
