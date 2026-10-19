@@ -380,6 +380,18 @@ per point is expensive: `setCaptureClock` ~65 ms, changing the channel mask
 ~55 ms, one arm/abort cycle ~46 ms, which is ~120 ms for an
 A(4 GS/s) → B(100 MS/s) round trip.
 
+There is no third analog input to fall back on. AUX I/O is a 3.3 V TTL digital
+input -- `GET_AUX_INPUT_LEVEL` returns 0 or 1, and its only input functions are
+Trigger Enable and a software-readable bit -- while TRIG IN is a comparator
+whose data "cannot be digitized" (User Manual V1-5 p.45). ECLK, when fitted, is
+a clock input. The board has exactly two analog channels.
+
+So two analog signals at the same time means **A+B at 2 GS/s**; that is the only
+simultaneous configuration this board has. For anything below 50 MHz it costs
+nothing in bandwidth (2 GS/s is 20x Nyquist), but a 4096-point record then spans
+2.048 µs instead of 1.024 µs, so the reconstruction's sample rate has to become
+2e9 -- or the record has to drop to 2048 points to keep the same window.
+
 ### One continuous stream instead of switching
 
 That 46 ms is the abort/re-arm cycle, not the board. Leaving a single 4 GS/s
@@ -392,16 +404,23 @@ stream running and demodulating the newest record of each DMA buffer gives:
 | 1 ms | 2 016 | 252 |
 | 10 ms | 200 | 25 |
 
-`AlazarStreamSensor` wraps exactly that: `TRIG_EXTERNAL` plus a timeout, one
-channel, host-side demodulation with a precomputed phasor (~6 µs per reading).
-With the laser off the board self-triggers; with the laser on it follows the
-laser as long as the timeout is longer than the laser period. Approach feedback
-and the imaging payload then come from the same stream, with no reconfiguration
-between points.
+`AlazarStreamSensor` wraps exactly that: `TRIG_EXTERNAL` plus a timeout, one or
+both channels, host-side demodulation with a precomputed phasor (~6 µs per
+reading). With the laser off the board self-triggers; with the laser on it
+follows the laser as long as the timeout is longer than the laser period.
+Approach feedback and the imaging payload then come from the same stream, with
+no reconfiguration between points.
+
+With `--channels A+B` the board runs at 2 GS/s, both inputs are de-interleaved
+from each record (`A0 B0 A1 B1 ...`), `read()` returns the amplitude of
+`--signal-channel`, and `latest()` returns both channels as a dict. Measured at
+2 GS/s dual: 199 626 records/s, 249.9 readings/s at a 1 ms timeout, with A and B
+showing independent noise as expected.
 
 ```bat
 python -m Alazar_imaging.AlazarStreamSensor --selftest
 python -m Alazar_imaging.AlazarStreamSensor --probe --duration 3
+python -m Alazar_imaging.AlazarStreamSensor --probe --channels A+B --signal-channel B
 python -m Alazar_imaging.AlazarStreamSensor --probe --channel B --sample-rate-hz 2e9
 ```
 

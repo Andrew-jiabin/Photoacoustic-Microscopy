@@ -89,17 +89,46 @@ _SAMPLE_SHIFT = 4
 Reading = namedtuple("Reading", "amplitude_v interval_s sequence")
 
 
-def channel_mask(value):
-    """``"A"``, ``"B"`` or an SDK mask -> a single-channel mask."""
+def mask_of(value):
+    """``"A"``, ``"B"``, ``"A+B"`` or an SDK mask -> a channel mask.
+
+    The board has exactly two analog inputs.  AUX I/O is a 3.3 V TTL digital
+    input (``GET_AUX_INPUT_LEVEL`` returns 0 or 1) and TRIG IN is a comparator
+    that "cannot be digitized" (ATS9373 User Manual V1-5 p.45), so there is no
+    third analog path to fall back on.
+    """
     if isinstance(value, str):
         text = value.strip().upper().replace(" ", "")
-        resolved = {"A": ats.CHANNEL_A, "B": ats.CHANNEL_B}.get(text)
+        resolved = {
+            "A": ats.CHANNEL_A,
+            "B": ats.CHANNEL_B,
+            "A+B": ats.CHANNEL_A | ats.CHANNEL_B,
+            "B+A": ats.CHANNEL_A | ats.CHANNEL_B,
+            "AB": ats.CHANNEL_A | ats.CHANNEL_B,
+        }.get(text)
         if resolved is None:
-            raise ValueError("channel must be 'A' or 'B', got %r" % (value,))
+            raise ValueError("channels must be 'A', 'B' or 'A+B', got %r" % (value,))
         return resolved
     mask = int(value)
-    if mask not in (ats.CHANNEL_A, ats.CHANNEL_B):
-        raise ValueError("a stream uses one input; channel mask 0x%X is not A or B" % mask)
+    if mask not in (ats.CHANNEL_A, ats.CHANNEL_B,
+                    ats.CHANNEL_A | ats.CHANNEL_B):
+        raise ValueError("channels must be A, B or A+B, got mask 0x%X" % mask)
+    return mask
+
+
+def _mask_name(mask):
+    return {
+        ats.CHANNEL_A: "A",
+        ats.CHANNEL_B: "B",
+        ats.CHANNEL_A | ats.CHANNEL_B: "A+B",
+    }.get(mask, "0x%X" % mask)
+
+
+def channel_mask(value):
+    """Like :func:`mask_of`, but only one channel (used for the signal input)."""
+    mask = mask_of(value)
+    if mask == (ats.CHANNEL_A | ats.CHANNEL_B):
+        raise ValueError("a signal channel must be A or B, not A+B")
     return mask
 
 
@@ -165,6 +194,8 @@ class AlazarStreamSensor(object):
         sample_rate=None,
         sample_rate_hz=DEFAULT_SAMPLE_RATE_HZ,
         channel="A",
+        channels=None,
+        signal_channel=None,
         record_length=DEFAULT_RECORD_LENGTH,
         f0_hz=DEFAULT_F0_HZ,
         input_range=DEFAULT_INPUT_RANGE,
@@ -184,7 +215,10 @@ class AlazarStreamSensor(object):
             else _sample_rate_constant(sample_rate_hz)
         )
         self.sample_rate_hz = float(sample_rate_hz)
-        self.channel = channel_mask(channel)
+        self.channel_mask = mask_of(channels if channels is not None else channel)
+        self.channel_count = 2 if self.channel_mask == (
+            ats.CHANNEL_A | ats.CHANNEL_B) else 1
+        self.signal_channel = channel_mask(signal_channel or "A")
         self.record_length = int(record_length)
         self.f0_hz = float(f0_hz)
         self.input_range = input_range
@@ -206,6 +240,7 @@ class AlazarStreamSensor(object):
         self._norm = None
         self._t_start = None
         self.readings = 0
+        self.last_interval = 0.0
         self.errors = []
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -236,18 +271,27 @@ class AlazarStreamSensor(object):
         board = self.board
 
         # Measured on the board: 4 GS/s exists only in single-channel DES mode,
-        # and DES is wired to A.  B is rejected with ApiInconsistentChannel, so
-        # fail here with a sentence instead of at startCapture with a driver code.
-        if self.channel == ats.CHANNEL_B and self.sample_rate_hz > 2e9:
-            raise ValueError(
-                "channel B tops out at 2 GS/s on the ATS9373; 4 GS/s is "
-                "single-channel DES mode and is only available on A"
-            )
+        # and DES is wired to A.  Fail here with a sentence instead of at
+        # startCapture with a driver code.
+        if self.sample_rate_hz > 2e9:
+            if self.channel_count == 2:
+                raise ValueError(
+                    "A+B is limited to 2 GS/s: 4 GS/s exists only in "
+                    "single-channel DES mode "
+                    "(ApiDESOnlySupportedInSingleChannelMode)"
+                )
+            if self.channel_mask == ats.CHANNEL_B:
+                raise ValueError(
+                    "channel B tops out at 2 GS/s on the ATS9373; 4 GS/s is "
+                    "single-channel DES mode and is only available on A"
+                )
 
         board.setCaptureClock(ats.INTERNAL_CLOCK, self.sample_rate,
                               ats.CLOCK_EDGE_RISING, 0)
-        board.inputControlEx(self.channel, ats.DC_COUPLING, self.input_range,
-                             ats.IMPEDANCE_50_OHM)
+        for ch in (ats.CHANNEL_A, ats.CHANNEL_B):
+            if self.channel_mask & ch:
+                board.inputControlEx(ch, ats.DC_COUPLING, self.input_range,
+                                     ats.IMPEDANCE_50_OHM)
 
         # External trigger plus a timeout: the laser wins when it is present,
         # the timeout keeps data flowing when it is not.
@@ -263,9 +307,9 @@ class AlazarStreamSensor(object):
             self.record_length, self.sample_rate_hz, self.f0_hz
         )
         self._log(
-            "configured %.3f GS/s, channel %s, %d points, timeout %d ticks"
-            % (self.sample_rate_hz / 1e9,
-               "A" if self.channel == ats.CHANNEL_A else "B",
+            "configured %.3f GS/s, channels %s (signal %s), %d points, timeout %d ticks"
+            % (self.sample_rate_hz / 1e9, _mask_name(self.channel_mask),
+               "A" if self.signal_channel == ats.CHANNEL_A else "B",
                self.record_length, self.timeout_ticks)
         )
         return self
@@ -273,7 +317,8 @@ class AlazarStreamSensor(object):
     def _ensure_buffers(self):
         if self.buffers:
             return
-        bytes_per_buffer = 2 * self.record_length * self.records_per_buffer
+        bytes_per_buffer = (2 * self.record_length * self.records_per_buffer
+                            * self.channel_count)
         self.buffers = [
             ats.DMABuffer(self.board.handle, ctypes.c_uint16, bytes_per_buffer)
             for _ in range(self.buffer_count)
@@ -290,7 +335,7 @@ class AlazarStreamSensor(object):
         board = self.board
         self._ensure_buffers()
         board.beforeAsyncRead(
-            self.channel, 0, self.record_length, self.records_per_buffer,
+            self.channel_mask, 0, self.record_length, self.records_per_buffer,
             0x7FFFFFFF,
             ats.ADMA_EXTERNAL_STARTCAPTURE | ats.ADMA_NPT,
         )
@@ -338,33 +383,67 @@ class AlazarStreamSensor(object):
                                    self.buffers[index].size_bytes)
         self._posted[index] = True
 
-    def read(self):
-        """Return the newest amplitude as a :class:`Reading`."""
-        if not self._running:
-            raise RuntimeError("start() first")
+    def _records(self, view):
+        """Split one DMA buffer into per-channel ``(n, record_length)`` arrays.
+
+        Alazar interleaves enabled channels sample by sample: A0 B0 A1 B1 ...
+        so the even samples belong to A and the odd ones to B.
+        """
+        width = self.record_length * self.channel_count
+        usable = (view.size // width) * width
+        block = view[:usable].reshape(-1, width)
+        if self.channel_count == 1:
+            return {self.channel_mask: block}
+        return {
+            ats.CHANNEL_A: block[:, 0::2],
+            ats.CHANNEL_B: block[:, 1::2],
+        }
+
+    def _read_amplitudes(self):
+        """Demodulate the newest record of every enabled channel."""
         view, index = self._next_buffer()
-        record = view[-self.record_length:]
-        amplitude = demod_amplitude(record, self._phasor, self._norm,
-                                    self.input_range_volts)
+        channels = self._records(view)
+        amps = dict(
+            (ch, demod_amplitude(arr[-1], self._phasor, self._norm,
+                                 self.input_range_volts))
+            for ch, arr in channels.items()
+        )
         self._release(index)
 
         now = time.time()
         interval = 0.0 if self._t_prev is None else (now - self._t_prev)
         self._t_prev = now
+        self.last_interval = interval
         self._sequence += 1
         self.readings += 1
-        return Reading(amplitude, interval, self._sequence)
+        return amps, interval
+
+    def read(self):
+        """Return the newest amplitude of ``signal_channel`` as a :class:`Reading`."""
+        if not self._running:
+            raise RuntimeError("start() first")
+        amps, interval = self._read_amplitudes()
+        return Reading(amps[self.signal_channel], interval, self._sequence)
+
+    def read_channels(self):
+        """``{CHANNEL_A: volts, CHANNEL_B: volts}`` for the newest record."""
+        if not self._running:
+            raise RuntimeError("start() first")
+        amps, _ = self._read_amplitudes()
+        return amps
 
     def read_amplitude(self):
         """``read().amplitude_v`` for a tight control loop."""
         return self.read().amplitude_v
 
     def latest(self, records=1):
-        """Return the most recent ``records`` raw records, ``(n, length)`` uint16.
+        """Return the most recent ``records`` raw records.
 
-        This is the payload path: after the probe touches down, the last few
-        records of the same stream are already laser-triggered, so no separate
-        acquisition is needed.
+        Single channel: ``(n, record_length)`` uint16.  Dual channel: a dict
+        ``{CHANNEL_A: (n, len), CHANNEL_B: (n, len)}``.  This is the payload
+        path: after the probe touches down, the last few records of the same
+        stream are already laser-triggered, so no separate acquisition is
+        needed.
         """
         if not self._running:
             raise RuntimeError("start() first")
@@ -373,14 +452,20 @@ class AlazarStreamSensor(object):
         have = 0
         while have < records:
             view, index = self._next_buffer()
-            usable = (view.size // self.record_length) * self.record_length
-            block = view[:usable].reshape(-1, self.record_length)
-            take = min(records - have, block.shape[0])
-            collected.append(block[-take:].copy())
+            channels = self._records(view)
+            take = min(records - have, channels[self.signal_channel].shape[0])
+            collected.append(dict((ch, arr[-take:].copy())
+                                  for ch, arr in channels.items()))
             have += take
             self._release(index)
-        data = np.concatenate(collected, axis=0)
-        return data[-records:]
+
+        out = {}
+        for ch in collected[0]:
+            out[ch] = np.concatenate([block[ch] for block in collected],
+                                     axis=0)[-records:]
+        if self.channel_count == 1:
+            return out[self.channel_mask]
+        return out
 
     # -- diagnostics -------------------------------------------------------- #
 
@@ -443,11 +528,13 @@ def _selftest():
 
     check("channel A resolves", channel_mask("A") == ats.CHANNEL_A)
     check("channel B resolves", channel_mask("B") == ats.CHANNEL_B)
+    check("A+B resolves to both",
+          mask_of("A+B") == (ats.CHANNEL_A | ats.CHANNEL_B))
     try:
         channel_mask("A+B")
-        check("A+B is rejected", False)
+        check("A+B is rejected as a signal channel", False)
     except ValueError:
-        check("A+B is rejected", True)
+        check("A+B is rejected as a signal channel", True)
 
     print("")
     if problems:
@@ -458,9 +545,15 @@ def _selftest():
 
 
 def _probe(args):
+    channels = args.channels or args.channel
+    rate = args.sample_rate_hz
+    if rate is None:
+        rate = 2e9 if channels == "A+B" else DEFAULT_SAMPLE_RATE_HZ
+
     sensor = AlazarStreamSensor(
-        sample_rate_hz=args.sample_rate_hz,
-        channel=args.channel,
+        sample_rate_hz=rate,
+        channels=channels,
+        signal_channel=args.signal_channel,
         record_length=args.record_length,
         f0_hz=args.f0_hz,
         records_per_buffer=args.records_per_buffer,
@@ -470,16 +563,30 @@ def _probe(args):
     sensor.open()
     sensor.configure()
     sensor.start()
+    dual = sensor.channel_count == 2
     print("")
-    print("%10s %14s %12s" % ("t (s)", "amp (mV)", "interval (ms)"))
+    if dual:
+        print("%10s %12s %12s %10s" % ("t (s)", "A (mV)", "B (mV)", "dt (ms)"))
+    else:
+        print("%10s %14s %12s" % ("t (s)", "amp (mV)", "dt (ms)"))
     started = time.time()
+    count = 0
     try:
         while time.time() - started < args.duration:
-            reading = sensor.read()
-            if reading.sequence <= 10 or reading.sequence % 50 == 0:
-                print("%10.3f %14.3f %12.3f"
-                      % (time.time() - started, reading.amplitude_v * 1e3,
-                         reading.interval_s * 1e3))
+            amps = sensor.read_channels()
+            count += 1
+            if count <= 10 or count % 50 == 0:
+                if dual:
+                    print("%10.3f %12.3f %12.3f %10.3f"
+                          % (time.time() - started,
+                             amps[ats.CHANNEL_A] * 1e3,
+                             amps[ats.CHANNEL_B] * 1e3,
+                             sensor.last_interval * 1e3))
+                else:
+                    print("%10.3f %14.3f %12.3f"
+                          % (time.time() - started,
+                             amps[sensor.signal_channel] * 1e3,
+                             sensor.last_interval * 1e3))
                 sys.stdout.flush()
     finally:
         sensor.stop()
@@ -496,9 +603,15 @@ def main(argv=None):
     )
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--probe", action="store_true")
-    parser.add_argument("--channel", default="A", choices=("A", "B"))
+    parser.add_argument("--channel", default="A", choices=("A", "B"),
+                        help="single input (shorthand for --channels)")
+    parser.add_argument("--channels", default=None, choices=("A", "B", "A+B"),
+                        help="inputs to acquire; A+B runs at 2 GS/s")
+    parser.add_argument("--signal-channel", default=None, choices=("A", "B"),
+                        help="input the amplitude is taken from (default A)")
     parser.add_argument("--f0-hz", type=float, default=DEFAULT_F0_HZ)
-    parser.add_argument("--sample-rate-hz", type=float, default=DEFAULT_SAMPLE_RATE_HZ)
+    parser.add_argument("--sample-rate-hz", type=float, default=None,
+                        help="default 4 GS/s for one channel, 2 GS/s for A+B")
     parser.add_argument("--record-length", type=int, default=DEFAULT_RECORD_LENGTH)
     parser.add_argument("--records-per-buffer", type=int,
                         default=DEFAULT_RECORDS_PER_BUFFER)
