@@ -218,7 +218,19 @@ class AlazarStreamSensor(object):
         self.channel_mask = mask_of(channels if channels is not None else channel)
         self.channel_count = 2 if self.channel_mask == (
             ats.CHANNEL_A | ats.CHANNEL_B) else 1
-        self.signal_channel = channel_mask(signal_channel or "A")
+        if signal_channel is None:
+            # Single input: the amplitude comes from that input.  Dual: default
+            # to A, which is the imaging channel.
+            self.signal_channel = (
+                self.channel_mask if self.channel_count == 1 else ats.CHANNEL_A
+            )
+        else:
+            self.signal_channel = channel_mask(signal_channel)
+            if not (self.channel_mask & self.signal_channel):
+                raise ValueError(
+                    "signal channel %s is not among the acquired channels"
+                    % ("A" if self.signal_channel == ats.CHANNEL_A else "B")
+                )
         self.record_length = int(record_length)
         self.f0_hz = float(f0_hz)
         self.input_range = input_range
@@ -244,6 +256,10 @@ class AlazarStreamSensor(object):
         self.errors = []
 
     # -- lifecycle ---------------------------------------------------------- #
+
+    @property
+    def running(self):
+        return self._running
 
     def _log(self, message):
         if self.verbose:

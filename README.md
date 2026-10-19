@@ -377,8 +377,8 @@ the board, quoted with the driver's own error strings:
 
 So a second channel cannot record while A runs at 4 GS/s, and switching channels
 per point is expensive: `setCaptureClock` ~65 ms, changing the channel mask
-~55 ms, one arm/abort cycle ~46 ms, which is ~120 ms for an
-A(4 GS/s) → B(100 MS/s) round trip.
+~55 ms, one arm/abort cycle ~46 ms -- which compounds, on the real class, into
+**231 ms to leave B for A and 217 ms to come back**, i.e. ~450 ms per point.
 
 There is no third analog input to fall back on. AUX I/O is a 3.3 V TTL digital
 input -- `GET_AUX_INPUT_LEVEL` returns 0 or 1, and its only input functions are
@@ -390,7 +390,12 @@ So two analog signals at the same time means **A+B at 2 GS/s**; that is the only
 simultaneous configuration this board has. For anything below 50 MHz it costs
 nothing in bandwidth (2 GS/s is 20x Nyquist), but a 4096-point record then spans
 2.048 µs instead of 1.024 µs, so the reconstruction's sample rate has to become
-2e9 -- or the record has to drop to 2048 points to keep the same window.
+2e9 -- or the record has to drop to 2048 points to keep the same window. In
+practice 2 GS/s was rejected for the imaging channel because of the ~500 MHz
+interleaving artefact (see the next-but-one section).
+
+**A relay on the AUX pin is the way out**: keep A at 4 GS/s and switch which
+cable it sees. That is the `relay` feedback mode, documented below.
 
 ### One continuous stream instead of switching
 
@@ -423,6 +428,68 @@ python -m Alazar_imaging.AlazarStreamSensor --probe --duration 3
 python -m Alazar_imaging.AlazarStreamSensor --probe --channels A+B --signal-channel B
 python -m Alazar_imaging.AlazarStreamSensor --probe --channel B --sample-rate-hz 2e9
 ```
+
+### Keeping 4 GS/s: a relay on the AUX pin
+
+The three obvious ways to get an approach signal *and* a 4 GS/s imaging input
+all fail, and it is worth writing down why, because each one looks fine until
+it is measured:
+
+| approach | why it does not work |
+| --- | --- |
+| one cable into A, demod at 4 GS/s | the approach monitor and the transducer are two different signals on two different connectors; they cannot be summed into one input |
+| approach on B at 100 MS/s, reconfig per point | works, but a B→A→B round trip measured **231 ms + 217 ms** per point, and the clock change is a PLL relock, not a memory copy |
+| A+B together at 2 GS/s | the only simultaneous configuration, but at 2 GS/s the two ADCs are interleaved, and the interleaving mismatch puts a **spurious tone near 500 MHz** in the spectrum. Below 50 MHz that should not matter -- yet it was observed on this board, so 2 GS/s is not trusted for the imaging channel |
+
+What is left is to keep **A at 4 GS/s for the entire scan** and move the
+*connector*, not the clock. A two-way signal relay on the CH A input does that,
+driven by the AUX I/O pin configured as `AUX_OUT_SERIAL_DATA` (the SDK's
+"general purpose digital output", level 0/1). AUX cannot carry a signal, but it
+can certainly carry a logic level, and toggling it mid-stream was verified not
+to disturb the acquisition.
+
+```
+AUX centre pin --[1k]-- base of a small NPN / logic-level MOSFET
+                          collector -- relay coil -- +5 V   (flyback diode across the coil)
+                          relay common -- CH A centre pin
+                          relay N.O.   -- approach monitor
+                          relay N.C.   -- PA transducer
+```
+
+Do not drive the coil from the pin. Use a signal relay with gold contacts or a
+reed relay (closes in ~1 ms); a power relay will inject switching noise into a
+microvolt-level PA signal.
+
+`PAM_AFM_FEEDBACK=relay` selects this path. The stream is configured once, at
+the start of the scan, on A at 4 GS/s; each point flips the relay to the
+approach cable, runs the PI, flips to the transducer, waits
+`PAM_AFM_RELAY_SETTLE_MS` (default 2.0 ms) and sums the newest
+`PAM_AFM_RECORDS_PER_POINT` records out of the *same* stream. Nothing is
+reconfigured, so the ~450 ms round trip disappears.
+
+Measured on the board with `_test_relay_fb.py` (no relay fitted, both cables
+summed -- the numbers below are timing, not signal):
+
+| step | cost |
+| --- | --- |
+| `prepare()` (one-time 4 GS/s configure + arm) | 206 ms |
+| approach reading | 4.0 ms (252 Hz) |
+| `payload(1)` incl. 2 ms relay settle | 4.0 ms |
+| `payload(256)` | 129 ms |
+| payload dtype | `uint32`, shape `(1, 4096)` |
+
+```bat
+set PAM_AFM_FEEDBACK=relay
+set PAM_AFM_RELAY_SETTLE_MS=2.0
+python -m Alazar_imaging.AlazarAuxRelay --level 1
+python -m Alazar_imaging.AlazarAuxRelay --toggle 0.5
+```
+
+The relay's `active_level` is a constructor argument, because which position is
+"approach" depends on which contact the monitor is on. `AlazarAuxRelay` exposes
+`--active-level {0,1}` for that. Until a relay is actually fitted, `relay` mode
+still runs -- it just sums both cables, which is the right way to bench-test the
+code path without touching the optics.
 
 ### On-FPGA FFT
 
@@ -590,6 +657,8 @@ make the deployment reproducible; replace them for a different installation.
 ├── Alazar_imaging/                  # hardware wrappers and ATS examples
 │   ├── AlazarNPTSystem.py           # ATS9373 NPT acquisition wrapper
 │   ├── AlazarFFTSpectrum.py         # on-FPGA FFT readout, trigger-free
+│   ├── AlazarStreamSensor.py        # continuous stream + host demod, 250 Hz
+│   ├── AlazarAuxRelay.py            # AUX pin as a TTL output, for a 2-way relay
 │   ├── BPC303NativeController.py   # closed-loop BPC303 controller
 │   ├── PriorStageAdapter.py         # Prior ProScan behind the BPC303 interface
 │   ├── PriorUnifiedStage.py         # Prior SDK transport

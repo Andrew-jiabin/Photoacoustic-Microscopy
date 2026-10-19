@@ -64,8 +64,25 @@ Two feedback paths
     board reconfiguration per point, because the point payload is still taken at
     4 GS/s to keep the file contract.
 
-Neither path uses a trigger.  Both trigger engines are disabled, which is what
-the current hardware requires: the laser trigger is not connected.
+``PAM_AFM_FEEDBACK=stream``
+    100 MS/s continuous stream on ``PAM_AFM_FEEDBACK_CHANNEL`` (default ``B``).
+    Reports **volts**.  Unlike ``demod`` it never aborts and re-arms, so a
+    reading costs ~4 ms instead of ~46 ms (~250 Hz against ~20 Hz), and the
+    approach signal can sit on a cable that is not the imaging input.  The board
+    still switches to 4 GS/s on A for the payload, but that switch is started
+    before the XY move so it overlaps the stage travel.
+
+``PAM_AFM_FEEDBACK=relay``
+    A stays at **4 GS/s for the whole scan** and a two-way signal relay on the
+    AUX I/O digital output selects which cable A sees: the 10 MHz monitor while
+    approaching, the transducer while taking the point.  This is the only path
+    that keeps A at 4 GS/s *and* takes the approach reading from its own cable,
+    because the board has two analog inputs and no more -- AUX is a 3.3 V TTL
+    digital port, not a third channel, and ``TRIG IN`` cannot be digitized.
+    Costs a relay instead of 231 ms + 217 ms of reconfiguration per point.
+
+None of these paths uses a trigger.  Both trigger engines are disabled, which is
+what the current hardware requires: the laser trigger is not connected.
 
 Usage
 -----
@@ -94,6 +111,8 @@ from Alazar_imaging.AlazarBurstCapture import (
     demod_amplitude_mean,
 )
 from Alazar_imaging.AlazarFFTSpectrum import AlazarFFTSpectrum
+from Alazar_imaging.AlazarStreamSensor import AlazarStreamSensor
+from Alazar_imaging.AlazarAuxRelay import AuxRelay
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
 from Nanomax.afm_scan import (
     AfmApproachConfig,
@@ -172,8 +191,10 @@ class RunConfig:
 
         # Feedback.
         self.feedback = env_str("PAM_AFM_FEEDBACK", "demod").lower()
-        if self.feedback not in ("demod", "fft"):
-            raise ValueError("PAM_AFM_FEEDBACK must be 'demod' or 'fft'")
+        if self.feedback not in ("demod", "fft", "stream", "relay"):
+            raise ValueError(
+                "PAM_AFM_FEEDBACK must be 'demod', 'fft', 'stream' or 'relay'"
+            )
         self.f0_hz = env_float("PAM_AFM_F0_HZ", 10e6)
         self.band_hz = env_float("PAM_AFM_BAND_HZ", 100e3)
         self.feedback_records = env_int("PAM_AFM_FEEDBACK_RECORDS", 8)
@@ -183,12 +204,24 @@ class RunConfig:
         # repeatable; the FFT path additionally gets 24.4 kHz bins instead of
         # 977 kHz ones.  Verified on the board: both modes run trigger-free.
         self.feedback_rate_msps = env_float("PAM_AFM_FEEDBACK_RATE_MSPS", 100.0)
+        # "stream" mode only.  The approach signal lives on its own cable, so it
+        # needs its own input; B is the one A does not use.  The timeout sets the
+        # feedback rate while no laser is present: 100 ticks = 1 ms -> ~250 Hz.
+        self.feedback_channel = env_str("PAM_AFM_FEEDBACK_CHANNEL", "B").upper()
+        self.feedback_timeout_ticks = env_int("PAM_AFM_FEEDBACK_TIMEOUT_TICKS", 100)
+        # "relay" mode: time the relay contact needs after switching to the
+        # imaging input before the payload is taken, so the transient is not
+        # included in the A-line.
+        self.relay_settle_s = env_float("PAM_AFM_RELAY_SETTLE_MS", 2.0) / 1000.0
         self.input_range_volts = env_float("PAM_AFM_INPUT_RANGE_V", DEFAULT_INPUT_RANGE_VOLTS)
 
         # Setpoint.
         self.setpoint = env_float("PAM_AFM_SETPOINT", 0.0)
+        # "relay" also reads a 10 MHz amplitude off the digitizer, so it is in
+        # volts as well; only the on-FPGA FFT reports arbitrary units.
         self.setpoint_unit = env_str(
-            "PAM_AFM_SETPOINT_UNIT", "V" if self.feedback == "demod" else "au"
+            "PAM_AFM_SETPOINT_UNIT",
+            "V" if self.feedback in ("demod", "stream", "relay") else "au",
         )
 
         # Control engine.  "pi" tracks a setpoint and can correct in either
@@ -338,10 +371,22 @@ class RunConfig:
         )
 
     def describe(self):
-        lines = [
+        # "relay" always runs A at 4 GS/s, whatever PAM_AFM_FEEDBACK_RATE_MSPS
+        # says -- that variable belongs to the B-channel stream.
+        rate_msps = 4000.0 if self.feedback == "relay" else self.feedback_rate_msps
+        feedback_line = (
             "feedback        : %s (%.0f MS/s, %d records, f0 = %.3f MHz, band +/-%.1f kHz)"
-            % (self.feedback, self.feedback_rate_msps, self.feedback_records,
-               self.f0_hz / 1e6, self.band_hz / 1e3),
+            % (self.feedback, rate_msps, self.feedback_records,
+               self.f0_hz / 1e6, self.band_hz / 1e3)
+        )
+        if self.feedback == "stream":
+            feedback_line += ", channel %s, timeout %d ticks" % (
+                self.feedback_channel, self.feedback_timeout_ticks)
+        elif self.feedback == "relay":
+            feedback_line += ", channel A, AUX relay, settle %.1f ms" % (
+                self.relay_settle_s * 1e3)
+        lines = [
+            feedback_line,
             "setpoint        : %.4f %s" % (self.setpoint, self.setpoint_unit),
         ]
         if self.control_mode == "pi":
@@ -452,6 +497,103 @@ class DemodFeedback:
         return "time-domain demodulation at %.0f MS/s" % (self.sample_rate_hz / 1e6)
 
 
+class StreamFeedback:
+    """10 MHz amplitude in volts from a continuous stream on one input.
+
+    ``DemodFeedback`` aborts and re-arms the board for every reading, which
+    costs ~46 ms and caps the approach loop at ~20 Hz.  This one leaves the
+    stream running and takes the newest record of each DMA buffer: ~4 ms per
+    reading at a 1 ms trigger timeout, i.e. ~250 Hz, with no reconfiguration.
+
+    The input is normally B, because A has to stay at 4 GS/s for the payload
+    and the two signals are on separate cables.
+    """
+
+    unit = "V"
+
+    def __init__(self, sensor, config):
+        self.sensor = sensor
+        self.config = config
+
+    def prepare(self):
+        if self.sensor.board is None:
+            self.sensor.open()
+        if not self.sensor.running:
+            self.sensor.configure()
+            self.sensor.start()
+
+    def measure(self):
+        return self.sensor.read().amplitude_v, 0.0
+
+    def value(self):
+        return self.measure()
+
+    def finish(self):
+        self.sensor.stop()
+
+    def describe(self):
+        return "continuous stream on channel %s at %.0f MS/s" % (
+            self.config.feedback_channel, self.config.feedback_rate_msps)
+
+
+class RelayFeedback:
+    """A stays at 4 GS/s; an AUX-driven relay selects the input cable.
+
+    The two signals cannot share an input, and the board has no third analog
+    channel, so a two-way signal relay on CH A is the only way to keep 4 GS/s
+    for the whole scan.  The digitizer streams A at 4 GS/s from the first point
+    to the last; the relay decides whether A sees the 10 MHz monitor (approach)
+    or the PA transducer (imaging).
+
+    Switching cost is the relay's own time (a reed relay closes in ~1 ms),
+    against 231 ms + 217 ms measured for reconfiguring the board between
+    B(100 MS/s) and A(4 GS/s).
+    """
+
+    unit = "V"
+
+    def __init__(self, sensor, relay, config):
+        self.sensor = sensor
+        self.relay = relay
+        self.config = config
+
+    def prepare(self):
+        if self.sensor.board is None:
+            self.sensor.open()
+        self.relay.open()
+        if not self.sensor.running:
+            self.sensor.configure()
+            self.sensor.start()
+        self.relay.select("approach")
+
+    def measure(self):
+        return self.sensor.read().amplitude_v, 0.0
+
+    def value(self):
+        return self.measure()
+
+    def payload(self, records):
+        """Switch to the imaging input, then sum the newest ``records`` records."""
+        self.relay.select("imaging")
+        time.sleep(self.config.relay_settle_s)
+        data = self.sensor.latest(records)
+        if data.size == 0:
+            return np.zeros((1, self.sensor.record_length), dtype=np.uint32)
+        # dtype=uint32 is explicit: on Windows numpy promotes a uint32 sum to
+        # uint64, and the .mat contract wants one uint32 row per pixel.
+        return data.astype(np.uint32).sum(axis=0, keepdims=True, dtype=np.uint32)
+
+    def finish(self):
+        # Stop the stream, then park the relay on the imaging input: with the
+        # scan over, the transducer is the input a later acquisition expects.
+        # prepare() switches back to the approach cable.
+        self.sensor.stop()
+        self.relay.select("imaging")
+
+    def describe(self):
+        return "continuous stream on A at 4 GS/s, AUX relay selects the input"
+
+
 class FftFeedback:
     """10 MHz amplitude in board units from the on-FPGA FFT."""
 
@@ -521,6 +663,54 @@ class SyntheticFeedback:
 
     def describe(self):
         return "synthetic surface at z=%.3f um, rise %.2f um" % (self.z_contact, self.rise_um)
+
+
+def build_feedback(config):
+    """Create the feedback source named by ``PAM_AFM_FEEDBACK``.
+
+    Kept in one place so the scan and the Z sweep cannot drift apart.
+    """
+    if config.feedback == "demod":
+        daq = AlazarBurstCapture(
+            sample_rate_hz=config.feedback_rate_msps * 1e6,
+            input_range_volts=config.input_range_volts,
+            verbose=False,
+        )
+        return DemodFeedback(daq, config)
+    if config.feedback == "fft":
+        fft = AlazarFFTSpectrum(
+            sample_rate_hz=config.feedback_rate_msps * 1e6,
+            input_range_volts=config.input_range_volts,
+            verbose=False,
+        )
+        return FftFeedback(fft, config)
+    if config.feedback == "stream":
+        sensor = AlazarStreamSensor(
+            sample_rate_hz=config.feedback_rate_msps * 1e6,
+            channels=config.feedback_channel,
+            signal_channel=config.feedback_channel,
+            record_length=4096,
+            f0_hz=config.f0_hz,
+            records_per_buffer=config.feedback_records,
+            timeout_ticks=config.feedback_timeout_ticks,
+            input_range_volts=config.input_range_volts,
+            verbose=False,
+        )
+        return StreamFeedback(sensor, config)
+    if config.feedback == "relay":
+        sensor = AlazarStreamSensor(
+            sample_rate_hz=4e9,
+            channels="A",
+            signal_channel="A",
+            record_length=4096,
+            f0_hz=config.f0_hz,
+            records_per_buffer=config.feedback_records,
+            timeout_ticks=config.feedback_timeout_ticks,
+            input_range_volts=config.input_range_volts,
+            verbose=False,
+        )
+        return RelayFeedback(sensor, AuxRelay(verbose=False), config)
+    raise ValueError("unknown feedback %r" % config.feedback)
 
 
 def load_external_source(spec, config):
@@ -666,22 +856,10 @@ def run_scan(config, args):
         print("")
 
         board = None
-        if config.feedback == "demod":
-            daq = AlazarBurstCapture(
-                sample_rate_hz=config.feedback_rate_msps * 1e6,
-                input_range_volts=config.input_range_volts,
-                verbose=False,
-            )
-            feedback = DemodFeedback(daq, config)
-        elif config.feedback == "fft":
-            fft = AlazarFFTSpectrum(
-                sample_rate_hz=config.feedback_rate_msps * 1e6,
-                input_range_volts=config.input_range_volts,
-                verbose=False,
-            )
-            feedback = FftFeedback(fft, config)
-        else:
-            raise ValueError("unknown feedback %r" % config.feedback)
+        feedback = build_feedback(config)
+        # In "demod" the approach DAQ doubles as the payload DAQ; in "fft" and
+        # "stream" the payload needs its own 4 GS/s acquisition on A.
+        daq = getattr(feedback, "daq", None)
 
         print("  feedback        : %s" % feedback.describe())
         feedback.prepare()
@@ -722,6 +900,14 @@ def run_scan(config, args):
                 "AFM_POINT_BEGIN", index=index, total=total_points,
                 x_um="%.4f" % target_x, y_um="%.4f" % target_y, z_from_um="%.4f" % z_cursor,
             )
+            # Restart the approach stream before the move.  The clock change and
+            # the arm cost are then paid while the stage is travelling instead
+            # of after it has settled.  "relay" keeps its stream running across
+            # the whole scan, so this only flips the input back to the approach
+            # cable -- a millisecond, not a reconfiguration.
+            if config.feedback in ("fft", "stream", "relay"):
+                feedback.prepare()
+
             stage.move_xyz(x=target_x, y=target_y)
             stage.wait_until_settled(
                 target_x, target_y,
@@ -729,11 +915,6 @@ def run_scan(config, args):
                 tolerance_step=config.position_tolerance_um,
                 timeout_s=config.settle_timeout_s,
             )
-
-            if config.feedback == "fft":
-                # The FFT stream was stopped by the previous point's payload
-                # capture; restart it before approaching.
-                feedback.prepare()
 
             result, z_retract = scanner.scan_point(
                 z_cursor, here_xy=(target_x, target_y), next_xy=next_xy
@@ -755,20 +936,26 @@ def run_scan(config, args):
                     break
                 continue
 
-            # Payload at the setpoint.  In FFT mode the board must be switched
-            # back to 4 GS/s for this, which is why the stream is stopped first.
-            if config.feedback == "fft":
-                feedback.finish()
-                if daq is None:
-                    daq = AlazarBurstCapture(
-                        sample_rate_hz=4e9,
-                        input_range_volts=config.input_range_volts,
-                        verbose=False,
-                    )
-                    daq.open()
-                daq.configure()
+            # Payload at the setpoint.  In FFT and stream modes the board must be
+            # switched back to 4 GS/s on A for this, which is why the approach
+            # stream is stopped first.  "relay" never leaves 4 GS/s: the relay
+            # moves A from the approach cable to the transducer and the same
+            # stream keeps delivering records, so nothing is reconfigured.
+            if config.feedback == "relay":
+                payload = feedback.payload(config.records_per_point)
+            else:
+                if config.feedback in ("fft", "stream"):
+                    feedback.finish()
+                    if daq is None:
+                        daq = AlazarBurstCapture(
+                            sample_rate_hz=4e9,
+                            input_range_volts=config.input_range_volts,
+                            verbose=False,
+                        )
+                        daq.open()
+                    daq.configure()
 
-            payload = daq.capture_summed(config.records_per_point)
+                payload = daq.capture_summed(config.records_per_point)
             if payload.size == 0:
                 z_failures += 1
                 append_run_log("AFM_POINT_FAILED", index=index, reason="no_payload")
@@ -923,20 +1110,7 @@ def probe_z(config, args):
         z0 = float(stage.get_axis_position("z"))
         sign = 1.0 if config.approach_sign >= 0 else -1.0
 
-        if config.feedback == "demod":
-            daq = AlazarBurstCapture(
-                sample_rate_hz=config.feedback_rate_msps * 1e6,
-                input_range_volts=config.input_range_volts,
-                verbose=False,
-            )
-            feedback = DemodFeedback(daq, config)
-        else:
-            fft = AlazarFFTSpectrum(
-                sample_rate_hz=config.feedback_rate_msps * 1e6,
-                input_range_volts=config.input_range_volts,
-                verbose=False,
-            )
-            feedback = FftFeedback(fft, config)
+        feedback = build_feedback(config)
         feedback.prepare()
 
         print("\nZ sweep from %.4f um, %+.3f um per step, %d steps"
