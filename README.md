@@ -362,14 +362,62 @@ timeout is what makes the board self-trigger when the interval expires. The
 parameter is an **integer count of 10 µs ticks**, not seconds; passing a float
 raises `ctypes.ArgumentError`.
 
+### Channels and the 4 GS/s limit
+
+4 GS/s is not a property of the board, it is a property of *one* channel: the
+two 2 GS/s ADCs are interleaved in dual-edge sampling (DES) mode. Measured on
+the board, quoted with the driver's own error strings:
+
+| request | result |
+| --- | --- |
+| A, 4 GS/s | ok |
+| B, 4 GS/s | `ApiInconsistentChannel` |
+| A+B, 4 GS/s | `ApiDESOnlySupportedInSingleChannelMode` |
+| A+B, 2 GS/s | ok |
+
+So a second channel cannot record while A runs at 4 GS/s, and switching channels
+per point is expensive: `setCaptureClock` ~65 ms, changing the channel mask
+~55 ms, one arm/abort cycle ~46 ms, which is ~120 ms for an
+A(4 GS/s) → B(100 MS/s) round trip.
+
+### One continuous stream instead of switching
+
+That 46 ms is the abort/re-arm cycle, not the board. Leaving a single 4 GS/s
+stream running and demodulating the newest record of each DMA buffer gives:
+
+| trigger timeout | records/s | readings/s (8 records/buffer) |
+| --- | --- | --- |
+| 10 µs | 196 962 | 24 620 |
+| 100 µs | 22 180 | 2 772 |
+| 1 ms | 2 016 | 252 |
+| 10 ms | 200 | 25 |
+
+`AlazarStreamSensor` wraps exactly that: `TRIG_EXTERNAL` plus a timeout, one
+channel, host-side demodulation with a precomputed phasor (~6 µs per reading).
+With the laser off the board self-triggers; with the laser on it follows the
+laser as long as the timeout is longer than the laser period. Approach feedback
+and the imaging payload then come from the same stream, with no reconfiguration
+between points.
+
+```bat
+python -m Alazar_imaging.AlazarStreamSensor --selftest
+python -m Alazar_imaging.AlazarStreamSensor --probe --duration 3
+python -m Alazar_imaging.AlazarStreamSensor --probe --channel B --sample-rate-hz 2e9
+```
+
 ### On-FPGA FFT
 
 `DSP_MODULE 0 id=0x10000 (FFT) v5.32, maxLength 4096, 12 bits`. With
 `fftSetup` at 4096 points the board returns 2048 `FLOAT_AMP2` bins per record,
 so the 10 MHz peak is read without a host-side FFT: **325 readings/s** versus
-**20 readings/s** for the time-domain path. Both modes run at 100 MS/s, because
+**20 readings/s** for the abort-per-reading time-domain path. (That 20 is the
+re-arm cost, not the path's ceiling: a continuous time-domain stream does
+252–24 620 readings/s, see the table above.) Both modes run at 100 MS/s, because
 a 4096-sample record then spans 40.96 µs — 409.6 cycles of the carrier, against
 10.24 cycles at 4 GS/s.
+
+`--channel B` is supported. The FFT block processes one input, so B at 100 MS/s
+works and B at 4 GS/s does not (see the channel table above).
 
 Three traps, all found on hardware:
 

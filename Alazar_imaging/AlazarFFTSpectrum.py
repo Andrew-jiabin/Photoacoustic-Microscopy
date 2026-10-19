@@ -126,6 +126,28 @@ DEFAULT_OUTPUT_FORMAT = ats.FFT_OUTPUT_FORMAT_FLOAT_AMP2
 DEFAULT_TRIGGER_TIMEOUT_TICKS = 1
 
 
+def channel_mask(value):
+    """Turn ``"A"``, ``"B"`` or an SDK mask into a single-channel mask.
+
+    The FFT block processes one input, so a mask naming both channels is
+    rejected here rather than being passed to ``fftSetup`` and failing later
+    with an opaque driver error.
+    """
+    if isinstance(value, str):
+        text = value.strip().upper().replace(" ", "")
+        resolved = {"A": ats.CHANNEL_A, "B": ats.CHANNEL_B}.get(text)
+        if resolved is None:
+            raise ValueError("channel must be 'A' or 'B', got %r" % (value,))
+        return resolved
+    mask = int(value)
+    if mask not in (ats.CHANNEL_A, ats.CHANNEL_B):
+        raise ValueError(
+            "the on-FPGA FFT processes one input; channel mask 0x%X is not A or B"
+            % mask
+        )
+    return mask
+
+
 def _sample_rate_map():
     """``{Hz: ats.SAMPLE_RATE_*}`` built from the constants this SDK exports.
 
@@ -246,7 +268,11 @@ def noise_amplitude(power, freqs, f0_hz, half_bandwidth_hz, guard_bins=6):
 # --------------------------------------------------------------------------- #
 
 class AlazarFFTSpectrum:
-    """Free-running on-FPGA FFT acquisition on channel A.
+    """Free-running on-FPGA FFT acquisition on one input channel.
+
+    ``channel="A"`` is the imaging input; ``channel="B"`` lets a second cable
+    carry the approach signal.  Only one of them can be active at a time: the
+    board has a single timebase, so B cannot run while A is at 4 GS/s.
 
     Typical use::
 
@@ -271,6 +297,7 @@ class AlazarFFTSpectrum:
         window=ats.DSP_WINDOW_HANNING,
         input_range=DEFAULT_INPUT_RANGE,
         input_range_volts=DEFAULT_INPUT_RANGE_VOLTS,
+        channel="A",
         records_per_buffer=8,
         buffer_count=4,
         timeout_ms=2000,
@@ -289,6 +316,7 @@ class AlazarFFTSpectrum:
         self.window = window
         self.input_range = input_range
         self.input_range_volts = float(input_range_volts)
+        self.channel = channel_mask(channel)
         self.records_per_buffer = int(records_per_buffer)
         self.buffer_count = int(buffer_count)
         self.timeout_ms = int(timeout_ms)
@@ -382,9 +410,9 @@ class AlazarFFTSpectrum:
         # Clock: internal, fixed rate.
         board.setCaptureClock(ats.INTERNAL_CLOCK, self.sample_rate, ats.CLOCK_EDGE_RISING, 0)
 
-        # Channel A only: the DSP block can process a single input.
+        # One input only: the DSP block cannot process both channels.
         board.inputControlEx(
-            ats.CHANNEL_A, ats.DC_COUPLING, self.input_range, ats.IMPEDANCE_50_OHM
+            self.channel, ats.DC_COUPLING, self.input_range, ats.IMPEDANCE_50_OHM
         )
 
         # Trigger disabled on both engines, plus a non-zero trigger timeout.
@@ -417,7 +445,7 @@ class AlazarFFTSpectrum:
         # buffers are allocated and before beforeAsyncRead.
         self.bytes_per_record = int(
             self.fft_module.fftSetup(
-                ats.CHANNEL_A,
+                self.channel,
                 self.record_length,
                 self.fft_length,
                 self.output_format,
@@ -493,7 +521,7 @@ class AlazarFFTSpectrum:
         # In DSP mode the third argument is the number of *bytes* per output
         # record, not samples -- see ATS-SDK Guide 25.1 section 4.1.3.
         board.beforeAsyncRead(
-            ats.CHANNEL_A,
+            self.channel,
             0,
             self.bytes_per_record,
             self.records_per_buffer,
@@ -791,6 +819,7 @@ def _probe(args):
     fft = AlazarFFTSpectrum(
         sample_rate_hz=args.sample_rate_hz,
         record_length=args.record_length,
+        channel=args.channel,
         records_per_buffer=args.records_per_buffer,
         trigger_timeout_ticks=args.trigger_timeout_ticks,
         verbose=not args.quiet,
@@ -851,6 +880,8 @@ def main(argv=None):
                         help="half width of the integration band (Hz)")
     parser.add_argument("--duration", type=float, default=5.0, help="probe duration (s)")
     parser.add_argument("--sample-rate-hz", type=float, default=DEFAULT_SAMPLE_RATE_HZ)
+    parser.add_argument("--channel", default="A", choices=("A", "B"),
+                        help="input channel to process; the FFT block handles one")
     parser.add_argument("--record-length", type=int, default=DEFAULT_RECORD_LENGTH)
     parser.add_argument("--records-per-buffer", type=int, default=8)
     parser.add_argument("--buffers", type=int, default=1,
