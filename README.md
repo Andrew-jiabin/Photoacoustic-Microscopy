@@ -451,14 +451,42 @@ to disturb the acquisition.
 ```
 AUX centre pin --[1k]-- base of a small NPN / logic-level MOSFET
                           collector -- relay coil -- +5 V   (flyback diode across the coil)
-                          relay common -- CH A centre pin
-                          relay N.O.   -- approach monitor
-                          relay N.C.   -- PA transducer
+                          pole 1 common -- CH A centre pin
+                          pole 1 N.O.   -- approach monitor
+                          pole 1 N.C.   -- PA transducer
+                          pole 2 common -- 50 ohm to ground
+                          pole 2 N.O.   -- PA transducer      crossed on purpose: pole 2
+                          pole 2 N.C.   -- approach monitor   terminates whichever cable
+                                                              CH A is not connected to
 ```
+
+Pole 2 is deliberately crossed against pole 1. Energised, CH A sits on the
+monitor and the transducer sees the dummy load; released, the roles swap. Wiring
+pole 2 the same way round as pole 1 would put the 50 Ω load on the *selected*
+cable, halving the source impedance -- which looks like a 6 dB drop and is easy
+to misread as a sensitivity change.
 
 Do not drive the coil from the pin. Use a signal relay with gold contacts or a
 reed relay (closes in ~1 ms); a power relay will inject switching noise into a
 microvolt-level PA signal.
+
+Prefer a **DPDT** relay over an SPDT one -- still one AUX line. One pole
+switches the signal into CH A, the other parks the unselected cable on a 50 Ω
+dummy load, so the source stays terminated and CH A is connected at every
+instant. With an SPDT, put the transducer on the normally-closed contact so a
+power loss parks CH A on the PA signal rather than leaving it open.
+
+**Is the switching hard on CH A? No.** Signal and reed relays are
+break-before-make, so the two cables are never joined and neither source ever
+drives the other. During the transfer (a few hundred µs) the input has no DC
+path and the reading is invalid, but that is not a stress on the part: the input
+has a 50 Ω termination and ESD diodes, and at millivolt levels there is no
+arcing across the contacts (that needs tens of volts). What damages an input is
+overvoltage, not switching -- keep both cables inside the selected input range.
+Two things do matter, and neither is destructive: bond both cable shields to the
+same ground at the digitizer end, or the two sources drive a ground loop through
+the contacts; and keep the coil wires away from the signal wires, because the
+flyback transient couples capacitively rather than through the contacts.
 
 `PAM_AFM_FEEDBACK=relay` selects this path. The stream is configured once, at
 the start of the scan, on A at 4 GS/s; each point flips the relay to the

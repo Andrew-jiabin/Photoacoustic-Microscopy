@@ -31,6 +31,41 @@ relay coil between +5 V and the collector/drain, flyback diode across the coil.
 Do **not** drive the coil from the pin directly: it is a logic output, not a
 driver.  Use a signal relay with gold contacts (a reed relay is fine at 10 MHz);
 a power relay will inject noise into a microvolt-level PA signal.
+
+Prefer a **DPDT** relay over an SPDT one, still driven by the single AUX line:
+one pole switches the signal into CH A, the other parks the *unselected*
+cable on a 50 Ohm dummy load.  That keeps the source terminated (no open-circuit
+pickup) and leaves CH A connected at every instant, including the
+break-before-make gap.  With an SPDT, wire the transducer to the normally-closed
+contact so a power loss parks CH A on the PA signal instead of leaving it open.
+
+The second pole must be **crossed** against the first::
+
+    pole 1 common -> CH A        pole 2 common -> 50 Ohm to ground
+    pole 1 N.O.   -> monitor     pole 2 N.O.   -> transducer
+    pole 1 N.C.   -> transducer  pole 2 N.C.   -> monitor
+
+Wired the same way round, the dummy load would land on the *selected* cable and
+halve the source impedance -- a 6 dB drop that reads like a sensitivity change.
+
+Is the switching itself hard on CH A?
+-------------------------------------
+No.  Signal and reed relays are break-before-make, so the two cables are never
+connected to each other -- there is no moment when one source drives the other.
+The input has a 50 Ohm termination and ESD diodes; during the few hundred
+microseconds of the transfer the input simply has no DC path and the reading is
+invalid, which is not a stress on the part.  At millivolt levels there is no
+arcing across the contacts (that needs tens of volts).  What would damage the
+input is overvoltage, not switching, so keep both cables inside the selected
+input range.
+
+Two things that do matter, and neither is destructive:
+
+* bond the shields of both cables to the same ground at the digitizer end, or
+  the two sources will drive a ground loop through the contacts and the reading
+  will jump;
+* keep the coil wires away from the signal wires -- the flyback transient is
+  coupled capacitively, not through the contacts.
 """
 
 from __future__ import annotations
