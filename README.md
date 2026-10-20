@@ -407,6 +407,30 @@ inherit it: approach readings when the laser is off, laser-locked records when
 it is on. Set `PAM_AFM_LASER_PERIOD_US` if the repetition rate changes; the
 timeout is derived from it as `ceil(1.3 × period / 10 µs)`.
 
+**Check it before trusting a scan.** With TRIG IN as the source the board
+replaces the LSB of every sample with the live state of the trigger input, so a
+long slow record is a 1-bit copy of the trigger waveform — no scope needed:
+
+```bat
+python -m Tool_code.check_trigger
+```
+
+With nothing connected it prints `no trigger pulse seen` and `0.00 % duty`. With
+a pulse it prints the frequency, period and jitter, and tells you whether the
+timeout is long enough. Measured on this rig with the cable unplugged:
+
+```
+  low bits 0..3 constant : yes
+  trigger bit high       : 0.00 % duty
+  transitions            : 0
+VERDICT: no trigger pulse seen.
+```
+
+That `bits 0..3 constant` line is itself the proof that samples are left-aligned
+in the 16-bit word, i.e. that bit 4 really is the 12-bit LSB being overwritten.
+Run this after any rewiring: it is the difference between "the scan looks odd"
+and "the trigger cable fell out".
+
 ### Channels and the 4 GS/s limit
 
 4 GS/s is not a property of the board, it is a property of *one* channel: the
