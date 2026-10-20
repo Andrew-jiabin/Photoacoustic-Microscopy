@@ -294,7 +294,10 @@ class AlazarBurstCapture:
         data = self.capture(records)
         if data.size == 0:
             return np.zeros((1, self.samples_per_record), dtype=np.uint32)
-        summed = data.astype(np.uint32).sum(axis=0, keepdims=True)
+        # dtype must be given explicitly: numpy's sum() promotes uint32 to the
+        # platform's default integer (uint64 on Windows), which breaks the
+        # documented contract and, in data_io, the uint16 cast downstream.
+        summed = data.astype(np.uint32).sum(axis=0, keepdims=True, dtype=np.uint32)
         return summed
 
     def capture_averaged(self, records):

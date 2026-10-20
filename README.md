@@ -614,14 +614,112 @@ code path without touching the optics.
 so the 10 MHz peak is read without a host-side FFT: **325 readings/s** versus
 **20 readings/s** for the abort-per-reading time-domain path. (That 20 is the
 re-arm cost, not the path's ceiling: a continuous time-domain stream does
-252–24 620 readings/s, see the table above.) Both modes run at 100 MS/s, because
-a 4096-sample record then spans 40.96 µs — 409.6 cycles of the carrier, against
-10.24 cycles at 4 GS/s.
+252–24 620 readings/s, see the table above.)
 
 `--channel B` is supported. The FFT block processes one input, so B at 100 MS/s
 works and B at 4 GS/s does not (see the channel table above).
 
-Three traps, all found on hardware:
+### The 4096-point cap, and how to get 1 MHz anyway
+
+The DSP module will not transform more than 4096 points, and this is the driver
+refusing the call rather than a limit worth working around. `Tool_code/check_fft_cap.py`
+asks it directly:
+
+```
+DSP modules: 1
+  [0] id=0x10000 FFT  v5.32 maxLength=4096
+
+AlazarFFTSetup, record length == transform length:
+    4096 points -> ok, 2048 bins, bin width 976.6 kHz
+    8192 points -> ApiFftSizeTooLarge
+   16384 points -> ApiFftSizeTooLarge
+
+AlazarFFTSetup, zero-padded (short record, long transform):
+  record  4096, fft  8192 -> ApiFftSizeTooLarge
+  record  4096, fft 16384 -> ApiFftSizeTooLarge
+```
+
+Both arguments are capped, so even the dishonest route — a 4096-sample record
+zero-padded to a longer transform, which interpolates the spectrum without
+widening the window — is closed. There is no way around it from the host.
+
+Resolution is set by the **window in time**, not by the bin count, so with the
+point count fixed the only lever left is the clock. Measured with a synthetic
+250 MHz + 251 MHz pair (equal amplitudes, random relative phase, 16 draws,
+median of the valley depth between the two peaks — 0 = one hump, 1 = valley down
+to the baseline):
+
+| record | rate | window | bin | Hann main lobe | valley depth | resolves 1 MHz |
+|---|---|---|---|---|---|---|
+| 4096 | 4 GS/s | 1.024 µs | 976.6 kHz | 1953.1 kHz | **0.00** | no |
+| 8192 | 4 GS/s | 2.048 µs | 488.3 kHz | 976.6 kHz | 0.44 | marginal |
+| **4096** | **2 GS/s** | **2.048 µs** | **488.3 kHz** | **976.6 kHz** | **0.99** | **yes** |
+| 16384 | 4 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | yes |
+
+The third row is the one that matters: **2 GS/s on the on-chip FFT resolves
+1 MHz**, because the same 4096 points then span twice the time. It also covers
+0..1 GHz, which is the band of interest, and the readout rate does not change —
+the record is 4096 points whatever the clock, and the DSP path reads at 10 kHz
+either way. `PAM_Main_Nanomax_AFM.py` therefore defaults
+`PAM_AFM_FEEDBACK_RATE_MSPS` to 2000 when `PAM_AFM_FEEDBACK=fft` and the backend
+is `board`, and prints the achieved lobe width (with a `1 MHz NOT resolved`
+warning) so the setting is visible rather than implied.
+
+If the band above 1 GHz matters, `PAM_AFM_FFT_BACKEND=host` moves the samples and
+transforms them in numpy, where the record length is free:
+
+| samples | bin | Hann main lobe | capture (64 rec) | FFT | bytes |
+|---|---|---|---|---|---|
+| 4096 | 976.6 kHz | 1953.1 kHz | 49.5 ms | 6.0 ms | 512 KB |
+| 8192 | 488.3 kHz | 976.6 kHz | 49.5 ms | 6.0 ms | 1 MB |
+| 16384 | 244.1 kHz | 488.3 kHz | 48.7 ms | 12.5 ms | 2 MB |
+
+Capture time is flat in record length — the period is set by the trigger timeout,
+not the record — so the longer record costs only the FFT. The trade is
+throughput, not resolution: a 64-record spectrum point costs **39.5 ms on the
+on-chip path** (2 GS/s, 2048 bins) against **104 ms on the host path**
+(4 GS/s, 16384 points, 8193 bins).
+
+### Spurious lines at Fs/4 and Fs/2
+
+The board emits narrow lines at exactly Fs/4 and Fs/2 that move with the clock,
+so they are the board, not the sample. Measured with no signal connected,
+256 records, Hann window, level as peak-to-median ratio:
+
+| rate | Fs/4 | Fs/2 | 3Fs/8 |
+|---|---|---|---|
+| 4 GS/s | 1000 MHz, 10.1× | 2000 MHz (Nyquist) | 1500 MHz, 1.8× |
+| 2 GS/s | 500 MHz, 2.4× | 1000 MHz (outside the returned bins) | 750 MHz, 1.1× |
+| 1 GS/s | 250 MHz, 1.2× | 500 MHz (outside) | 375 MHz, 1.0× |
+
+This is the spike that made 2 GS/s look unusable at 500 MHz: it is at Fs/4, it is
+three bins wide, and at 4 GS/s the same line sits at 1 GHz and four times higher
+above the floor. Treat an exact-Fs/4 or exact-Fs/2 line as instrumentation, not
+signal — it is a good reason to record a dark reference and subtract it.
+
+### A spectrum as the point payload
+
+`PAM_AFM_PAYLOAD=spectrum` stores one averaged amplitude spectrum per point
+instead of an A-line. On the FFT path it costs no reconfiguration and no 4 GS/s
+acquisition at all, and the shape is the bin count rather than the sample count.
+Because the `.mat` contract has nowhere to put a frequency axis, the scan also
+writes a `.npz` beside it (`spectrum_io.SpectrumDataset`): amplitudes, the axis,
+the positions and the acquisition settings. `PAM_Spectrum_Reconstruction.py` reads
+that and draws any band from it:
+
+```
+python PAM_Spectrum_Reconstruction.py scan.npz --list
+python PAM_Spectrum_Reconstruction.py scan.npz --band 5 15 --band 100 400 --save out
+python PAM_Spectrum_Reconstruction.py scan.npz --point 5.0 5.0 --log
+python PAM_Spectrum_Reconstruction.py scan.npz --interactive
+```
+
+`MATLAB/PAM_Reconstruction_4.m` still opens the `.mat` — it will be reading a
+spectrum instead of a waveform, which is why the new script exists: `max - min`
+over a spectrum mixes every frequency together, while a band reduction keeps the
+content the spectrum was recorded for.
+
+Three traps on the DSP path, all found on hardware:
 
 - **FFT/DSP methods live on `DspModule`, not on `Board`.** Probing
   `hasattr(ats.Board, "fftSetup")` wrongly suggests the SDK is missing six
@@ -634,6 +732,12 @@ Three traps, all found on hardware:
 - **`ats.AlazarAllocBufferU16` is not a module attribute** — it lives on the
   loaded DLL object. Allocate through `ats.DMABuffer(handle, c_uint16, bytes)`
   and reinterpret the memory as float32; it owns the matching free.
+
+And one on the payload path: `read_spectrum()` returns one **DMA buffer**, which
+already averages `records_per_buffer` (8) records. Converting
+`records_per_point` to a buffer count instead of calling it once per record cut a
+64-record spectrum point from **316 ms to 39.5 ms** — the old loop was pulling
+eight times the data it asked for.
 
 ### Timing
 
@@ -765,6 +869,8 @@ make the deployment reproducible; replace them for a different installation.
 ├── PAM_Main_Nanomax.py              # current integrated PAM entry point
 ├── PAM_Main_Nanomax_ClosedLoop.py   # NanoMax closed-loop PAM, no laser
 ├── PAM_Main_Nanomax_AFM.py          # AFM approach/retract scan, PI Z loop
+├── PAM_Spectrum_Reconstruction.py   # any band from a spectrum scan, + point spectra
+├── spectrum_io.py                   # SpectrumDataset: amplitudes + frequency axis
 ├── PAM_Main_Prior.py                # Prior ProScan PAM, no laser
 ├── PAM_Main_LBTEK.py                # validated 1D LBTEK PAM path
 ├── PAM_Main.py                      # legacy Prior acquisition loop
@@ -773,6 +879,7 @@ make the deployment reproducible; replace them for a different installation.
 ├── Alazar_imaging/                  # hardware wrappers and ATS examples
 │   ├── AlazarNPTSystem.py           # ATS9373 NPT acquisition wrapper
 │   ├── AlazarFFTSpectrum.py         # on-FPGA FFT readout, trigger-free
+│   ├── AlazarHostSpectrum.py        # host FFT, long records, resolves 1 MHz
 │   ├── AlazarStreamSensor.py        # continuous stream + host demod, 250 Hz
 │   ├── AlazarAuxRelay.py            # AUX pin as a TTL output, for a 2-way relay
 │   ├── BPC303NativeController.py   # closed-loop BPC303 controller

@@ -59,10 +59,37 @@ Two feedback paths
     1.024 us record).
 
 ``PAM_AFM_FEEDBACK=fft``
-    100 MS/s, on-FPGA 4096-point FFT (see ``AlazarFFTSpectrum``).  Reports
-    **board units** but with ~98 kHz selectivity and no host-side FFT.  Costs one
-    board reconfiguration per point, because the point payload is still taken at
-    4 GS/s to keep the file contract.
+    The point spectrum.  ``PAM_AFM_FFT_BACKEND`` says where the transform runs.
+
+    ``board`` (default) uses the ATS9373's DSP module, which the driver caps at
+    4096 points -- ask for 8192 and it returns ``ApiFftSizeTooLarge``, and it
+    refuses zero-padding (4096-sample record, 8192-point transform) with the same
+    error, so the cap cannot be worked around from the host.  Since the point
+    count is fixed, the only lever on resolution is the clock:
+
+    ==============  ============  ===========  ===========  ============
+    rate            window        bin          main lobe    range
+    ==============  ============  ===========  ===========  ============
+    4 GS/s          1.024 us      976.6 kHz    1953.1 kHz   0..2 GHz
+    **2 GS/s**      2.048 us      488.3 kHz     976.6 kHz   0..1 GHz
+    1 GS/s          4.096 us      244.1 kHz     488.3 kHz   0..0.5 GHz
+    ==============  ============  ===========  ===========  ============
+
+    At 4 GS/s two peaks 1 MHz apart merge into one hump -- measured on the
+    board, a 250/251 MHz pair leaves a valley depth of 0.00, i.e. invisible.  At
+    2 GS/s the same pair leaves 0.99, which is unambiguous, and 2 GS/s still
+    covers 0..1 GHz, the whole band of interest.  So **2 GS/s is the default for
+    this backend**, and the readout rate is unchanged -- 10 kHz either way,
+    because the record is 4096 points whatever the clock.
+
+    ``host`` moves the samples and transforms them in numpy, where the record
+    length is free.  4 GS/s with 16384 points gives 244.1 kHz bins and a
+    488.3 kHz lobe over 0..2 GHz.  Capture time is flat in record length --
+    48.7 ms at 16384 against 49.5 ms at 4096 for 64 records, because the period
+    is set by the trigger timeout -- so the longer record costs only the FFT,
+    12.5 ms against 6.0 ms.  Use it when the band above 1 GHz matters; use the
+    on-chip path when it does not, because it is two orders of magnitude faster
+    per reading.
 
 ``PAM_AFM_FEEDBACK=stream``
     100 MS/s continuous stream on ``PAM_AFM_FEEDBACK_CHANNEL`` (default ``B``).
@@ -81,8 +108,28 @@ Two feedback paths
     digital port, not a third channel, and ``TRIG IN`` cannot be digitized.
     Costs a relay instead of 231 ms + 217 ms of reconfiguration per point.
 
-None of these paths uses a trigger.  Both trigger engines are disabled, which is
-what the current hardware requires: the laser trigger is not connected.
+Trigger
+-------
+``PAM_AFM_TRIGGER=external`` (default) waits on ``TRIG IN`` and falls back to
+``PAM_AFM_FEEDBACK_TIMEOUT_TICKS`` when no pulse arrives.  That is a hardware OR
+of "the laser said go" and "the timeout said go", not a mode switch: with the
+laser running every record is laser-locked, and with the trigger cable
+unplugged the same configuration still produces records.  The timeout must
+exceed one laser period (952 us at 1050 Hz), otherwise it fires before every
+pulse, never locks, and reports no error while doing so.
+
+``PAM_AFM_TRIGGER=disable`` free-runs.  Much faster -- 2.0 ms against 381.8 ms
+for 64 records -- but the records are not laser-locked, so a summed A-line is
+built from random phases of the laser cycle and the photoacoustic signal
+averages away.  Only for bench work and for a rig with no trigger cable.
+
+Spectrum payload
+----------------
+``PAM_AFM_PAYLOAD=spectrum`` stores one averaged amplitude spectrum per point
+instead of an A-line.  With ``PAM_AFM_FEEDBACK=fft`` that costs no board
+reconfiguration at all, and the file also gets a ``.npz`` beside the ``.mat``
+holding the frequency axis -- see ``spectrum_io.SpectrumDataset`` and
+``PAM_Spectrum_Reconstruction.py``.
 
 Usage
 -----
@@ -111,6 +158,10 @@ from Alazar_imaging.AlazarBurstCapture import (
     demod_amplitude_mean,
 )
 from Alazar_imaging.AlazarFFTSpectrum import AlazarFFTSpectrum
+from Alazar_imaging.AlazarHostSpectrum import (
+    AlazarHostSpectrum,
+    amplitude_to_volts,
+)
 from Alazar_imaging.AlazarStreamSensor import AlazarStreamSensor
 from Alazar_imaging.AlazarAuxRelay import AuxRelay
 from Alazar_imaging.BPC303NativeController import BPC303NativeController
@@ -130,6 +181,7 @@ from Nanomax.scan_utils import (
     scan_shape_from_range,
     validate_sample_trajectory,
 )
+from spectrum_io import SpectrumDataset
 
 
 for _stream in (sys.stdout, sys.stderr):
@@ -195,16 +247,48 @@ class RunConfig:
             raise ValueError(
                 "PAM_AFM_FEEDBACK must be 'demod', 'fft', 'stream' or 'relay'"
             )
+        # Where the FFT is computed.  "board" is the ATS9373's DSP module, which
+        # the driver caps at 4096 points -- asked for 8192 it returns
+        # ApiFftSizeTooLarge, and it refuses zero-padding (4096-record,
+        # 8192-transform) with the same error, so there is no way around it from
+        # the host.  "host" moves the samples and transforms them in numpy, where
+        # the record length is limited only by DMA memory.
+        self.fft_backend = env_str("PAM_AFM_FFT_BACKEND", "board").lower()
+        if self.fft_backend not in ("board", "host"):
+            raise ValueError("PAM_AFM_FFT_BACKEND must be 'board' or 'host'")
+        self.fft_length = env_int(
+            "PAM_AFM_FFT_LENGTH", 16384 if self.fft_backend == "host" else 4096
+        )
+        if self.fft_backend == "board" and self.fft_length > 4096:
+            raise ValueError(
+                "the on-FPGA FFT module stops at 4096 points (ApiFftSizeTooLarge); "
+                "set PAM_AFM_FFT_BACKEND=host for a longer record"
+            )
         self.f0_hz = env_float("PAM_AFM_F0_HZ", 10e6)
         self.band_hz = env_float("PAM_AFM_BAND_HZ", 100e3)
         self.feedback_records = env_int("PAM_AFM_FEEDBACK_RECORDS", 8)
-        # 4 GS/s for everything that looks at the PA signal, because the band of
-        # interest reaches 1 GHz: at 4 GS/s the on-FPGA FFT covers 0..2 GHz with
-        # 976.6 kHz bins, while 100 MS/s would stop at 50 MHz.  Only the B-channel
-        # approach stream runs slower, since it only has to see 10 MHz.
-        # Verified on the board: the 4 GS/s FFT is also *faster*, 2500 readings/s
-        # against 322, because a 4096-point record is 1.024 us instead of 41 us.
-        default_rate = 100.0 if self.feedback == "stream" else 4000.0
+        # Sample rate.  The band of interest reaches 1 GHz, so 100 MS/s is out --
+        # it stops at 50 MHz.  Which rate is right above that depends on whether
+        # the record length is capped, because resolution is window *length*:
+        #
+        #   on-chip FFT, 4096 points fixed -> the only lever is the clock
+        #     4 GS/s: 1.024 us window, 976.6 kHz bins, 1953.1 kHz lobe, 0..2 GHz
+        #             -> 1 MHz NOT resolved (measured valley depth 0.00)
+        #     2 GS/s: 2.048 us window, 488.3 kHz bins,  976.6 kHz lobe, 0..1 GHz
+        #             -> 1 MHz resolved (valley depth 0.99 in the same test)
+        #   host FFT, record length free
+        #     4 GS/s, 16384 points: 4.096 us window, 244.1 kHz bins, 0..2 GHz
+        #
+        # So for the on-chip path 2 GS/s is the right default: it is the only
+        # on-chip setting that resolves 1 MHz, and it still covers the whole band
+        # of interest.  Measured on the board, the DSP path reads at 10 kHz either
+        # way -- the record is 4096 points regardless of the clock.
+        if self.feedback == "stream":
+            default_rate = 100.0
+        elif self.feedback == "fft" and self.fft_backend == "board":
+            default_rate = 2000.0
+        else:
+            default_rate = 4000.0
         self.feedback_rate_msps = env_float("PAM_AFM_FEEDBACK_RATE_MSPS", default_rate)
         # "external" follows the laser and falls back to the timeout; "disable"
         # free-runs.  Free running is much faster (the timeout no longer sets the
@@ -235,24 +319,27 @@ class RunConfig:
         # What a point record is.  "time" is the original contract: (1, 4096)
         # uint16 A-lines at 4 GS/s.  "spectrum" stores the averaged FFT instead,
         # which is only possible on the FFT path -- and then the whole scan stays
-        # at 100 MS/s, so the per-point reconfiguration to 4 GS/s disappears.
+        # at 4 GS/s with no reconfiguration at all.
         self.payload = env_str("PAM_AFM_PAYLOAD", "time").lower()
         if self.payload not in ("time", "spectrum"):
             raise ValueError("PAM_AFM_PAYLOAD must be 'time' or 'spectrum'")
         if self.payload == "spectrum" and self.feedback != "fft":
             raise ValueError(
                 "PAM_AFM_PAYLOAD=spectrum requires PAM_AFM_FEEDBACK=fft "
-                "(only the on-FPGA path produces a spectrum)"
+                "(only the FFT path produces a spectrum)"
             )
         self.input_range_volts = env_float("PAM_AFM_INPUT_RANGE_V", DEFAULT_INPUT_RANGE_VOLTS)
 
         # Setpoint.
         self.setpoint = env_float("PAM_AFM_SETPOINT", 0.0)
         # "relay" also reads a 10 MHz amplitude off the digitizer, so it is in
-        # volts as well; only the on-FPGA FFT reports arbitrary units.
+        # volts as well, and so is the host FFT: full scale is the input range,
+        # so the conversion is exact rather than a calibration to be measured.
+        # Only the on-FPGA FFT reports arbitrary units.
         self.setpoint_unit = env_str(
             "PAM_AFM_SETPOINT_UNIT",
-            "V" if self.feedback in ("demod", "stream", "relay") else "au",
+            "V" if self.feedback in ("demod", "stream", "relay")
+            or (self.feedback == "fft" and self.fft_backend == "host") else "au",
         )
 
         # Control engine.  "pi" tracks a setpoint and can correct in either
@@ -416,15 +503,25 @@ class RunConfig:
         elif self.feedback == "relay":
             feedback_line += ", channel A, AUX relay, settle %.1f ms" % (
                 self.relay_settle_s * 1e3)
+        elif self.feedback == "fft":
+            # The number that decides whether the run can answer the question it
+            # was started for, so print it rather than leaving it to be derived.
+            bin_hz = rate_msps * 1e6 / float(self.fft_length)
+            feedback_line += (
+                ", %s FFT %d points -> %.1f kHz bins, main lobe %.1f kHz"
+                % (self.fft_backend, self.fft_length, bin_hz / 1e3, 2 * bin_hz / 1e3)
+            )
+            if 2 * bin_hz > 1e6:
+                feedback_line += "  (1 MHz NOT resolved)"
         lines = [
             feedback_line,
             "setpoint        : %.4f %s" % (self.setpoint, self.setpoint_unit),
         ]
         if self.payload == "spectrum":
             lines.append(
-                "payload         : averaged FFT spectrum, %d records/point "
-                "(stays at %.0f MS/s, no 4 GS/s reconfiguration)"
-                % (self.records_per_point, self.feedback_rate_msps)
+                "payload         : averaged FFT spectrum, %d bins/point from %d records "
+                "(no 4 GS/s reconfiguration)"
+                % (self.fft_length // 2 + 1, self.records_per_point)
             )
         if self.control_mode == "pi":
             kp, ki = self.effective_gains()
@@ -676,9 +773,16 @@ class FftFeedback:
         and no 4 GS/s acquisition.  Shape is ``(1, n_bins)`` uint16, which keeps
         the .mat contract's dtype even though the length is the bin count rather
         than 4096 samples.
+
+        ``read_spectrum`` returns one DMA buffer, and that buffer already
+        averages ``records_per_buffer`` records.  So ``records`` has to be
+        converted to a buffer count: the old loop called it once per record and
+        therefore pulled eight times the data it asked for, which is why a
+        64-record point took 316 ms instead of 40 ms.
         """
+        per_buffer = max(1, int(getattr(self.fft, "records_per_buffer", 1) or 1))
+        count = max(1, int(round(float(records) / per_buffer)))
         total = None
-        count = max(1, int(records))
         for _ in range(count):
             amplitude, _freqs = self.fft.read_amplitude_spectrum()
             total = amplitude if total is None else total + amplitude
@@ -693,6 +797,84 @@ class FftFeedback:
         return "on-FPGA FFT at %.0f MS/s (module v%s)" % (
             self.config.feedback_rate_msps, info.get("version", "?")
         )
+
+
+class HostFftFeedback:
+    """10 MHz amplitude in volts from a host-side FFT at 4 GS/s.
+
+    Reports volts rather than board units because the host path has an exact
+    calibration -- full scale is the input range, so a raw amplitude of 32768 is
+    ``PAM_AFM_INPUT_RANGE_V`` volts.  The on-FPGA module's internal scaling would
+    have to be measured first, which is why that path reports "au".
+
+    Unlike :class:`FftFeedback` there is no stream to keep running: each reading
+    is one burst capture, so the board is left idle between readings.  That costs
+    a few milliseconds per reading and removes the "first buffer after an abort
+    is NaN" problem the DSP path has.
+    """
+
+    unit = "V"
+
+    # _capture_payload reads this: the burst capture inside the host FFT is
+    # already at 4 GS/s on A, which is exactly what a time-domain point payload
+    # needs, so the board must not be opened a second time.
+    owns_payload_daq = True
+
+    def __init__(self, fft, config):
+        self.fft = fft
+        self.config = config
+
+    def prepare(self):
+        if self.fft.board is None:
+            self.fft.open()
+            self.fft.configure()
+
+    def _band(self, freqs):
+        """Bins inside f0 +/- band, widened to the nearest bins when empty.
+
+        At 244 kHz bins a 100 kHz band can still fall between two bin centres,
+        so the same floor as AlazarFFTSpectrum.band_mask applies.
+        """
+        lo = self.config.f0_hz - abs(self.config.band_hz)
+        hi = self.config.f0_hz + abs(self.config.band_hz)
+        mask = (freqs >= lo) & (freqs <= hi)
+        if not mask.any():
+            nearest = int(np.argmin(np.abs(freqs - self.config.f0_hz)))
+            mask = np.zeros(freqs.size, dtype=bool)
+            mask[max(0, nearest - 1):nearest + 2] = True
+        return mask
+
+    def measure(self):
+        amplitude, freqs = self.fft.read_spectrum(records=self.config.feedback_records)
+        band = self._band(freqs)
+        peak = float(amplitude[band].max())
+        outside = ~band
+        floor = float(np.median(amplitude[outside])) if outside.any() else 0.0
+        snr = peak / floor if floor > 0 else 0.0
+        return float(amplitude_to_volts(peak, self.config.input_range_volts)), snr
+
+    def value(self):
+        return self.measure()
+
+    def payload(self, records):
+        """The spectrum payload: ``(1, fft_length/2 + 1)`` uint16 ADC units.
+
+        Raw ADC units rather than volts so the value fits uint16 with room to
+        spare -- full scale is 32768 -- and so a spectrum can live in the same
+        dtype as an A-line.  ``SpectrumDataset.to_volts`` converts on the way out.
+        """
+        amplitude, _freqs = self.fft.read_spectrum(records=records)
+        return np.clip(np.rint(amplitude), 0, 65535).astype(np.uint16)[None, :]
+
+    def capture_summed(self, records):
+        """Time-domain payload, reusing the capture the FFT already owns."""
+        return self.fft.capture.capture_summed(records)
+
+    def finish(self):
+        return None
+
+    def describe(self):
+        return self.fft.describe()
 
 
 class SyntheticFeedback:
@@ -741,8 +923,19 @@ def build_feedback(config):
         )
         return DemodFeedback(daq, config)
     if config.feedback == "fft":
+        if config.fft_backend == "host":
+            host = AlazarHostSpectrum(
+                sample_rate_hz=config.feedback_rate_msps * 1e6,
+                record_length=config.fft_length,
+                input_range_volts=config.input_range_volts,
+                trigger=config.trigger,
+                trigger_timeout_ticks=config.feedback_timeout_ticks,
+                verbose=False,
+            )
+            return HostFftFeedback(host, config)
         fft = AlazarFFTSpectrum(
             sample_rate_hz=config.feedback_rate_msps * 1e6,
+            record_length=config.fft_length,
             input_range_volts=config.input_range_volts,
             trigger=config.trigger,
             trigger_timeout_ticks=config.feedback_timeout_ticks,
@@ -791,12 +984,17 @@ def _capture_payload(config, feedback, daq_box):
     to point without a global.
     """
     if config.payload == "spectrum":
-        # Same stream the feedback loop is reading, averaged a little longer.
-        # No reconfiguration, no 4 GS/s acquisition, and the shape is the bin
-        # count rather than the sample count.
+        # Same acquisition the feedback loop is reading, averaged a little
+        # longer.  No reconfiguration, no separate 4 GS/s acquisition, and the
+        # shape is the bin count rather than the sample count.
         return feedback.payload(config.records_per_point)
     if config.feedback == "relay":
         return feedback.payload(config.records_per_point)
+    if getattr(feedback, "owns_payload_daq", False):
+        # The host FFT already holds a 4 GS/s burst capture on A, which is
+        # exactly what the time payload needs.  Opening the board a second time
+        # to get an identical acquisition would only add a failure mode.
+        return feedback.capture_summed(config.records_per_point)
     if config.feedback in ("fft", "stream"):
         feedback.finish()
         if daq_box["daq"] is None:
@@ -810,6 +1008,65 @@ def _capture_payload(config, feedback, daq_box):
             daq_box["daq"].open()
         daq_box["daq"].configure()
     return daq_box["daq"].capture_summed(config.records_per_point)
+
+
+def _save_spectrum_dataset(mat_path, all_data, config, scan_w, scan_h):
+    """Write the ``.npz`` that carries what the ``.mat`` contract cannot.
+
+    A ``.mat`` written by ``data_io`` is a dict of ``(1, N)`` arrays plus a
+    metadata struct, and nothing in it says what the N columns *are*.  For an
+    A-line that is fine -- 4096 samples at a fixed rate.  For a spectrum it is
+    not: the reader would have to guess the FFT length, the sample rate and
+    whether the values are amplitudes or powers.  ``SpectrumDataset`` stores the
+    axis next to the data, so the guess never has to happen.
+
+    The frequency axis is derived as ``n * fs / fft_length`` rather than with
+    ``rfftfreq``, because the on-FPGA path returns ``fft_length / 2`` bins (it
+    drops the Nyquist bin) while the host path returns ``fft_length / 2 + 1``.
+    The linear rule covers both.
+    """
+    n_bins = int(np.asarray(all_data[0][0]).size)
+    sample_rate_hz = float(config.feedback_rate_msps) * 1e6
+    freqs_hz = (np.arange(n_bins, dtype=np.float64)
+                * sample_rate_hz / float(config.fft_length))
+
+    rows, positions = [], []
+    for payload, pos_str, _meta in all_data:
+        values = np.asarray(payload).reshape(-1)
+        if values.size != n_bins:
+            continue
+        try:
+            xy = [float(part) for part in str(pos_str).split(",")[:2]]
+        except ValueError:
+            continue
+        if len(xy) != 2:
+            continue
+        rows.append(values.astype(np.float32))
+        positions.append(xy)
+    if not rows:
+        return None
+
+    dataset = SpectrumDataset(
+        np.vstack(rows),
+        freqs_hz,
+        np.asarray(positions, dtype=np.float32),
+        records=np.full(len(rows), int(config.records_per_point), dtype=np.int32),
+        meta={
+            "scan_shape": [int(scan_w), int(scan_h)],
+            "step_um": float(config.step_um),
+            "sample_rate_hz": sample_rate_hz,
+            "fft_length": int(config.fft_length),
+            "fft_backend": config.fft_backend,
+            "records_per_point": int(config.records_per_point),
+            "input_range_volts": float(config.input_range_volts),
+            "payload_kind": "spectrum",
+            "units": "adc",
+        },
+    )
+    written = dataset.save(
+        os.path.splitext(mat_path)[0] + ".npz", mat_sidecar=False
+    )
+    return written[0] if written else None
 
 
 def load_external_source(spec, config):
@@ -1114,6 +1371,10 @@ def run_scan(config, args):
             "afm_setpoint_unit": config.setpoint_unit,
             "afm_f0_hz": config.f0_hz,
             "afm_band_hz": config.band_hz,
+            "afm_payload": config.payload,
+            "afm_fft_backend": config.fft_backend,
+            "afm_fft_length": config.fft_length,
+            "afm_input_range_v": config.input_range_volts,
             "afm_approach_sign": config.approach_sign,
             "afm_coarse_step_um": config.coarse_step_um,
             "afm_fine_step_um": config.fine_step_um,
@@ -1134,6 +1395,12 @@ def run_scan(config, args):
             if isinstance(value, (int, float, str, bool)):
                 stage_metadata["afm_" + key] = value
 
+        # A spectrum payload is already an average, not a sum, so it must not go
+        # through the "divide by records_per_point" path in data_io -- that would
+        # scale it by 1/N a second time.  average_enable=False stores the array
+        # as-is, which is also what keeps it inside uint16.
+        average_enable = config.payload != "spectrum"
+
         result = save_scan_data(
             all_data,
             scan_w,
@@ -1141,7 +1408,7 @@ def run_scan(config, args):
             config.step_um,
             config.records_per_point,
             SAMPLES_PER_RECORD,
-            True,
+            average_enable,
             SCAN_TARGET,
             COORDINATE_UNIT,
             None,
@@ -1154,6 +1421,22 @@ def run_scan(config, args):
             stage_metadata=stage_metadata,
         )
         path = result.get("path") if isinstance(result, dict) else None
+
+        # The .mat contract has nowhere to put a frequency axis, so a spectrum
+        # scan also gets a .npz beside it: one amplitude spectrum per point plus
+        # the axis, the positions and the acquisition settings.  That is what
+        # PAM_Spectrum_Reconstruction.py reads.
+        if path and config.payload == "spectrum":
+            try:
+                npz_path = _save_spectrum_dataset(
+                    path, all_data, config, scan_w, scan_h
+                )
+                if npz_path:
+                    print("  spectrum: %s" % npz_path)
+            except Exception as exc:                       # noqa: BLE001
+                append_run_log("AFM_SPECTRUM_SAVE_FAILED", error=repr(exc))
+                print("  spectrum sidecar failed: %r" % (exc,))
+
         append_run_log("AFM_SCAN_END", points=len(all_data), failures=z_failures, path=path)
         if path:
             print("  saved: %s" % path)
