@@ -619,7 +619,7 @@ re-arm cost, not the path's ceiling: a continuous time-domain stream does
 `--channel B` is supported. The FFT block processes one input, so B at 100 MS/s
 works and B at 4 GS/s does not (see the channel table above).
 
-### The 4096-point cap, and what it costs to beat it
+### The 4096-point cap, and why the clock cannot buy the resolution back
 
 The DSP module will not transform more than 4096 points, and this is the driver
 refusing the call rather than a limit worth working around. `Tool_code/check_fft_cap.py`
@@ -653,40 +653,80 @@ down to the baseline.
 
 | record | rate | window | bin | Hann main lobe | valley depth | 1 MHz | 64-rec point |
 |---|---|---|---|---|---|---|---|
-| 4096 | 4 GS/s | 1.024 µs | 976.6 kHz | 1953.1 kHz | 0.00 | invisible | 39.5 ms |
-| 4096 | 2 GS/s | 2.048 µs | 488.3 kHz | 976.6 kHz | 0.37 | a notch | 39.5 ms |
-| 8192 | 2 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | clean | 57.1 ms |
-| 16384 | 4 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | clean | 64.1 ms |
+| **4096, on-chip** | **4 GS/s** | **1.024 µs** | **976.6 kHz** | **1953.1 kHz** | **0.00** | invisible | **39.5 ms** |
+| 4096, on-chip | 2 GS/s | 2.048 µs | 488.3 kHz | 976.6 kHz | 0.37 | a notch | 39.5 ms |
+| 8192, host | 2 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | clean | 57.1 ms |
+| **16384, host** | **4 GS/s** | **4.096 µs** | **244.1 kHz** | **488.3 kHz** | **0.99** | **clean** | **64.1 ms** |
 
 The rule that falls out of it: **Hann needs about four bins of separation** before
 the valley is unambiguous, so 1 MHz needs 244 kHz bins. At 488 kHz the two tones
 are two bins apart — a notch you can see, not a valley you can trust — and at
 976 kHz they are one bin apart and simply merge.
 
-Which means the on-chip FFT **cannot cleanly resolve 1 MHz at any clock**: its
-4096 points reach 488 kHz bins at 2 GS/s and no further. 2 GS/s is still the right
-default for it, because 0.37 beats 0.00 and 2 GS/s covers 0..1 GHz, but it buys a
-notch rather than a separation. Clean 1 MHz needs the host path.
+So the on-chip FFT **cannot cleanly resolve 1 MHz**: its 4096 points reach 488 kHz
+bins at 2 GS/s and no further. The remaining question is whether a slower clock is
+worth using at all, and measuring the answer settled it — see below. It is not:
+2 GS/s is rejected for two independent reasons, and the resolution it buys is only
+a notch anyway. `PAM_Main_Nanomax_AFM.py` therefore keeps
+`PAM_AFM_FEEDBACK_RATE_MSPS` at 4000, refuses a lower value outright, and prints
+the achieved lobe width with a `1 MHz NOT resolved` warning so the limitation is
+visible rather than implied.
 
-`PAM_Main_Nanomax_AFM.py` therefore defaults `PAM_AFM_FEEDBACK_RATE_MSPS` to 2000
-when `PAM_AFM_FEEDBACK=fft` and the backend is `board`, and prints the achieved
-lobe width (with a `1 MHz NOT resolved` warning) so the setting is visible rather
-than implied.
+### What it costs to move the clock
 
-The host path, `PAM_AFM_FFT_BACKEND=host`, moves the samples and transforms them
-in numpy, where the record length is free:
+The obvious fix for the cap is to run the feedback FFT at 2 GS/s and the payload
+at 4 GS/s. It does not survive a measurement: `AlazarSetCaptureClock` blocks while
+the PLL relocks, and that dominates everything else in the switch. Measured on the
+board, on-chip FFT, 4096 points, 8×4 buffers, 12 alternating switches:
+
+| leg | stop | `setCaptureClock` | start | flush | first read | **total** |
+|---|---|---|---|---|---|---|
+| 4 GS/s → 2 GS/s | 24 ms | **87 ms** | 24 ms | 0.3 ms | 0.06 ms | **137 ms** |
+| 2 GS/s → 4 GS/s | 25 ms | **173–193 ms** | 24 ms | 0.4 ms | 0.06 ms | **222 ms** |
+| round trip | | | | | | **359 ms** |
+
+Adding a full `configure()` on top — re-running `fftSetWindowFunction` and
+`fftSetup`, which do not depend on the clock and so are wasted work — costs another
+410–480 ms and takes the totals to 520–720 ms.
+
+For comparison, the other switch that might have been useful, between the on-chip
+FFT and the host FFT **at a constant 4 GS/s**:
+
+| leg | open | configure | read | total |
+|---|---|---|---|---|
+| on-chip → host (16384 pt) | 24 ms | 201 ms | 70 ms | 293 ms |
+| host → on-chip | — | 452 ms | 23 ms | 465 ms |
+| round trip | | | | **744 ms** |
+
+Both are the same order as the 448 ms per-point channel round trip that this
+design already exists to avoid. The conclusion is architectural rather than a
+tuning problem: **a scan picks one acquisition mode and stays in it.**
+
+### Choosing the one mode
+
+The host path is not simply "the better one with a slower FFT", because a single
+host reading is a full DMA round trip:
+
+| | single reading | 64-record spectrum point | bins | lobe |
+|---|---|---|---|---|
+| on-chip, 4 GS/s, 4096 pt | 0.03 ms (167 Hz with the laser trigger) | 39.5 ms | 2048 | 1953 kHz |
+| host, 4 GS/s, 16384 pt | **47 ms (21 Hz)** | 65 ms (111 ms triggered) | 8193 | 488 kHz |
+
+So the two modes are asymmetric: the on-chip path is fast enough to drive the
+approach loop and coarse, the host path resolves 1 MHz and reads at 21 Hz. Pick
+per scan, not per point. If a run needs both — a fast approach *and* 1 MHz
+spectra — the honest route is two passes: scan with the on-chip backend, then
+re-scan the interesting points in host mode, rather than switching 359–744 ms per
+point inside one scan.
+
+Capture time is flat in record length on the host path — the period is set by the
+trigger timeout, not the record — so the longer record costs only the FFT:
 
 | samples | bin | Hann main lobe | capture (64 rec) | FFT | bytes |
 |---|---|---|---|---|---|
 | 4096 | 976.6 kHz | 1953.1 kHz | 49.5 ms | 6.0 ms | 512 KB |
 | 8192 | 488.3 kHz | 976.6 kHz | 49.5 ms | 6.0 ms | 1 MB |
 | 16384 | 244.1 kHz | 488.3 kHz | 48.7 ms | 12.5 ms | 2 MB |
-
-Capture time is flat in record length — the period is set by the trigger timeout,
-not the record — so the longer record costs only the FFT. The trade is 25 ms per
-point, not an order of magnitude: **39.5 ms** for a 64-record spectrum point on the
-on-chip path (2 GS/s, 2048 bins) against **64 ms** on the host path (4 GS/s, 16384
-points, 8193 bins).
 
 ### Spurious lines at Fs/4 and Fs/2
 

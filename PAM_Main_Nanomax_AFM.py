@@ -70,29 +70,38 @@ Two feedback paths
     ==============  ============  ===========  ===========  ============
     rate            window        bin          main lobe    range
     ==============  ============  ===========  ===========  ============
-    4 GS/s          1.024 us      976.6 kHz    1953.1 kHz   0..2 GHz
-    **2 GS/s**      2.048 us      488.3 kHz     976.6 kHz   0..1 GHz
+    **4 GS/s**      1.024 us      976.6 kHz    1953.1 kHz   0..2 GHz
+    2 GS/s          2.048 us      488.3 kHz     976.6 kHz   0..1 GHz
     1 GS/s          4.096 us      244.1 kHz     488.3 kHz   0..0.5 GHz
     ==============  ============  ===========  ===========  ============
-    At 4 GS/s two peaks 1 MHz apart merge into one hump: a 250/251 MHz pair,
-    averaged over 32 phase draws in power the way a payload averages records,
-    leaves a valley depth of 0.00 -- invisible.  At 2 GS/s the same pair leaves
-    0.37, a notch you can see, and 2 GS/s still covers 0..1 GHz.  So 2 GS/s is
-    the default for this backend, but be clear about what it buys: **the on-chip
-    path cannot cleanly resolve 1 MHz at any clock**, because Hann needs about
-    four bins of separation and 4096 points at 2 GS/s is two.  Clean separation
-    needs 244 kHz bins, i.e. 16384 points, which the module will not do.  Use
-    ``PAM_AFM_FFT_BACKEND=host`` for that; the readout rate is unchanged either
-    way at 10 kHz, because the record is 4096 points whatever the clock.
+    The slower rows are *not* available, for two independent reasons.  A slower
+    clock moves the board's own Fs/4 spur into the band: at 2 GS/s it lands on
+    500 MHz at 2.4x the median, which is the spike that made 2 GS/s look broken.
+    And slowing it per point is not free either -- ``AlazarSetCaptureClock``
+    blocks for 87 ms going down and 173-193 ms coming back up while the PLL
+    relocks, so a 4G -> 2G -> 4G round trip costs 359 ms per point.
+
+    So this backend runs at 4 GS/s and **does not resolve 1 MHz**: a 250/251 MHz
+    pair, averaged over 32 phase draws in power the way a payload averages
+    records, leaves a valley depth of 0.00.  Hann needs about four bins of
+    separation, and 4096 points at any permitted clock gives at most two.  That
+    is fine for the approach loop, which only needs the amplitude of one tone,
+    and fine if the stored spectrum only has to show *what* is present.  It is
+    not fine if two lines 1 MHz apart must be told apart.
 
     ``host`` moves the samples and transforms them in numpy, where the record
     length is free.  4 GS/s with 16384 points gives 244.1 kHz bins and a
-    488.3 kHz lobe over 0..2 GHz, and the same pair leaves 0.99.  Capture time is
-    flat in record length -- 48.7 ms at 16384 against 49.5 ms at 4096 for 64
-    records, because the period is set by the trigger timeout -- so the longer
-    record costs only the FFT.  A 64-record spectrum point is 39.5 ms on the
-    on-chip path and 64 ms on the host path: the trade is 25 ms per point, not
-    an order of magnitude.
+    488.3 kHz lobe over 0..2 GHz, and the same pair leaves 0.99.  No clock
+    change is involved -- resolution comes from the record length -- so the whole
+    scan stays at 4 GS/s either way.
+
+    The cost is the feedback rate, not the payload.  A single host reading is
+    **47 ms (21 Hz)** against 0.03 ms for the on-chip stream, because every
+    reading is a full DMA round trip.  A 64-record spectrum point is 65 ms on
+    the host path (111 ms with the laser trigger) against 39.5 ms on-chip.  So
+    the choice is between a fast approach loop with a coarse spectrum and a slow
+    one with a resolved spectrum; pick per scan, not per point, because switching
+    modes mid-scan costs 293 ms one way and 465 ms back.
 
 ``PAM_AFM_FEEDBACK=stream``
     100 MS/s continuous stream on ``PAM_AFM_FEEDBACK_CHANNEL`` (default ``B``).
@@ -270,31 +279,40 @@ class RunConfig:
         self.f0_hz = env_float("PAM_AFM_F0_HZ", 10e6)
         self.band_hz = env_float("PAM_AFM_BAND_HZ", 100e3)
         self.feedback_records = env_int("PAM_AFM_FEEDBACK_RECORDS", 8)
-        # Sample rate.  The band of interest reaches 1 GHz, so 100 MS/s is out --
-        # it stops at 50 MHz.  Which rate is right above that depends on whether
-        # the record length is capped, because resolution is window *length*:
+        # Sample rate.  Two constraints pin this down, and neither is negotiable.
         #
-        #   on-chip FFT, 4096 points fixed -> the only lever is the clock
-        #     4 GS/s: 1.024 us window, 976.6 kHz bins, 1953.1 kHz lobe, 0..2 GHz
-        #             -> 1 MHz invisible (valley depth 0.00)
-        #     2 GS/s: 2.048 us window, 488.3 kHz bins,  976.6 kHz lobe, 0..1 GHz
-        #             -> 1 MHz visible as a notch (0.37), not a clean valley
-        #   host FFT, record length free
-        #     4 GS/s, 16384 points: 4.096 us window, 244.1 kHz bins, 0..2 GHz
-        #             -> 1 MHz resolved (0.99)
+        # 1. The band of interest reaches 1 GHz, so 100 MS/s is out: it stops at
+        #    50 MHz.
+        # 2. 2 GS/s is unusable, because the board's own Fs/4 line then sits at
+        #    500 MHz -- in the middle of the band -- at 2.4x the median.  At
+        #    4 GS/s the same line moves to 1 GHz (10.1x median), which is the
+        #    edge of the band rather than the middle of it.
         #
-        # Valley depths are measured after averaging 32 phase draws in power,
-        # which is what a payload does; Hann needs four bins of separation before
-        # the valley is unambiguous, so 244 kHz bins is the target and 488 kHz is
-        # the shoulder.  That is why the on-chip path cannot cleanly resolve
-        # 1 MHz at any clock, and why 2 GS/s is nevertheless its best setting.
+        # So every PA acquisition runs at 4 GS/s.  The rate is deliberately *not*
+        # a per-point decision: AlazarSetCaptureClock costs 87 ms going down to
+        # 2 GS/s and 173-193 ms coming back up (measured, see the table in the
+        # README), because the driver waits for the PLL to relock.  A per-point
+        # 4G->2G->4G round trip is 359 ms, which is the same order as the
+        # channel-reconfiguration cost this design already rejects.
+        #
+        # The consequence is that the on-chip FFT cannot resolve 1 MHz: 4096
+        # points at 4 GS/s is a 1.024 us window, 976.6 kHz bins and a 1953 kHz
+        # Hann main lobe, and 1 MHz needs ~244 kHz bins.  Resolution is bought
+        # with a longer record instead, on the host backend, for the whole scan.
         if self.feedback == "stream":
             default_rate = 100.0
-        elif self.feedback == "fft" and self.fft_backend == "board":
-            default_rate = 2000.0
         else:
             default_rate = 4000.0
         self.feedback_rate_msps = env_float("PAM_AFM_FEEDBACK_RATE_MSPS", default_rate)
+        if self.feedback == "fft" and self.feedback_rate_msps < 4000.0:
+            raise ValueError(
+                "PAM_AFM_FEEDBACK_RATE_MSPS=%.0f is below 4 GS/s: the board's Fs/4 "
+                "line lands at %.0f MHz, inside the band of interest.  Switching "
+                "rates per point costs 137-222 ms, so it is not a workaround "
+                "either -- use PAM_AFM_FFT_BACKEND=host with a longer record to "
+                "buy resolution at 4 GS/s."
+                % (self.feedback_rate_msps, self.feedback_rate_msps * 1e6 / 4.0 / 1e6)
+            )
         # "external" follows the laser and falls back to the timeout; "disable"
         # free-runs.  Free running is much faster (the timeout no longer sets the
         # record period) but the payload records are not laser-locked, so it is
@@ -522,7 +540,11 @@ class RunConfig:
                 % (self.fft_backend, self.fft_length, bin_hz / 1e3, lobe_hz / 1e3)
             )
             if lobe_hz > 1e6:
-                feedback_line += "  (1 MHz NOT resolved)"
+                feedback_line += (
+                    "  (1 MHz NOT resolved: the on-chip module stops at 4096 "
+                    "points, and 2 GS/s would move the Fs/4 spur to 500 MHz -- "
+                    "set PAM_AFM_FFT_BACKEND=host for the whole scan)"
+                )
             elif lobe_hz > 0.5e6:
                 feedback_line += "  (1 MHz marginal: a notch, not a valley)"
         lines = [
