@@ -724,6 +724,34 @@ def build_feedback(config):
     raise ValueError("unknown feedback %r" % config.feedback)
 
 
+def _capture_payload(config, feedback, daq_box):
+    """One point's raw records, taken while the sample is still at the setpoint.
+
+    ``relay`` reads them out of the stream that is already running, so nothing
+    is reconfigured.  The other paths stop the approach acquisition and re-arm
+    the board at 4 GS/s on A, which is exactly why this has to happen before the
+    retract: re-arming after the sample has been lifted would record a different
+    focal plane.
+
+    ``daq_box`` is a one-slot dict so the lazily created DAQ survives from point
+    to point without a global.
+    """
+    if config.feedback == "relay":
+        return feedback.payload(config.records_per_point)
+    if config.feedback in ("fft", "stream"):
+        feedback.finish()
+        if daq_box["daq"] is None:
+            daq_box["daq"] = AlazarBurstCapture(
+                sample_rate_hz=4e9,
+                input_range_volts=config.input_range_volts,
+                trigger_timeout_ticks=config.feedback_timeout_ticks,
+                verbose=False,
+            )
+            daq_box["daq"].open()
+        daq_box["daq"].configure()
+    return daq_box["daq"].capture_summed(config.records_per_point)
+
+
 def load_external_source(spec, config):
     r"""Load a user-supplied Z criterion (Nanomax.afm_control.load_source).
 
@@ -927,9 +955,22 @@ def run_scan(config, args):
                 timeout_s=config.settle_timeout_s,
             )
 
+            # The payload belongs at the setpoint, not after the retract: the PA
+            # signal does not need probe contact, but it is focused at the
+            # contact Z, so scan_point calls back while the sample is still
+            # there and only lifts it afterwards.
+            payload_box = {"data": None}
+            daq_box = {"daq": daq}
+
+            def take_payload(_result, _payload=payload_box, _daq=daq_box):
+                _payload["data"] = _capture_payload(config, feedback, _daq)
+
             result, z_retract = scanner.scan_point(
-                z_cursor, here_xy=(target_x, target_y), next_xy=next_xy
+                z_cursor, here_xy=(target_x, target_y), next_xy=next_xy,
+                on_contact=take_payload,
             )
+            daq = daq_box["daq"]
+            payload = payload_box["data"]
             retract_lifts.append(round(abs(z_retract - result.z_um), 4) if result.ok else 0.0)
 
             if not result.ok:
@@ -947,28 +988,7 @@ def run_scan(config, args):
                     break
                 continue
 
-            # Payload at the setpoint.  In FFT and stream modes the board must be
-            # switched back to 4 GS/s on A for this, which is why the approach
-            # stream is stopped first.  "relay" never leaves 4 GS/s: the relay
-            # moves A from the approach cable to the transducer and the same
-            # stream keeps delivering records, so nothing is reconfigured.
-            if config.feedback == "relay":
-                payload = feedback.payload(config.records_per_point)
-            else:
-                if config.feedback in ("fft", "stream"):
-                    feedback.finish()
-                    if daq is None:
-                        daq = AlazarBurstCapture(
-                            sample_rate_hz=4e9,
-                            input_range_volts=config.input_range_volts,
-                            trigger_timeout_ticks=config.feedback_timeout_ticks,
-                            verbose=False,
-                        )
-                        daq.open()
-                    daq.configure()
-
-                payload = daq.capture_summed(config.records_per_point)
-            if payload.size == 0:
+            if payload is None or payload.size == 0:
                 z_failures += 1
                 append_run_log("AFM_POINT_FAILED", index=index, reason="no_payload")
                 z_cursor = z_retract

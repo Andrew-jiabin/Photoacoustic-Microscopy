@@ -1222,11 +1222,19 @@ class AfmScanner:
 
     # -- one point ---------------------------------------------------------- #
 
-    def scan_point(self, z_from, here_xy=None, next_xy=None):
+    def scan_point(self, z_from, here_xy=None, next_xy=None, on_contact=None):
         """Approach, and on success return ``(result, z_retract)``.
 
         ``here_xy`` / ``next_xy`` are the XY of this point and of the one after
         it; they are only used to decide how far to lift before the XY move.
+
+        ``on_contact`` is called the moment the approach succeeds and *before*
+        the retract, i.e. while the sample is still at the setpoint.  That is
+        where the point payload belongs: the photoacoustic signal does not need
+        probe contact, but it is focused at the contact Z, so taking it after
+        the retract would image a different plane.  Exceptions from the callback
+        are logged and swallowed -- a failed payload must not turn a successful
+        approach into a crash; the caller decides what a missing payload means.
         """
         result = self.approach(z_from)
         # Tell the policy where the probe actually met the surface, success or
@@ -1238,6 +1246,11 @@ class AfmScanner:
             pass
         if not result.ok:
             return result, z_from
+        if on_contact is not None:
+            try:
+                on_contact(result)
+            except Exception as exc:
+                self._emit("AFM_ON_CONTACT_FAILED", error=repr(exc))
         if here_xy is not None:
             try:
                 self._history.append((float(here_xy[0]), float(here_xy[1]),
