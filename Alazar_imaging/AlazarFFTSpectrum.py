@@ -28,16 +28,32 @@ usual ``waitAsyncBufferComplete`` / ``abortAsyncRead`` pair with
 before ``beforeAsyncRead`` and before the DMA buffers are allocated, because it
 is the function that reports the output record size.
 
-No trigger is used.  Both trigger engines are set to ``TRIG_DISABLE``, and the
-trigger *timeout* is set to a small non-zero value -- that second part is what
-actually makes it run.  ``AlazarSetTriggerTimeOut(0)`` means "wait forever for a
-trigger", and this board keeps waiting even with the trigger disabled, so a zero
-timeout just hangs until ``dspGetBuffer`` reports ``ApiWaitTimeout`` (measured on
-the real board, no cable attached).  A non-zero timeout makes the board trigger
-itself once the interval expires, i.e. a free-running source with a known,
-adjustable period.  ``trigger_timeout_ticks`` is a parameter for that reason: one
-tick is 10 us, so the default of 1 asks for the next record as soon as the
-previous one finishes.
+Trigger: follow the laser when it is there, self-trigger when it is not
+----------------------------------------------------------------------
+``trigger="external"`` (the default) waits for the sync pulse on TRIG IN and
+falls back to the timeout when none arrives, so one configuration covers both
+"laser running" and "laser off".  The timeout must exceed the laser period --
+952 us at 1050 Hz, hence 150 ticks = 1.5 ms -- or the board fires before every
+pulse and the records land at random phases.  That matters here even though a
+power spectrum is phase-blind: a 1.024 us window only contains the
+photoacoustic signal when it starts on the pulse, so random-phase records dilute
+the averaged spectrum by roughly the duty cycle.
+
+``trigger="disable"`` restores free running, which is what the very first
+version of this module did.  ``AlazarSetTriggerTimeOut(0)`` means "wait forever
+for a trigger", and this board keeps waiting even with the trigger disabled, so
+a zero timeout just hangs until ``dspGetBuffer`` reports ``ApiWaitTimeout``
+(measured on the real board, no cable attached).  A non-zero timeout makes the
+board trigger itself once the interval expires.
+
+Sample rate
+-----------
+4 GS/s by default.  At 4 GS/s the FFT covers 0..2 GHz in 976.6 kHz bins, which
+is what the PA signal needs; 100 MS/s stops at 50 MHz.  The 4 GS/s path is also
+faster to read, 2500 readings/s against 322, because a 4096-point record spans
+1.024 us instead of 41 us.  One consequence: a 100 kHz band contains no bin
+centre at that resolution, so :func:`band_mask` falls back to the two nearest
+bins.
 
 Units
 -----
@@ -120,10 +136,22 @@ DEFAULT_INPUT_RANGE_VOLTS = 0.4
 # from amplitude.  bytes/record = fft_length/2 * 4 = 8192 for a 4096-point FFT.
 DEFAULT_OUTPUT_FORMAT = ats.FFT_OUTPUT_FORMAT_FLOAT_AMP2
 
+# Trigger source.  "external" waits for the laser sync pulse on TRIG IN and
+# falls back to the timeout when none arrives; "disable" ignores TRIG IN.
+DEFAULT_TRIGGER = "external"
+
 # Trigger timeout in ticks of 10 us.  0 means "wait forever for a trigger",
-# which stalls this board when no trigger cable is attached; 1 (= 10 us) lets
-# the board trigger itself and record as fast as the record length allows.
-DEFAULT_TRIGGER_TIMEOUT_TICKS = 1
+# which stalls this board when no trigger cable is attached; a non-zero value is
+# what lets the board carry on without one.
+#
+# With trigger="external" this is also the fallback period, so it must exceed the
+# laser period (952 us at 1050 Hz) or the board fires before every pulse.  A
+# 1.024 us window only catches the photoacoustic signal when it starts on the
+# pulse, so random-phase records dilute the averaged spectrum by the duty cycle.
+# 150 ticks = 1.5 ms leaves 57 % margin.
+DEFAULT_TRIGGER_TIMEOUT_TICKS = 150
+
+DEFAULT_TRIGGER_LEVEL = 153
 
 
 def channel_mask(value):
@@ -221,17 +249,30 @@ def frequency_axis(n_bins, fft_length, sample_rate_hz):
     return np.arange(n_bins, dtype=np.float64) * (float(sample_rate_hz) / float(fft_length))
 
 
-def band_mask(freqs, f0_hz, half_bandwidth_hz):
+def band_mask(freqs, f0_hz, half_bandwidth_hz, min_bins=2):
     """Bins that fall inside ``f0 +/- half_bandwidth``.
 
     A band rather than a single bin, because 10 MHz rarely lands exactly on a
     bin centre (at 100 MS/s it sits at bin 409.6) and a windowed tone leaks into
     its neighbours.  Summing a small band makes the reading insensitive to a
     percent or two of carrier-frequency error.
+
+    ``min_bins`` is the floor.  At 4 GS/s one bin is 976.6 kHz wide, so a 100 kHz
+    band contains no bin centre at all and the old code raised -- which made the
+    4 GS/s FFT path unable to read a 10 MHz amplitude, i.e. unable to do the one
+    thing it is run at 4 GS/s for.  Two bins are taken instead: a Hann main lobe
+    is two bins wide, so the tone's energy is split between them and summing both
+    recovers it.
     """
+    freqs = np.asarray(freqs)
     lo = float(f0_hz) - abs(float(half_bandwidth_hz))
     hi = float(f0_hz) + abs(float(half_bandwidth_hz))
     mask = (freqs >= lo) & (freqs <= hi)
+    if not mask.any() and min_bins > 0:
+        nearest = int(np.argmin(np.abs(freqs - float(f0_hz))))
+        first = max(0, nearest - (int(min_bins) - 1) // 2)
+        mask = np.zeros(freqs.shape, dtype=bool)
+        mask[first:first + int(min_bins)] = True
     if not mask.any():
         raise ValueError(
             "no FFT bins inside %.3f..%.3f Hz; widen half_bandwidth or check the sample rate"
@@ -302,6 +343,8 @@ class AlazarFFTSpectrum:
         buffer_count=4,
         timeout_ms=2000,
         trigger_timeout_ticks=DEFAULT_TRIGGER_TIMEOUT_TICKS,
+        trigger=DEFAULT_TRIGGER,
+        trigger_level=DEFAULT_TRIGGER_LEVEL,
         verbose=True,
         board=None,
     ):
@@ -321,6 +364,10 @@ class AlazarFFTSpectrum:
         self.buffer_count = int(buffer_count)
         self.timeout_ms = int(timeout_ms)
         self.trigger_timeout_ticks = int(trigger_timeout_ticks)
+        self.trigger = str(trigger).strip().lower()
+        if self.trigger not in ("external", "disable"):
+            raise ValueError("trigger must be 'external' or 'disable', got %r" % (trigger,))
+        self.trigger_level = int(trigger_level)
         self.verbose = verbose
 
         self.board = None
@@ -415,15 +462,26 @@ class AlazarFFTSpectrum:
             self.channel, ats.DC_COUPLING, self.input_range, ats.IMPEDANCE_50_OHM
         )
 
-        # Trigger disabled on both engines, plus a non-zero trigger timeout.
-        # The timeout is what actually gets data flowing with no trigger cable:
+        # Trigger: follow the laser when a cable is attached, self-trigger when it
+        # is not.  The timeout is what gets data flowing with no trigger cable --
         # a timeout of 0 means "wait forever", and this board honours that even
         # with the trigger disabled (verified on hardware: ApiWaitTimeout).
-        board.setTriggerOperation(
-            ats.TRIG_ENGINE_OP_J,
-            ats.TRIG_ENGINE_J, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
-            ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
-        )
+        if self.trigger == "external":
+            board.setExternalTrigger(
+                getattr(ats, "DC_COUPLING", 1), getattr(ats, "ETR_2V5", 3)
+            )
+            board.setTriggerOperation(
+                ats.TRIG_ENGINE_OP_J,
+                ats.TRIG_ENGINE_J, ats.TRIG_EXTERNAL, ats.TRIGGER_SLOPE_POSITIVE,
+                self.trigger_level,
+                ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+            )
+        else:
+            board.setTriggerOperation(
+                ats.TRIG_ENGINE_OP_J,
+                ats.TRIG_ENGINE_J, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+                ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+            )
         board.setTriggerDelay(0)
         board.setTriggerTimeOut(self.trigger_timeout_ticks)
         board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
@@ -577,6 +635,21 @@ class AlazarFFTSpectrum:
         self.board.postAsyncBuffer(buffer.addr, buffer.size_bytes)
         self._posted[index] = True
         return power, self.freqs
+
+    def read_amplitude_spectrum(self, average=True):
+        """Return ``(amplitude, freqs)`` -- linear amplitude per bin.
+
+        ``read_spectrum`` hands back whatever the board's output format holds
+        (amplitude squared, a log scale, ...).  This normalises it to a linear
+        amplitude so a caller can store it or threshold it without knowing which
+        format is configured.  Log formats are returned unchanged: they are
+        already monotonic in power, and taking a square root of a dB value would
+        be meaningless.
+        """
+        power, freqs = self.read_spectrum(average=average)
+        if self.output_format in _LOG_FORMATS:
+            return power, freqs
+        return np.sqrt(np.maximum(power, 0.0)), freqs
 
     def measure(self, f0_hz, half_bandwidth_hz, buffers=1):
         """Mean 10 MHz-style amplitude over ``buffers`` DMA buffers (board units)."""

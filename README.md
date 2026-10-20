@@ -564,6 +564,24 @@ approach cable, runs the PI, flips to the transducer, waits
 `PAM_AFM_RECORDS_PER_POINT` records out of the *same* stream. Nothing is
 reconfigured, so the ~450 ms round trip disappears.
 
+The laser runs for the whole scan. That is the simplest arrangement and it has a
+side benefit worth knowing: while pulses keep arriving the trigger timeout never
+expires, so the *approach* readings are laser-locked too and the record period
+becomes the laser period (952 µs at 1050 Hz) instead of the 1.5 ms timeout --
+approach feedback runs at ~1 kHz rather than ~200 Hz. Nothing in the code
+switches between those two states; the external condition does. The price is
+that the sample is illuminated during the seconds spent travelling between
+points.
+
+The payload is taken while the sample is still at the setpoint: `scan_point()`
+calls back between a successful approach and the retract, because the PA signal
+is focused at the contact Z. Taking it after the retract would image a plane one
+retract height higher — 0.5 µm by default, which is enough to soften the image
+on a high-NA objective. Each `AFM_POINT_DONE` event logs `payload_ms` and
+`payload_hz`, which is a free check on the trigger: locked to a 1050 Hz laser
+the rate comes out near 1050 Hz, self-triggering on the timeout it comes out
+faster and irregular.
+
 Measured on the board with `_test_relay_fb.py` (no relay fitted, both cables
 summed -- the numbers below are timing, not signal):
 

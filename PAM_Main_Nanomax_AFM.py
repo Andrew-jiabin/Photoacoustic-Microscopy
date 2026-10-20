@@ -198,12 +198,21 @@ class RunConfig:
         self.f0_hz = env_float("PAM_AFM_F0_HZ", 10e6)
         self.band_hz = env_float("PAM_AFM_BAND_HZ", 100e3)
         self.feedback_records = env_int("PAM_AFM_FEEDBACK_RECORDS", 8)
-        # 100 MS/s for both modes: a 4096-sample record then spans 40.96 us, i.e.
-        # 409.6 cycles of a 10 MHz carrier, instead of the 10.24 cycles a 4 GS/s
-        # record holds.  The longer window is what makes the amplitude reading
-        # repeatable; the FFT path additionally gets 24.4 kHz bins instead of
-        # 977 kHz ones.  Verified on the board: both modes run trigger-free.
-        self.feedback_rate_msps = env_float("PAM_AFM_FEEDBACK_RATE_MSPS", 100.0)
+        # 4 GS/s for everything that looks at the PA signal, because the band of
+        # interest reaches 1 GHz: at 4 GS/s the on-FPGA FFT covers 0..2 GHz with
+        # 976.6 kHz bins, while 100 MS/s would stop at 50 MHz.  Only the B-channel
+        # approach stream runs slower, since it only has to see 10 MHz.
+        # Verified on the board: the 4 GS/s FFT is also *faster*, 2500 readings/s
+        # against 322, because a 4096-point record is 1.024 us instead of 41 us.
+        default_rate = 100.0 if self.feedback == "stream" else 4000.0
+        self.feedback_rate_msps = env_float("PAM_AFM_FEEDBACK_RATE_MSPS", default_rate)
+        # "external" follows the laser and falls back to the timeout; "disable"
+        # free-runs.  Free running is much faster (the timeout no longer sets the
+        # record period) but the payload records are not laser-locked, so it is
+        # only for bench tests and for a rig with no trigger cable at all.
+        self.trigger = env_str("PAM_AFM_TRIGGER", "external").lower()
+        if self.trigger not in ("external", "disable"):
+            raise ValueError("PAM_AFM_TRIGGER must be 'external' or 'disable'")
         # "stream" mode only.  The approach signal lives on its own cable, so it
         # needs its own input; B is the one A does not use.  The timeout sets the
         # feedback rate while no laser is present: 100 ticks = 1 ms -> ~250 Hz.
@@ -223,6 +232,18 @@ class RunConfig:
         # imaging input before the payload is taken, so the transient is not
         # included in the A-line.
         self.relay_settle_s = env_float("PAM_AFM_RELAY_SETTLE_MS", 2.0) / 1000.0
+        # What a point record is.  "time" is the original contract: (1, 4096)
+        # uint16 A-lines at 4 GS/s.  "spectrum" stores the averaged FFT instead,
+        # which is only possible on the FFT path -- and then the whole scan stays
+        # at 100 MS/s, so the per-point reconfiguration to 4 GS/s disappears.
+        self.payload = env_str("PAM_AFM_PAYLOAD", "time").lower()
+        if self.payload not in ("time", "spectrum"):
+            raise ValueError("PAM_AFM_PAYLOAD must be 'time' or 'spectrum'")
+        if self.payload == "spectrum" and self.feedback != "fft":
+            raise ValueError(
+                "PAM_AFM_PAYLOAD=spectrum requires PAM_AFM_FEEDBACK=fft "
+                "(only the on-FPGA path produces a spectrum)"
+            )
         self.input_range_volts = env_float("PAM_AFM_INPUT_RANGE_V", DEFAULT_INPUT_RANGE_VOLTS)
 
         # Setpoint.
@@ -399,6 +420,12 @@ class RunConfig:
             feedback_line,
             "setpoint        : %.4f %s" % (self.setpoint, self.setpoint_unit),
         ]
+        if self.payload == "spectrum":
+            lines.append(
+                "payload         : averaged FFT spectrum, %d records/point "
+                "(stays at %.0f MS/s, no 4 GS/s reconfiguration)"
+                % (self.records_per_point, self.feedback_rate_msps)
+            )
         if self.control_mode == "pi":
             kp, ki = self.effective_gains()
             lines.append(
@@ -558,6 +585,13 @@ class RelayFeedback:
     Switching cost is the relay's own time (a reed relay closes in ~1 ms),
     against 231 ms + 217 ms measured for reconfiguring the board between
     B(100 MS/s) and A(4 GS/s).
+
+    The laser runs for the whole scan -- the simplest arrangement, and the one
+    this path assumes.  It has a side benefit: the approach readings are
+    laser-locked as well, so the record period is the laser period (952 us at
+    1050 Hz) instead of the 1.5 ms trigger timeout, and approach feedback runs at
+    ~1 kHz rather than ~200 Hz.  Nothing in the code distinguishes the two
+    states; while pulses keep arriving the timeout simply never expires.
     """
 
     unit = "V"
@@ -634,6 +668,23 @@ class FftFeedback:
     def value(self):
         return self.measure()
 
+    def payload(self, records):
+        """Average ``records`` FFT records into one amplitude spectrum.
+
+        This is the spectrum payload: the same buffers the feedback loop reads,
+        averaged a little longer, so the point record costs no reconfiguration
+        and no 4 GS/s acquisition.  Shape is ``(1, n_bins)`` uint16, which keeps
+        the .mat contract's dtype even though the length is the bin count rather
+        than 4096 samples.
+        """
+        total = None
+        count = max(1, int(records))
+        for _ in range(count):
+            amplitude, _freqs = self.fft.read_amplitude_spectrum()
+            total = amplitude if total is None else total + amplitude
+        mean = total / float(count)
+        return np.clip(np.rint(mean), 0, 65535).astype(np.uint16)[None, :]
+
     def finish(self):
         self.fft.stop()
 
@@ -684,6 +735,7 @@ def build_feedback(config):
         daq = AlazarBurstCapture(
             sample_rate_hz=config.feedback_rate_msps * 1e6,
             input_range_volts=config.input_range_volts,
+            trigger=config.trigger,
             trigger_timeout_ticks=config.feedback_timeout_ticks,
             verbose=False,
         )
@@ -692,6 +744,8 @@ def build_feedback(config):
         fft = AlazarFFTSpectrum(
             sample_rate_hz=config.feedback_rate_msps * 1e6,
             input_range_volts=config.input_range_volts,
+            trigger=config.trigger,
+            trigger_timeout_ticks=config.feedback_timeout_ticks,
             verbose=False,
         )
         return FftFeedback(fft, config)
@@ -736,6 +790,11 @@ def _capture_payload(config, feedback, daq_box):
     ``daq_box`` is a one-slot dict so the lazily created DAQ survives from point
     to point without a global.
     """
+    if config.payload == "spectrum":
+        # Same stream the feedback loop is reading, averaged a little longer.
+        # No reconfiguration, no 4 GS/s acquisition, and the shape is the bin
+        # count rather than the sample count.
+        return feedback.payload(config.records_per_point)
     if config.feedback == "relay":
         return feedback.payload(config.records_per_point)
     if config.feedback in ("fft", "stream"):
@@ -744,6 +803,7 @@ def _capture_payload(config, feedback, daq_box):
             daq_box["daq"] = AlazarBurstCapture(
                 sample_rate_hz=4e9,
                 input_range_volts=config.input_range_volts,
+                trigger=config.trigger,
                 trigger_timeout_ticks=config.feedback_timeout_ticks,
                 verbose=False,
             )
@@ -959,11 +1019,15 @@ def run_scan(config, args):
             # signal does not need probe contact, but it is focused at the
             # contact Z, so scan_point calls back while the sample is still
             # there and only lifts it afterwards.
-            payload_box = {"data": None}
+            payload_box = {"data": None, "ms": 0.0}
             daq_box = {"daq": daq}
 
             def take_payload(_result, _payload=payload_box, _daq=daq_box):
-                _payload["data"] = _capture_payload(config, feedback, _daq)
+                _started = time.time()
+                try:
+                    _payload["data"] = _capture_payload(config, feedback, _daq)
+                finally:
+                    _payload["ms"] = (time.time() - _started) * 1e3
 
             result, z_retract = scanner.scan_point(
                 z_cursor, here_xy=(target_x, target_y), next_xy=next_xy,
@@ -1012,6 +1076,13 @@ def run_scan(config, args):
                 y_um="%.4f" % target_y, z_um="%.4f" % result.z_um,
                 amplitude="%.4f" % result.amplitude, steps=result.steps,
                 approach_reason=result.reason,
+                # The payload rate is a free check on the laser: locked to a
+                # 1050 Hz laser it comes out near 1050 Hz, self-triggering on the
+                # 1.5 ms timeout it comes out faster and irregular.  A point that
+                # suddenly reads ~650 Hz means the trigger dropped out.
+                payload_ms="%.1f" % payload_box["ms"],
+                payload_hz="%.0f" % (
+                    config.records_per_point / max(payload_box["ms"], 1e-6) * 1e3),
             )
             if index == 1 or index % 10 == 0 or index == total_points:
                 elapsed = time.time() - started
