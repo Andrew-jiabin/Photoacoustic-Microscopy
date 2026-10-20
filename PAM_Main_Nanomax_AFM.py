@@ -208,7 +208,17 @@ class RunConfig:
         # needs its own input; B is the one A does not use.  The timeout sets the
         # feedback rate while no laser is present: 100 ticks = 1 ms -> ~250 Hz.
         self.feedback_channel = env_str("PAM_AFM_FEEDBACK_CHANNEL", "B").upper()
-        self.feedback_timeout_ticks = env_int("PAM_AFM_FEEDBACK_TIMEOUT_TICKS", 100)
+        # The laser period sets the minimum trigger timeout.  The board waits on
+        # TRIG IN and falls back to the timeout, so a timeout shorter than one
+        # laser period means it fires before every pulse, never locks, and the
+        # summed payload is built from records at random phases of the laser
+        # cycle.  Measured laser: 1050 Hz -> 952 us; 1.3x that is 124 ticks,
+        # which still leaves the approach loop reading ~200 Hz.
+        self.laser_period_us = env_float("PAM_AFM_LASER_PERIOD_US", 952.0)
+        _auto_ticks = int(math.ceil(1.3 * self.laser_period_us / 10.0))
+        self.feedback_timeout_ticks = env_int(
+            "PAM_AFM_FEEDBACK_TIMEOUT_TICKS", max(_auto_ticks, 10)
+        )
         # "relay" mode: time the relay contact needs after switching to the
         # imaging input before the payload is taken, so the transient is not
         # included in the A-line.
@@ -674,6 +684,7 @@ def build_feedback(config):
         daq = AlazarBurstCapture(
             sample_rate_hz=config.feedback_rate_msps * 1e6,
             input_range_volts=config.input_range_volts,
+            trigger_timeout_ticks=config.feedback_timeout_ticks,
             verbose=False,
         )
         return DemodFeedback(daq, config)
@@ -950,6 +961,7 @@ def run_scan(config, args):
                         daq = AlazarBurstCapture(
                             sample_rate_hz=4e9,
                             input_range_volts=config.input_range_volts,
+                            trigger_timeout_ticks=config.feedback_timeout_ticks,
                             verbose=False,
                         )
                         daq.open()

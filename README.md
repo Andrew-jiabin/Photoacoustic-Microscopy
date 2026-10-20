@@ -362,6 +362,51 @@ timeout is what makes the board self-trigger when the interval expires. The
 parameter is an **integer count of 10 µs ticks**, not seconds; passing a float
 raises `ctypes.ArgumentError`.
 
+### Where an A-line comes from, and why the timeout must beat the laser
+
+An A-line is only meaningful if it starts on a laser pulse. With no trigger
+cable, a 4096-point record at 4 GS/s covers 1.024 µs out of a 952 µs laser
+period — it lands at a random phase, so summing 256 of them averages the
+photoacoustic signal against the empty part of the cycle and the result is
+noise with a DC offset. **Free-running records are not a substitute for
+triggered ones.**
+
+`TRIG_EXTERNAL` plus a non-zero timeout gets both behaviours out of one
+configuration, with no mode switch and no reconfiguration:
+
+| state | what the board does | A-line valid? |
+| --- | --- | --- |
+| laser on, cable attached | waits for the sync pulse, one record per pulse | yes, phase-locked |
+| laser off / cable out | timeout expires, triggers itself | no, but the approach loop still reads |
+
+The single hard constraint: **the timeout must be longer than the laser
+period.** If it is shorter, the board times out before every pulse, never locks,
+and you are back to random-phase records without any error message. Measured
+laser: 1050 Hz → 952 µs, so the default is 150 ticks = 1.5 ms (57 % margin,
+against 5 % for the 1 ms it used to be).
+
+Measured on the board with no trigger cable attached, 4 GS/s × 4096, using
+`AlazarBurstCapture`:
+
+| trigger | ticks | records | elapsed | per record |
+| --- | --- | --- | --- | --- |
+| `disable` | 1 | 256 | 49.3 ms | 0.19 ms |
+| `external` | 1 | 256 | 49.0 ms | 0.19 ms |
+| `external` | 100 | 256 | 174.2 ms | 0.68 ms |
+| `external` | 150 | 256 | 240.0 ms | 0.94 ms |
+
+So with no trigger the payload costs 240 ms instead of 49 ms — that is the
+timeout being waited out 256 times, not extra work. Once the laser is connected
+the same 256 records cost 256 × 952 µs ≈ 244 ms, i.e. the trigger costs nothing
+that the laser was not already going to cost. The fixed arm/abort overhead is
+~46 ms in every row, which is why a single-record capture looks the same
+everywhere.
+
+`AlazarStreamSensor` uses the same mechanism, so `stream` and `relay` mode
+inherit it: approach readings when the laser is off, laser-locked records when
+it is on. Set `PAM_AFM_LASER_PERIOD_US` if the repetition rate changes; the
+timeout is derived from it as `ceil(1.3 × period / 10 µs)`.
+
 ### Channels and the 4 GS/s limit
 
 4 GS/s is not a property of the board, it is a property of *one* channel: the
@@ -501,9 +546,10 @@ summed -- the numbers below are timing, not signal):
 | step | cost |
 | --- | --- |
 | `prepare()` (one-time 4 GS/s configure + arm) | 206 ms |
-| approach reading | 4.0 ms (252 Hz) |
-| `payload(1)` incl. 2 ms relay settle | 4.0 ms |
-| `payload(256)` | 129 ms |
+| approach reading, laser off | 4.9 ms (203 Hz) |
+| `payload(1)` incl. 2 ms relay settle | 4.9 ms |
+| `payload(256)`, laser off | 160 ms |
+| `payload(256)`, locked to a 1050 Hz laser | ~244 ms (256 × 952 µs) |
 | payload dtype | `uint32`, shape `(1, 4096)` |
 
 ```bat

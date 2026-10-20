@@ -72,11 +72,13 @@ DEFAULT_INPUT_RANGE = ats.INPUT_RANGE_PM_200_MV
 DEFAULT_INPUT_RANGE_VOLTS = 0.2
 DEFAULT_F0_HZ = 10e6
 
-#: 100 ticks = 1 ms.  The timeout must stay longer than the laser period during
+#: 150 ticks = 1.5 ms.  The timeout must stay longer than the laser period during
 #: imaging, otherwise the board self-triggers between laser pulses and the
-#: payload records are no longer laser-synchronised.  With a 1 kHz laser this
-#: leaves ~250 readings/s of approach feedback, which is plenty at 1 um/s.
-DEFAULT_TIMEOUT_TICKS = 100
+#: payload records are no longer laser-synchronised.  Measured laser: 1050 Hz,
+#: 952 us period, so 1.5 ms leaves ~57 % margin instead of the 5 % a 1 ms
+#: timeout would leave.  With the laser off this is the approach period, which
+#: still gives ~170 readings/s -- ample at 1 um/s.
+DEFAULT_TIMEOUT_TICKS = 150
 
 DEFAULT_RECORDS_PER_BUFFER = 8
 DEFAULT_BUFFER_COUNT = 4

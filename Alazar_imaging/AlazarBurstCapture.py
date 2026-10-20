@@ -1,13 +1,32 @@
 # -*- coding: utf-8 -*-
-"""Trigger-free burst capture on the ATS9373, plus a 10 MHz amplitude demodulator.
+"""Burst capture on the ATS9373, plus a 10 MHz amplitude demodulator.
 
 Why this is not ``AlazarNPTSystem``
 -----------------------------------
 ``AlazarNPTSystem`` is the imaging path and it is shared by every entry point:
 it arms the board on the laser trigger and returns one A-line per pulse.  It is
-deliberately left untouched.  This module is the other mode -- both trigger
-engines disabled, the board free-runs, and the caller asks for exactly the
-number of records it needs.
+deliberately left untouched.  This module is the other mode -- the caller asks
+for exactly the number of records it needs, and the board may or may not have a
+trigger cable attached.
+
+Trigger: follow the laser if it is there, self-trigger if it is not
+-------------------------------------------------------------------
+``TRIG_EXTERNAL`` plus a non-zero timeout does both, with no reconfiguration and
+no mode switch:
+
+* laser sync pulse present on TRIG IN -> the board waits for it, so every record
+  starts on a laser pulse and the A-lines are phase-locked.  This is what makes
+  summing ``records_per_point`` records meaningful.
+* no pulse (laser off, cable unplugged) -> the timeout expires and the board
+  triggers itself, so the approach loop still gets readings.
+
+The one hard constraint is **the timeout must be longer than the laser period**.
+If it is shorter, the board times out before every pulse, never locks, and the
+sum is taken over records that land at random phases of the laser cycle.  At
+1050 Hz the period is 952 us, so the default is 150 ticks (1.5 ms).
+
+``trigger="disable"`` restores the old behaviour: TRIG IN is ignored and the
+board always self-triggers.  Use it only when there is no laser to follow.
 
 Two jobs:
 
@@ -21,8 +40,6 @@ Two jobs:
    AFM-style threshold interpretable.  The on-FPGA FFT path in
    ``AlazarFFTSpectrum`` reports board units; comparing the two on the same
    signal is the calibration procedure.
-
-No trigger is used anywhere in this module.
 """
 
 from __future__ import annotations
@@ -46,11 +63,31 @@ DEFAULT_INPUT_RANGE_VOLTS = 0.2
 _COUNTS_PER_FULL_SCALE = 2048.0
 _SAMPLE_SHIFT = 4
 
+# Trigger source.  "external" follows the laser sync pulse on TRIG IN and falls
+# back to the timeout when none arrives; "disable" ignores TRIG IN entirely.
+DEFAULT_TRIGGER = "external"
+
 # Trigger timeout in ticks of 10 us.  Zero means "wait forever for a trigger",
 # which stalls this board when no trigger cable is attached (verified on
-# hardware: ApiWaitTimeout).  One tick lets the board trigger itself, so a
-# capture completes even with nothing connected to the trigger input.
-DEFAULT_TRIGGER_TIMEOUT_TICKS = 1
+# hardware: ApiWaitTimeout).  A non-zero value is what lets the board carry on
+# without a trigger cable.
+#
+# With trigger="external" this value is also the fallback period, so it MUST be
+# longer than the laser period -- otherwise the board times out before every
+# pulse and the records are never phase-locked.  Measured laser: 1050 Hz,
+# period 952 us.  150 ticks = 1.5 ms leaves ~57 % margin.
+DEFAULT_TRIGGER_TIMEOUT_TICKS = 150
+
+# External trigger front end: DC coupling, +/-2.5 V range, positive slope,
+# threshold level 153 of 255 = +0.49 V.  These are the settings the trigger was
+# characterised with (PAM_触发频率实测_20261006.md); the sync pulse is ~4 us wide
+# and sits well above 0.49 V.
+#
+# getattr because the offline test replaces atsapi with a stub that carries only
+# the constants it needs; the numeric values are the SDK's own.
+DEFAULT_TRIGGER_COUPLING = getattr(ats, "DC_COUPLING", 1)
+DEFAULT_TRIGGER_RANGE = getattr(ats, "ETR_2V5", 3)
+DEFAULT_TRIGGER_LEVEL = 153
 
 
 def _sample_rate_map():
@@ -105,6 +142,8 @@ class AlazarBurstCapture:
         buffer_count=4,
         timeout_ms=5000,
         trigger_timeout_ticks=DEFAULT_TRIGGER_TIMEOUT_TICKS,
+        trigger=DEFAULT_TRIGGER,
+        trigger_level=DEFAULT_TRIGGER_LEVEL,
         verbose=True,
         board=None,
     ):
@@ -120,6 +159,10 @@ class AlazarBurstCapture:
         self.buffer_count = int(buffer_count)
         self.timeout_ms = int(timeout_ms)
         self.trigger_timeout_ticks = int(trigger_timeout_ticks)
+        self.trigger = str(trigger).strip().lower()
+        if self.trigger not in ("external", "disable"):
+            raise ValueError("trigger must be 'external' or 'disable', got %r" % (trigger,))
+        self.trigger_level = int(trigger_level)
         self.verbose = verbose
 
         self.board = None
@@ -145,7 +188,12 @@ class AlazarBurstCapture:
         self.board = None
 
     def configure(self):
-        """Clock, input and trigger.  Both trigger engines disabled."""
+        """Clock, input and trigger.
+
+        With ``trigger="external"`` the board waits on TRIG IN and falls back to
+        the timeout, which is what makes the same configuration work both with
+        the laser running and with it off.
+        """
         if self.board is None:
             raise RuntimeError("open() first")
         board = self.board
@@ -153,11 +201,20 @@ class AlazarBurstCapture:
         board.inputControlEx(
             ats.CHANNEL_A, ats.DC_COUPLING, self.input_range, ats.IMPEDANCE_50_OHM
         )
-        board.setTriggerOperation(
-            ats.TRIG_ENGINE_OP_J,
-            ats.TRIG_ENGINE_J, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
-            ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
-        )
+        if self.trigger == "external":
+            board.setExternalTrigger(DEFAULT_TRIGGER_COUPLING, DEFAULT_TRIGGER_RANGE)
+            board.setTriggerOperation(
+                ats.TRIG_ENGINE_OP_J,
+                ats.TRIG_ENGINE_J, ats.TRIG_EXTERNAL, ats.TRIGGER_SLOPE_POSITIVE,
+                self.trigger_level,
+                ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+            )
+        else:
+            board.setTriggerOperation(
+                ats.TRIG_ENGINE_OP_J,
+                ats.TRIG_ENGINE_J, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+                ats.TRIG_ENGINE_K, ats.TRIG_DISABLE, ats.TRIGGER_SLOPE_POSITIVE, 128,
+            )
         board.setTriggerDelay(0)
         # A non-zero timeout is what makes this work with no trigger cable: the
         # board waits `trigger_timeout_ticks` x 10 us and then triggers itself.
@@ -165,9 +222,9 @@ class AlazarBurstCapture:
         board.setTriggerTimeOut(self.trigger_timeout_ticks)
         board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
         self._log(
-            "configured fs=%.3f GS/s record=%d trigger=disabled timeout=%d ticks"
-            % (self.sample_rate_hz / 1e9, self.samples_per_record,
-               self.trigger_timeout_ticks)
+            "configured fs=%.3f GS/s record=%d trigger=%s timeout=%d ticks (%.1f ms)"
+            % (self.sample_rate_hz / 1e9, self.samples_per_record, self.trigger,
+               self.trigger_timeout_ticks, self.trigger_timeout_ticks * 0.01)
         )
         return self
 
