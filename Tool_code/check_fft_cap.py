@@ -151,15 +151,16 @@ def main(argv=None):
         print("At %.0f MS/s that is a %.3f us window, so:" % (
             args.rate_msps, max_length / (args.rate_msps * 1e6) * 1e6))
         bin_hz = args.rate_msps * 1e6 / max_length
-        print("  bin %.1f kHz, Hann main lobe %.1f kHz -> resolves 1 MHz: %s"
-              % (bin_hz / 1e3, 2 * bin_hz / 1e3,
-                 "yes" if 2 * bin_hz <= 1e6 else "NO"))
+        print("  bin %.1f kHz, Hann main lobe %.1f kHz" % (bin_hz / 1e3, 2 * bin_hz / 1e3))
         print("")
         print("The cap is on the point count, so the way to a longer time window is")
-        print("a slower clock.  2 GS/s over the same %d points gives a %.3f us window,"
+        print("a slower clock.  2 GS/s over the same %d points gives a %.3f us window"
               % (max_length, max_length / 2e9 * 1e6))
-        print("488.3 kHz bins and a 976.6 kHz lobe -- enough for 1 MHz -- and still")
-        print("covers 0..1 GHz.  Above 1 GHz, use PAM_AFM_FFT_BACKEND=host.")
+        print("and 488.3 kHz bins -- 1 MHz is then two bins apart, which shows up as")
+        print("a notch (valley depth 0.37 after power averaging) rather than a clean")
+        print("valley.  Hann needs about four bins, i.e. 244 kHz, i.e. 16384 points,")
+        print("which this module will not do.  So the on-chip FFT cannot cleanly")
+        print("resolve 1 MHz at any clock; use PAM_AFM_FFT_BACKEND=host for that.")
         return 0
 
     print("VERDICT: maxLength=%d; the on-chip FFT can go beyond 4096." % max_length)

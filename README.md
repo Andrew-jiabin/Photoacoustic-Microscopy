@@ -619,7 +619,7 @@ re-arm cost, not the path's ceiling: a continuous time-domain stream does
 `--channel B` is supported. The FFT block processes one input, so B at 100 MS/s
 works and B at 4 GS/s does not (see the channel table above).
 
-### The 4096-point cap, and how to get 1 MHz anyway
+### The 4096-point cap, and what it costs to beat it
 
 The DSP module will not transform more than 4096 points, and this is the driver
 refusing the call rather than a limit worth working around. `Tool_code/check_fft_cap.py`
@@ -645,28 +645,36 @@ widening the window — is closed. There is no way around it from the host.
 
 Resolution is set by the **window in time**, not by the bin count, so with the
 point count fixed the only lever left is the clock. Measured with a synthetic
-250 MHz + 251 MHz pair (equal amplitudes, random relative phase, 16 draws,
-median of the valley depth between the two peaks — 0 = one hump, 1 = valley down
-to the baseline):
+250 MHz + 251 MHz pair, equal amplitudes, 32 independent phase draws averaged in
+power — the same reduction a payload performs, because averaging fills a shallow
+valley in and a single lucky phase draw flatters the coarse settings. Valley
+depth is 1 − (minimum between the peaks)/(smaller peak): 0 = one hump, 1 = valley
+down to the baseline.
 
-| record | rate | window | bin | Hann main lobe | valley depth | resolves 1 MHz |
-|---|---|---|---|---|---|---|
-| 4096 | 4 GS/s | 1.024 µs | 976.6 kHz | 1953.1 kHz | **0.00** | no |
-| 8192 | 4 GS/s | 2.048 µs | 488.3 kHz | 976.6 kHz | 0.44 | marginal |
-| **4096** | **2 GS/s** | **2.048 µs** | **488.3 kHz** | **976.6 kHz** | **0.99** | **yes** |
-| 16384 | 4 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | yes |
+| record | rate | window | bin | Hann main lobe | valley depth | 1 MHz | 64-rec point |
+|---|---|---|---|---|---|---|---|
+| 4096 | 4 GS/s | 1.024 µs | 976.6 kHz | 1953.1 kHz | 0.00 | invisible | 39.5 ms |
+| 4096 | 2 GS/s | 2.048 µs | 488.3 kHz | 976.6 kHz | 0.37 | a notch | 39.5 ms |
+| 8192 | 2 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | clean | 57.1 ms |
+| 16384 | 4 GS/s | 4.096 µs | 244.1 kHz | 488.3 kHz | 0.99 | clean | 64.1 ms |
 
-The third row is the one that matters: **2 GS/s on the on-chip FFT resolves
-1 MHz**, because the same 4096 points then span twice the time. It also covers
-0..1 GHz, which is the band of interest, and the readout rate does not change —
-the record is 4096 points whatever the clock, and the DSP path reads at 10 kHz
-either way. `PAM_Main_Nanomax_AFM.py` therefore defaults
-`PAM_AFM_FEEDBACK_RATE_MSPS` to 2000 when `PAM_AFM_FEEDBACK=fft` and the backend
-is `board`, and prints the achieved lobe width (with a `1 MHz NOT resolved`
-warning) so the setting is visible rather than implied.
+The rule that falls out of it: **Hann needs about four bins of separation** before
+the valley is unambiguous, so 1 MHz needs 244 kHz bins. At 488 kHz the two tones
+are two bins apart — a notch you can see, not a valley you can trust — and at
+976 kHz they are one bin apart and simply merge.
 
-If the band above 1 GHz matters, `PAM_AFM_FFT_BACKEND=host` moves the samples and
-transforms them in numpy, where the record length is free:
+Which means the on-chip FFT **cannot cleanly resolve 1 MHz at any clock**: its
+4096 points reach 488 kHz bins at 2 GS/s and no further. 2 GS/s is still the right
+default for it, because 0.37 beats 0.00 and 2 GS/s covers 0..1 GHz, but it buys a
+notch rather than a separation. Clean 1 MHz needs the host path.
+
+`PAM_Main_Nanomax_AFM.py` therefore defaults `PAM_AFM_FEEDBACK_RATE_MSPS` to 2000
+when `PAM_AFM_FEEDBACK=fft` and the backend is `board`, and prints the achieved
+lobe width (with a `1 MHz NOT resolved` warning) so the setting is visible rather
+than implied.
+
+The host path, `PAM_AFM_FFT_BACKEND=host`, moves the samples and transforms them
+in numpy, where the record length is free:
 
 | samples | bin | Hann main lobe | capture (64 rec) | FFT | bytes |
 |---|---|---|---|---|---|
@@ -675,10 +683,10 @@ transforms them in numpy, where the record length is free:
 | 16384 | 244.1 kHz | 488.3 kHz | 48.7 ms | 12.5 ms | 2 MB |
 
 Capture time is flat in record length — the period is set by the trigger timeout,
-not the record — so the longer record costs only the FFT. The trade is
-throughput, not resolution: a 64-record spectrum point costs **39.5 ms on the
-on-chip path** (2 GS/s, 2048 bins) against **104 ms on the host path**
-(4 GS/s, 16384 points, 8193 bins).
+not the record — so the longer record costs only the FFT. The trade is 25 ms per
+point, not an order of magnitude: **39.5 ms** for a 64-record spectrum point on the
+on-chip path (2 GS/s, 2048 bins) against **64 ms** on the host path (4 GS/s, 16384
+points, 8193 bins).
 
 ### Spurious lines at Fs/4 and Fs/2
 

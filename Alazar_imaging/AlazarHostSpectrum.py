@@ -17,10 +17,17 @@ length that sets the resolution, and the record length is capped in hardware.
 Doubling the record to 8192 points halves both numbers:
 
     bin      = 488.3 kHz
-    main lobe = 976.6 kHz   < 1 MHz
+    main lobe = 976.6 kHz
 
-which is exactly the resolution the measurement needs.  16384 points buys more
-margin (lobe 488 kHz) for the same capture time; the FFT is not the bottleneck.
+which is the same separability as the on-chip FFT gets at 2 GS/s, and **is still
+only marginal for 1 MHz**: a 250/251 MHz pair, averaged over 32 phase draws the
+way a payload averages records, leaves a valley depth of 0.34 -- a notch you can
+see, not a valley you can trust.  At 16384 points (244.1 kHz bins, 488.3 kHz
+lobe) the same pair leaves 0.99, which is unambiguous.
+
+So the honest rule is **four bins of separation**: Hann needs the two tones about
+a main lobe apart before the valley is real, which is 1 MHz at 244 kHz bins.
+8192 points gets you to two bins and a shoulder.
 
 What it costs
 -------------
@@ -89,9 +96,11 @@ from Alazar_imaging.AlazarBurstCapture import (
 # must span 0..2 GHz, and 4 GS/s is the fastest the board offers (single channel).
 DEFAULT_SAMPLE_RATE_HZ = 4e9
 
-# 8192 points at 4 GS/s: 2.048 us window, 488.3 kHz bins, 976.6 kHz main lobe.
-# The smallest length that separates peaks 1 MHz apart.
-DEFAULT_RECORD_LENGTH = 8192
+# 16384 points at 4 GS/s: 4.096 us window, 244.1 kHz bins, 488.3 kHz main lobe.
+# 1 MHz is four bins here, which is where the valley becomes unambiguous; 8192
+# points only gets to two bins and a shoulder.  See the resolution table in
+# README.md.
+DEFAULT_RECORD_LENGTH = 16384
 
 DEFAULT_WINDOW = "hann"
 DEFAULT_INPUT_RANGE = DEFAULT_INPUT_RANGE_VOLTS
@@ -457,39 +466,42 @@ def _selftest():
     # Resolution: two equal tones 1 MHz apart.  The phases must be independent:
     # two cosines that both start at zero phase beat into one amplitude-modulated
     # hump sitting at the centre of the window, which reads as a single peak no
-    # matter how long the record is.  Averaging over random phase draws is what a
-    # pair of incoherent photoacoustic sources actually looks like.
+    # matter how long the record is.  Averaging over random phase draws in power
+    # -- which is what a payload does -- is the only honest way to measure this,
+    # and it is why 8192 points comes out marginal rather than resolved: power
+    # averaging fills a shallow valley in.
     print("")
     print("  %8s %10s %10s %10s %10s" % ("samples", "bin", "lobe", "dF/bin", "dip"))
     print("  " + "-" * 52)
     rng = np.random.RandomState(20261020)
     for length in (4096, 8192, 16384):
         t = np.arange(length) / fs
-        dips = []
-        for _ in range(16):
+        total = None
+        for _ in range(32):
             phase = rng.uniform(0, 2 * np.pi, 2)
             two = (np.cos(2 * np.pi * 250e6 * t + phase[0])
                    + np.cos(2 * np.pi * 251e6 * t + phase[1])) * 4000.0 + 32768.0
             two_codes = np.clip(np.round(two), 0, 65535).astype(np.uint16)
             amp, fr = amplitude_spectrum(two_codes[None, :], sample_rate_hz=fs)
-            dips.append(_dip_depth(amp[0], fr, 247e6, 254e6))
-        dip = float(np.median(dips))
+            total = amp[0] ** 2 if total is None else total + amp[0] ** 2
+        row = np.sqrt(total / 32.0)
+        dip = _dip_depth(row, fr, 247e6, 254e6)
         separation = 1e6 / resolution_hz(length, fs)
         print("  %8d %8.1f kHz %8.1f kHz %9.2f %9.2f" %
               (length, resolution_hz(length, fs) / 1e3,
                main_lobe_hz(length, fs) / 1e3, separation, dip))
         if length == 4096:
-            check("1 MHz merged at 4096", dip < 0.25, "dip %.2f" % dip)
+            check("1 MHz merged at 4096", dip < 0.1, "dip %.2f" % dip)
         if length == 8192:
-            check("1 MHz partly resolved at 8192", dip > 0.35, "dip %.2f" % dip)
+            check("1 MHz marginal at 8192", 0.2 < dip < 0.6, "dip %.2f" % dip)
         if length == 16384:
-            check("1 MHz resolved at 16384", dip > 0.7, "dip %.2f" % dip)
+            check("1 MHz resolved at 16384", dip > 0.85, "dip %.2f" % dip)
 
     print("")
     print("  dip 0 = one hump, 1 = valley down to the baseline.  Hann needs about")
     print("  four bins between the tones before the valley is unambiguous, so")
-    print("  1 MHz is comfortable at 16384 points (244 kHz bins) and marginal at")
-    print("  8192 (488 kHz bins, two bins apart: a shoulder, not a valley).")
+    print("  1 MHz is clean at 16384 points (244 kHz bins) and only a notch at")
+    print("  8192 (488 kHz bins, two bins apart).")
 
     print("")
     # Averaging on power, not amplitude.

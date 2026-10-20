@@ -74,22 +74,25 @@ Two feedback paths
     **2 GS/s**      2.048 us      488.3 kHz     976.6 kHz   0..1 GHz
     1 GS/s          4.096 us      244.1 kHz     488.3 kHz   0..0.5 GHz
     ==============  ============  ===========  ===========  ============
-
-    At 4 GS/s two peaks 1 MHz apart merge into one hump -- measured on the
-    board, a 250/251 MHz pair leaves a valley depth of 0.00, i.e. invisible.  At
-    2 GS/s the same pair leaves 0.99, which is unambiguous, and 2 GS/s still
-    covers 0..1 GHz, the whole band of interest.  So **2 GS/s is the default for
-    this backend**, and the readout rate is unchanged -- 10 kHz either way,
-    because the record is 4096 points whatever the clock.
+    At 4 GS/s two peaks 1 MHz apart merge into one hump: a 250/251 MHz pair,
+    averaged over 32 phase draws in power the way a payload averages records,
+    leaves a valley depth of 0.00 -- invisible.  At 2 GS/s the same pair leaves
+    0.37, a notch you can see, and 2 GS/s still covers 0..1 GHz.  So 2 GS/s is
+    the default for this backend, but be clear about what it buys: **the on-chip
+    path cannot cleanly resolve 1 MHz at any clock**, because Hann needs about
+    four bins of separation and 4096 points at 2 GS/s is two.  Clean separation
+    needs 244 kHz bins, i.e. 16384 points, which the module will not do.  Use
+    ``PAM_AFM_FFT_BACKEND=host`` for that; the readout rate is unchanged either
+    way at 10 kHz, because the record is 4096 points whatever the clock.
 
     ``host`` moves the samples and transforms them in numpy, where the record
     length is free.  4 GS/s with 16384 points gives 244.1 kHz bins and a
-    488.3 kHz lobe over 0..2 GHz.  Capture time is flat in record length --
-    48.7 ms at 16384 against 49.5 ms at 4096 for 64 records, because the period
-    is set by the trigger timeout -- so the longer record costs only the FFT,
-    12.5 ms against 6.0 ms.  Use it when the band above 1 GHz matters; use the
-    on-chip path when it does not, because it is two orders of magnitude faster
-    per reading.
+    488.3 kHz lobe over 0..2 GHz, and the same pair leaves 0.99.  Capture time is
+    flat in record length -- 48.7 ms at 16384 against 49.5 ms at 4096 for 64
+    records, because the period is set by the trigger timeout -- so the longer
+    record costs only the FFT.  A 64-record spectrum point is 39.5 ms on the
+    on-chip path and 64 ms on the host path: the trade is 25 ms per point, not
+    an order of magnitude.
 
 ``PAM_AFM_FEEDBACK=stream``
     100 MS/s continuous stream on ``PAM_AFM_FEEDBACK_CHANNEL`` (default ``B``).
@@ -273,16 +276,18 @@ class RunConfig:
         #
         #   on-chip FFT, 4096 points fixed -> the only lever is the clock
         #     4 GS/s: 1.024 us window, 976.6 kHz bins, 1953.1 kHz lobe, 0..2 GHz
-        #             -> 1 MHz NOT resolved (measured valley depth 0.00)
+        #             -> 1 MHz invisible (valley depth 0.00)
         #     2 GS/s: 2.048 us window, 488.3 kHz bins,  976.6 kHz lobe, 0..1 GHz
-        #             -> 1 MHz resolved (valley depth 0.99 in the same test)
+        #             -> 1 MHz visible as a notch (0.37), not a clean valley
         #   host FFT, record length free
         #     4 GS/s, 16384 points: 4.096 us window, 244.1 kHz bins, 0..2 GHz
+        #             -> 1 MHz resolved (0.99)
         #
-        # So for the on-chip path 2 GS/s is the right default: it is the only
-        # on-chip setting that resolves 1 MHz, and it still covers the whole band
-        # of interest.  Measured on the board, the DSP path reads at 10 kHz either
-        # way -- the record is 4096 points regardless of the clock.
+        # Valley depths are measured after averaging 32 phase draws in power,
+        # which is what a payload does; Hann needs four bins of separation before
+        # the valley is unambiguous, so 244 kHz bins is the target and 488 kHz is
+        # the shoulder.  That is why the on-chip path cannot cleanly resolve
+        # 1 MHz at any clock, and why 2 GS/s is nevertheless its best setting.
         if self.feedback == "stream":
             default_rate = 100.0
         elif self.feedback == "fft" and self.fft_backend == "board":
@@ -506,13 +511,20 @@ class RunConfig:
         elif self.feedback == "fft":
             # The number that decides whether the run can answer the question it
             # was started for, so print it rather than leaving it to be derived.
+            # Three levels, because "lobe < 1 MHz" is not the same as "resolves":
+            # Hann needs four bins of separation for a clean valley, so a 1 MHz
+            # pair is clean at a 500 kHz lobe, a notch at 1000 kHz, and one hump
+            # above that.
             bin_hz = rate_msps * 1e6 / float(self.fft_length)
+            lobe_hz = 2 * bin_hz
             feedback_line += (
                 ", %s FFT %d points -> %.1f kHz bins, main lobe %.1f kHz"
-                % (self.fft_backend, self.fft_length, bin_hz / 1e3, 2 * bin_hz / 1e3)
+                % (self.fft_backend, self.fft_length, bin_hz / 1e3, lobe_hz / 1e3)
             )
-            if 2 * bin_hz > 1e6:
+            if lobe_hz > 1e6:
                 feedback_line += "  (1 MHz NOT resolved)"
+            elif lobe_hz > 0.5e6:
+                feedback_line += "  (1 MHz marginal: a notch, not a valley)"
         lines = [
             feedback_line,
             "setpoint        : %.4f %s" % (self.setpoint, self.setpoint_unit),
